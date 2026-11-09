@@ -116,13 +116,19 @@ block `height`. `depth` is how many levels per side the source returns at most
 
 ## Structural rules (enforced on read and write)
 
+One validator in `hl-dataset` enforces these for both the writer and the
+reader and reports a `RuleError` either way, so anything the writer accepts
+the reader reads (property-tested).
+
 1. The first line is a `header` with `format_version` 2 and valid, unique assets.
-2. Block heights are contiguous from `first_height`.
+2. Block heights are contiguous from `first_height`. A block at `u64::MAX`
+   is allowed; any block after it is a `HeightOverflow` error.
 3. A book record carries the height of the block it directly follows (books
    come after their block and before the next one).
 4. At most one book record per asset per block.
 5. Every op and book names an asset declared in the header.
 6. Levels are strictly best-first; audit strings match their integers.
+   An `l4_book` level's order sizes must sum to at most `u64::MAX` lots.
 7. Blank lines are ignored; a malformed line or unknown `kind` is reported
    with its 1-based line number.
 

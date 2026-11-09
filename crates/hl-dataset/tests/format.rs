@@ -7,7 +7,7 @@ use std::io::Cursor;
 use hl_book_ref::{BookOp, Lots, Oid, Order, Px, Side};
 use hl_dataset::{
     AssetMeta, AssetOp, Block, BookState, Header, L2Book, L2Level, L4Book, L4Level, L4Order,
-    RawJson, ReadError, Reader, Step, Tx, WriteError, Writer, FORMAT_VERSION,
+    RawJson, ReadError, Reader, RuleError, Step, Tx, WriteError, Writer, FORMAT_VERSION,
 };
 
 fn btc() -> AssetMeta {
@@ -370,10 +370,12 @@ fn reader_rejects_a_height_gap_and_a_wrong_first_height() {
     assert!(
         matches!(
             err,
-            ReadError::HeightGap {
-                expected: 11,
-                found: 12,
-                line: 3
+            ReadError::Rule {
+                line: 3,
+                source: RuleError::HeightGap {
+                    expected: 11,
+                    found: 12
+                }
             }
         ),
         "{err:?}"
@@ -386,10 +388,12 @@ fn reader_rejects_a_height_gap_and_a_wrong_first_height() {
     assert!(
         matches!(
             err,
-            ReadError::HeightGap {
-                expected: 10,
-                found: 11,
-                line: 2
+            ReadError::Rule {
+                line: 2,
+                source: RuleError::HeightGap {
+                    expected: 10,
+                    found: 11
+                }
             }
         ),
         "{err:?}"
@@ -410,9 +414,9 @@ fn reader_rejects_misplaced_or_duplicate_books() {
     assert!(
         matches!(
             err,
-            ReadError::BookWithoutBlock {
-                height: 11,
-                line: 3
+            ReadError::Rule {
+                line: 3,
+                source: RuleError::BookWithoutBlock(11)
             }
         ),
         "{err:?}"
@@ -423,9 +427,9 @@ fn reader_rejects_misplaced_or_duplicate_books() {
     assert!(
         matches!(
             err,
-            ReadError::BookWithoutBlock {
-                height: 10,
-                line: 2
+            ReadError::Rule {
+                line: 2,
+                source: RuleError::BookWithoutBlock(10)
             }
         ),
         "{err:?}"
@@ -439,7 +443,13 @@ fn reader_rejects_misplaced_or_duplicate_books() {
     );
     let err = read_all(&text).err().unwrap();
     assert!(
-        matches!(err, ReadError::DuplicateBook { asset: 0, line: 4 }),
+        matches!(
+            err,
+            ReadError::Rule {
+                line: 4,
+                source: RuleError::DuplicateBook(0)
+            }
+        ),
         "{err:?}"
     );
 }
@@ -452,7 +462,13 @@ fn reader_rejects_undeclared_assets() {
     );
     let err = read_all(&text).err().unwrap();
     assert!(
-        matches!(err, ReadError::UnknownAsset { asset: 3, line: 2 }),
+        matches!(
+            err,
+            ReadError::Rule {
+                line: 2,
+                source: RuleError::UnknownAsset(3)
+            }
+        ),
         "{err:?}"
     );
     let text = format!(
@@ -461,7 +477,13 @@ fn reader_rejects_undeclared_assets() {
     );
     let err = read_all(&text).err().unwrap();
     assert!(
-        matches!(err, ReadError::UnknownAsset { asset: 4, line: 3 }),
+        matches!(
+            err,
+            ReadError::Rule {
+                line: 3,
+                source: RuleError::UnknownAsset(4)
+            }
+        ),
         "{err:?}"
     );
 }
@@ -475,7 +497,13 @@ fn reader_audits_decimal_strings_against_their_integers() {
     );
     let err = read_all(&text).err().unwrap();
     assert!(
-        matches!(err, ReadError::DecimalMismatch { line: 3, .. }),
+        matches!(
+            err,
+            ReadError::Rule {
+                line: 3,
+                source: RuleError::DecimalMismatch { .. }
+            }
+        ),
         "{err:?}"
     );
 }
@@ -489,7 +517,13 @@ fn reader_rejects_unsorted_levels() {
     );
     let err = read_all(&text).err().unwrap();
     assert!(
-        matches!(err, ReadError::UnsortedLevels { line: 3, .. }),
+        matches!(
+            err,
+            ReadError::Rule {
+                line: 3,
+                source: RuleError::UnsortedLevels { .. }
+            }
+        ),
         "{err:?}"
     );
 }
@@ -528,15 +562,18 @@ fn writer_enforces_contiguity_book_placement_and_declared_assets() {
     let mut out = Vec::new();
     let mut w = Writer::new(&mut out, &header()).unwrap();
     let err = w.write_book(&l4(100, &[], &[])).err().unwrap();
-    assert!(matches!(err, WriteError::BookWithoutBlock), "{err:?}");
+    assert!(
+        matches!(err, WriteError::Rule(RuleError::BookWithoutBlock(_))),
+        "{err:?}"
+    );
     let err = w.write_block(&block(101, vec![])).err().unwrap();
     assert!(
         matches!(
             err,
-            WriteError::HeightGap {
+            WriteError::Rule(RuleError::HeightGap {
                 expected: 100,
                 found: 101
-            }
+            })
         ),
         "{err:?}"
     );
@@ -550,11 +587,20 @@ fn writer_enforces_contiguity_book_placement_and_declared_assets() {
         ))
         .err()
         .unwrap();
-    assert!(matches!(err, WriteError::UnknownAsset(9)), "{err:?}");
+    assert!(
+        matches!(err, WriteError::Rule(RuleError::UnknownAsset(9))),
+        "{err:?}"
+    );
     w.write_block(&block(100, vec![])).unwrap();
     let err = w.write_book(&l4(99, &[], &[])).err().unwrap();
-    assert!(matches!(err, WriteError::BookWithoutBlock), "{err:?}");
+    assert!(
+        matches!(err, WriteError::Rule(RuleError::BookWithoutBlock(_))),
+        "{err:?}"
+    );
     w.write_book(&l4(100, &[], &[])).unwrap();
     let err = w.write_book(&l4(100, &[], &[])).err().unwrap();
-    assert!(matches!(err, WriteError::DuplicateBook(0)), "{err:?}");
+    assert!(
+        matches!(err, WriteError::Rule(RuleError::DuplicateBook(0))),
+        "{err:?}"
+    );
 }

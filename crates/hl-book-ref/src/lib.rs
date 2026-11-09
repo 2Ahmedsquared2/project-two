@@ -179,6 +179,15 @@ pub enum ApplyError {
         /// The opposite side's best price at the time.
         opposite_best: Px,
     },
+    /// The op would make a price level's total size exceed `u64::MAX` lots,
+    /// which no aggregate (L2 size) could then represent.
+    #[error("order {oid:?} would make the total size at {px:?} exceed u64::MAX lots")]
+    LevelSizeOverflow {
+        /// The order inserted or resized.
+        oid: Oid,
+        /// Its price level.
+        px: Px,
+    },
     /// A resting insert would cross the opposite best price: the op stream is inconsistent.
     #[error("order {oid:?} at {px:?} crosses opposite best {opposite_best:?}")]
     Crossed {
@@ -200,29 +209,48 @@ pub struct Level {
     pub orders: Vec<(Oid, Lots)>,
 }
 
+/// A price level whose total size does not fit in `u64` lots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, thiserror::Error)]
+#[error("the {side:?} level at {px:?} totals more than u64::MAX lots")]
+pub struct SizeOverflow {
+    /// Side of the level.
+    pub side: Side,
+    /// Price of the level.
+    pub px: Px,
+}
+
 impl BookSnapshot {
-    /// Aggregate to L2, keeping at most `depth` levels per side (all when `None`).
-    #[must_use]
-    pub fn to_l2(&self, depth: Option<usize>) -> L2Snapshot {
-        let agg = |levels: &[Level]| -> Vec<L2Level> {
+    /// Aggregate to L2, keeping at most `depth` levels per side (all when
+    /// `None`). Fails if a kept level's total size overflows `u64`: a wrapped
+    /// total could otherwise compare equal to a wrong recorded size.
+    pub fn to_l2(&self, depth: Option<usize>) -> Result<L2Snapshot, SizeOverflow> {
+        let agg = |side: Side, levels: &[Level]| -> Result<Vec<L2Level>, SizeOverflow> {
             levels
                 .iter()
                 .take(depth.unwrap_or(usize::MAX))
-                .map(L2Level::from)
+                .map(|l| L2Level::try_from(l).map_err(|()| SizeOverflow { side, px: l.px }))
                 .collect()
         };
-        L2Snapshot {
-            bids: agg(&self.bids),
-            asks: agg(&self.asks),
-        }
+        Ok(L2Snapshot {
+            bids: agg(Side::Bid, &self.bids)?,
+            asks: agg(Side::Ask, &self.asks)?,
+        })
     }
 }
 
+/// Sum of sizes, `None` if it overflows `u64`.
+fn checked_total(sizes: impl IntoIterator<Item = Lots>) -> Option<Lots> {
+    sizes
+        .into_iter()
+        .try_fold(0u64, |acc, sz| acc.checked_add(sz.0))
+        .map(Lots)
+}
+
 impl Level {
-    /// Total resting size at this level.
+    /// Total resting size at this level, or `None` if it overflows `u64`.
     #[must_use]
-    pub fn total(&self) -> Lots {
-        Lots(self.orders.iter().map(|(_, sz)| sz.0).sum())
+    pub fn total(&self) -> Option<Lots> {
+        checked_total(self.orders.iter().map(|&(_, sz)| sz))
     }
 }
 
@@ -238,13 +266,16 @@ pub struct L2Level {
     pub n: u32,
 }
 
-impl From<&Level> for L2Level {
-    fn from(level: &Level) -> Self {
-        Self {
+impl TryFrom<&Level> for L2Level {
+    /// The level's total size overflows `u64`.
+    type Error = ();
+
+    fn try_from(level: &Level) -> Result<Self, ()> {
+        Ok(Self {
             px: level.px,
-            sz: level.total(),
+            sz: level.total().ok_or(())?,
             n: u32::try_from(level.orders.len()).unwrap_or(u32::MAX),
-        }
+        })
     }
 }
 
@@ -399,7 +430,30 @@ impl Book {
                 opposite_best,
             });
         }
-        Ok(())
+        self.check_room(order.side, order.px, order.oid, Lots(0), order.sz)
+    }
+
+    /// Fail unless the level at `px` can hold `add` more lots after `remove`
+    /// lots leave it, so every level total stays representable in `u64`.
+    fn check_room(
+        &self,
+        side: Side,
+        px: Px,
+        oid: Oid,
+        remove: Lots,
+        add: Lots,
+    ) -> Result<(), ApplyError> {
+        let overflow = ApplyError::LevelSizeOverflow { oid, px };
+        let current = match self.side_ref(side).get(&px) {
+            Some(q) => checked_total(q.iter().map(|o| o.sz)).ok_or(overflow)?,
+            None => Lots(0),
+        };
+        current
+            .0
+            .checked_sub(remove.0)
+            .and_then(|t| t.checked_add(add.0))
+            .map(|_| ())
+            .ok_or(overflow)
     }
 
     fn insert(&mut self, order: Order) -> Result<(), ApplyError> {
@@ -494,6 +548,14 @@ impl Book {
                 ..Placed::default()
             });
         }
+        if tif == Tif::Gtc {
+            // Check before any fill so an error leaves the book unchanged. A
+            // crossing order has no own-side level at its price (the book is
+            // never crossed), so this only bites when it would rest whole.
+            self.check_room(order.side, order.px, order.oid, Lots(0), order.sz)?;
+        }
+        // TODO(UNVERIFIED-§3.5-matching): best price first, FIFO, fills at the
+        // resting price is INFERENCE with no primary statement.
         let stp_owner = owner.filter(|_| self.config.self_trade_prevention);
         let mut remaining = order.sz.0;
         let mut placed = Placed::default();
@@ -577,6 +639,8 @@ impl Book {
         if sz.0 == 0 {
             return Err(ApplyError::ZeroSize(oid));
         }
+        let old = self.get(oid).map_or(Lots(0), |o| o.sz);
+        self.check_room(side, px, oid, old, sz)?;
         let Some(order) = self
             .side_mut(side)
             .get_mut(&px)
@@ -646,22 +710,29 @@ impl Book {
         })
     }
 
-    /// The book aggregated to L2, at most `depth` levels per side (all when `None`).
-    #[must_use]
-    pub fn l2(&self, depth: Option<usize>) -> L2Snapshot {
-        let agg = |it: &mut dyn Iterator<Item = (&Px, &VecDeque<Order>)>| -> Vec<L2Level> {
+    /// The book aggregated to L2, at most `depth` levels per side (all when
+    /// `None`). Sums are checked; this book never holds a level whose total
+    /// overflows (inserts and resizes that would are rejected), so the error
+    /// is unreachable here but kept typed for callers.
+    pub fn l2(&self, depth: Option<usize>) -> Result<L2Snapshot, SizeOverflow> {
+        let agg = |side: Side,
+                   it: &mut dyn Iterator<Item = (&Px, &VecDeque<Order>)>|
+         -> Result<Vec<L2Level>, SizeOverflow> {
             it.take(depth.unwrap_or(usize::MAX))
-                .map(|(px, q)| L2Level {
-                    px: *px,
-                    sz: Lots(q.iter().map(|o| o.sz.0).sum()),
-                    n: u32::try_from(q.len()).unwrap_or(u32::MAX),
+                .map(|(px, q)| {
+                    Ok(L2Level {
+                        px: *px,
+                        sz: checked_total(q.iter().map(|o| o.sz))
+                            .ok_or(SizeOverflow { side, px: *px })?,
+                        n: u32::try_from(q.len()).unwrap_or(u32::MAX),
+                    })
                 })
                 .collect()
         };
-        L2Snapshot {
-            bids: agg(&mut self.bids.iter().rev()),
-            asks: agg(&mut self.asks.iter()),
-        }
+        Ok(L2Snapshot {
+            bids: agg(Side::Bid, &mut self.bids.iter().rev())?,
+            asks: agg(Side::Ask, &mut self.asks.iter())?,
+        })
     }
 
     /// The whole book as plain data, bids highest first and asks lowest first.

@@ -21,7 +21,7 @@ fn inserts_rest_fifo_within_a_level() {
         .unwrap();
     let level = book.level(Side::Bid, Px(100)).expect("level exists");
     assert_eq!(level.orders, vec![(Oid(1), Lots(5)), (Oid(2), Lots(7))]);
-    assert_eq!(level.total(), Lots(12));
+    assert_eq!(level.total(), Some(Lots(12)));
     assert_eq!(book.order_count(), 2);
 }
 

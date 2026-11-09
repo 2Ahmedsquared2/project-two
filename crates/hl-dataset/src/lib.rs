@@ -18,7 +18,7 @@
 //! to be: it is written by a capture tool, read by a checker, and inspected by
 //! people with `head` and `jq`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Write};
 
 use hl_book_ref::{BookSnapshot, Level, Lots, Oid, Px};
@@ -484,59 +484,14 @@ pub enum ReadError {
         /// What is wrong.
         reason: String,
     },
-    /// An op or book names an asset the header does not declare.
-    #[error("line {line}: asset {asset} is not declared in the header")]
-    UnknownAsset {
-        /// Asset index.
-        asset: u32,
+    /// A record breaks a structural rule of the format (the same rules the
+    /// [`Writer`] enforces).
+    #[error("line {line}: {source}")]
+    Rule {
         /// 1-based line number.
         line: usize,
-    },
-    /// Block heights are not contiguous from `first_height`.
-    #[error("line {line}: expected block height {expected}, found {found}")]
-    HeightGap {
-        /// The height the reader expected next.
-        expected: u64,
-        /// The height the record carried.
-        found: u64,
-        /// 1-based line number.
-        line: usize,
-    },
-    /// A book record does not follow the block with its height.
-    #[error("line {line}: book record for height {height} does not follow its block")]
-    BookWithoutBlock {
-        /// The height the book record carried.
-        height: u64,
-        /// 1-based line number.
-        line: usize,
-    },
-    /// A second book for the same asset after one block.
-    #[error("line {line}: a second book for asset {asset} after the same block")]
-    DuplicateBook {
-        /// Asset index.
-        asset: u32,
-        /// 1-based line number.
-        line: usize,
-    },
-    /// Levels are not strictly best-first on a side.
-    #[error("line {line}: {side} levels are not strictly best-first at {px_ticks} ticks")]
-    UnsortedLevels {
-        /// `bids` or `asks`.
-        side: &'static str,
-        /// First out-of-order price.
-        px_ticks: u64,
-        /// 1-based line number.
-        line: usize,
-    },
-    /// An audit decimal string disagrees with its integer.
-    #[error("line {line}: decimal {text:?} is not {units} units")]
-    DecimalMismatch {
-        /// The decimal string.
-        text: String,
-        /// The integer beside it.
-        units: u64,
-        /// 1-based line number.
-        line: usize,
+        /// The rule broken.
+        source: RuleError,
     },
 }
 
@@ -552,92 +507,189 @@ pub enum WriteError {
     /// A header asset entry is invalid or repeated.
     #[error("header: asset {0}: invalid or repeated")]
     BadAssetMeta(u32),
-    /// An op or book names an undeclared asset.
-    #[error("asset {0} is not declared in the header")]
-    UnknownAsset(u32),
-    /// A block's height does not continue the run.
-    #[error("expected block height {expected}, found {found}")]
-    HeightGap {
-        /// The height the writer expected next.
-        expected: u64,
-        /// The height given.
-        found: u64,
-    },
-    /// A book was written before any block, or for another height than the last block.
-    #[error("a book record must follow the block with its height")]
-    BookWithoutBlock,
-    /// A second book for the same asset after one block.
-    #[error("a block has at most one book per asset (asset {0})")]
-    DuplicateBook(u32),
+    /// A record breaks a structural rule of the format (the same rules the
+    /// [`Reader`] enforces), so it was not written.
+    #[error(transparent)]
+    Rule(#[from] RuleError),
 }
 
-fn declared_assets(header: &Header) -> Result<BTreeSet<u32>, (u32, String)> {
-    let mut seen = BTreeSet::new();
-    for a in &header.assets {
-        a.validate().map_err(|e| (a.asset_index, e.to_string()))?;
-        if !seen.insert(a.asset_index) {
-            return Err((a.asset_index, "declared twice".to_owned()));
+/// A structural rule of the format, enforced identically by [`Writer`] and
+/// [`Reader`] through one validator, so anything written is readable.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RuleError {
+    /// An op or book names an asset the header does not declare.
+    #[error("asset {0} is not declared in the header")]
+    UnknownAsset(u32),
+    /// Block heights are not contiguous from `first_height`.
+    #[error("expected block height {expected}, found {found}")]
+    HeightGap {
+        /// The height expected next.
+        expected: u64,
+        /// The height the record carried.
+        found: u64,
+    },
+    /// A block follows the block at `u64::MAX`: no height can continue the run.
+    #[error("height overflow: no block can follow height {0}")]
+    HeightOverflow(u64),
+    /// A book record does not follow the block with its height.
+    #[error("book record for height {0} does not follow its block")]
+    BookWithoutBlock(u64),
+    /// A second book for the same asset after one block.
+    #[error("a second book for asset {0} after the same block")]
+    DuplicateBook(u32),
+    /// Levels are not strictly best-first on a side.
+    #[error("{side} levels are not strictly best-first at {px_ticks} ticks")]
+    UnsortedLevels {
+        /// `bids` or `asks`.
+        side: &'static str,
+        /// First out-of-order price.
+        px_ticks: u64,
+    },
+    /// An audit decimal string disagrees with its integer.
+    #[error("decimal {text:?} is not {units} units")]
+    DecimalMismatch {
+        /// The decimal string.
+        text: String,
+        /// The integer beside it.
+        units: u64,
+    },
+    /// An L4 level's order sizes sum past `u64::MAX` lots.
+    #[error("{side} level at {px_ticks} ticks: total size overflows u64 lots")]
+    LevelSizeOverflow {
+        /// `bids` or `asks`.
+        side: &'static str,
+        /// The level's price.
+        px_ticks: u64,
+    },
+}
+
+/// The structural rules shared by [`Writer`] and [`Reader`]: contiguous
+/// heights, declared assets, books after their block (one per asset), sorted
+/// levels, decimal audit strings that match their integers, and representable
+/// L4 level totals.
+#[derive(Debug)]
+struct Rules {
+    assets: BTreeMap<u32, AssetMeta>,
+    /// The height the next block must carry; `None` after a block at `u64::MAX`.
+    next_height: Option<u64>,
+    last_block: Option<u64>,
+    books_after_block: BTreeSet<u32>,
+}
+
+impl Rules {
+    fn new(header: &Header) -> Result<Self, (u32, String)> {
+        let mut assets = BTreeMap::new();
+        for a in &header.assets {
+            a.validate().map_err(|e| (a.asset_index, e.to_string()))?;
+            if assets.insert(a.asset_index, a.clone()).is_some() {
+                return Err((a.asset_index, "declared twice".to_owned()));
+            }
         }
+        Ok(Self {
+            assets,
+            next_height: Some(header.first_height),
+            last_block: None,
+            books_after_block: BTreeSet::new(),
+        })
     }
-    Ok(seen)
+
+    /// Check a block and, if it passes, record it as the latest.
+    fn block(&mut self, block: &Block) -> Result<(), RuleError> {
+        let Some(expected) = self.next_height else {
+            // The previous block was at u64::MAX.
+            return Err(RuleError::HeightOverflow(u64::MAX));
+        };
+        if block.height != expected {
+            return Err(RuleError::HeightGap {
+                expected,
+                found: block.height,
+            });
+        }
+        if let Some(op) = block
+            .ops
+            .iter()
+            .find(|o| !self.assets.contains_key(&o.asset))
+        {
+            return Err(RuleError::UnknownAsset(op.asset));
+        }
+        self.next_height = block.height.checked_add(1);
+        self.last_block = Some(block.height);
+        self.books_after_block.clear();
+        Ok(())
+    }
+
+    /// Check a book state and, if it passes, record it after the latest block.
+    fn book(&mut self, book: &BookState) -> Result<(), RuleError> {
+        if self.last_block != Some(book.height()) {
+            return Err(RuleError::BookWithoutBlock(book.height()));
+        }
+        let asset = book.asset();
+        let meta = self
+            .assets
+            .get(&asset)
+            .ok_or(RuleError::UnknownAsset(asset))?;
+        if self.books_after_block.contains(&asset) {
+            return Err(RuleError::DuplicateBook(asset));
+        }
+        match book {
+            BookState::L2(b) => {
+                for (side, levels) in [("bids", &b.bids), ("asks", &b.asks)] {
+                    check_sorted(side, levels.iter().map(|l| l.px_ticks))?;
+                    for l in levels {
+                        audit(l.px.as_deref(), l.px_ticks, meta.max_price_decimals)?;
+                        audit(l.sz.as_deref(), l.sz_lots, meta.sz_decimals)?;
+                    }
+                }
+            }
+            BookState::L4(b) => {
+                for (side, levels) in [("bids", &b.bids), ("asks", &b.asks)] {
+                    check_sorted(side, levels.iter().map(|l| l.px_ticks))?;
+                    for l in levels {
+                        audit(l.px.as_deref(), l.px_ticks, meta.max_price_decimals)?;
+                        l.orders
+                            .iter()
+                            .try_fold(0u64, |acc, o| acc.checked_add(o.sz_lots))
+                            .ok_or(RuleError::LevelSizeOverflow {
+                                side,
+                                px_ticks: l.px_ticks,
+                            })?;
+                    }
+                }
+            }
+        }
+        self.books_after_block.insert(asset);
+        Ok(())
+    }
 }
 
 /// Streaming dataset writer. Enforces the structural rules as it goes.
 #[derive(Debug)]
 pub struct Writer<W: Write> {
     out: W,
-    assets: BTreeSet<u32>,
-    next_height: u64,
-    last_block: Option<u64>,
-    books_after_block: BTreeSet<u32>,
+    rules: Rules,
 }
 
 impl<W: Write> Writer<W> {
     /// Start a dataset by writing its header.
     pub fn new(mut out: W, header: &Header) -> Result<Self, WriteError> {
-        let assets = declared_assets(header).map_err(|(a, _)| WriteError::BadAssetMeta(a))?;
+        let rules = Rules::new(header).map_err(|(a, _)| WriteError::BadAssetMeta(a))?;
         let mut header = header.clone();
         header.extra.remove("kind");
         write_tagged(&mut out, "header", &header)?;
-        Ok(Self {
-            out,
-            assets,
-            next_height: header.first_height,
-            last_block: None,
-            books_after_block: BTreeSet::new(),
-        })
+        Ok(Self { out, rules })
     }
 
     /// Append a block. Its height must be the next in the run.
     pub fn write_block(&mut self, block: &Block) -> Result<(), WriteError> {
-        if block.height != self.next_height {
-            return Err(WriteError::HeightGap {
-                expected: self.next_height,
-                found: block.height,
-            });
-        }
-        if let Some(op) = block.ops.iter().find(|o| !self.assets.contains(&o.asset)) {
-            return Err(WriteError::UnknownAsset(op.asset));
-        }
-        write_tagged(&mut self.out, "block", block)?;
-        self.last_block = Some(block.height);
-        self.next_height = block.height + 1;
-        self.books_after_block.clear();
-        Ok(())
+        self.rules.block(block)?;
+        write_tagged(&mut self.out, "block", block)
     }
 
-    /// Append a book state after the block just written (at most one per asset).
+    /// Append a book state after the block just written (at most one per
+    /// asset). Its levels must be sorted best-first, its audit decimals must
+    /// match their integers, and its L4 level totals must fit in `u64`.
     pub fn write_book(&mut self, book: &BookState) -> Result<(), WriteError> {
-        if self.last_block != Some(book.height()) {
-            return Err(WriteError::BookWithoutBlock);
-        }
-        let asset = book.asset();
-        if !self.assets.contains(&asset) {
-            return Err(WriteError::UnknownAsset(asset));
-        }
-        if !self.books_after_block.insert(asset) {
-            return Err(WriteError::DuplicateBook(asset));
-        }
+        self.rules.book(book)?;
         match book {
             BookState::L2(b) => write_tagged(&mut self.out, "l2_book", b),
             BookState::L4(b) => write_tagged(&mut self.out, "l4_book", b),
@@ -689,8 +741,7 @@ pub struct Reader<R: BufRead> {
     lines: std::io::Lines<R>,
     line_no: usize,
     header: Header,
-    assets: BTreeSet<u32>,
-    next_height: u64,
+    rules: Rules,
 }
 
 fn parse<'a, T: Deserialize<'a>>(line: &'a str, line_no: usize) -> Result<T, ReadError> {
@@ -720,14 +771,13 @@ impl<R: BufRead> Reader<R> {
         }
         let mut header: Header = parse(&first, 1)?;
         header.extra.remove("kind");
-        let assets = declared_assets(&header)
+        let rules = Rules::new(&header)
             .map_err(|(asset, reason)| ReadError::BadAssetMeta { asset, reason })?;
         Ok(Self {
             lines,
             line_no: 1,
-            next_height: header.first_height,
             header,
-            assets,
+            rules,
         })
     }
 
@@ -745,10 +795,6 @@ impl<R: BufRead> Reader<R> {
             pending: None,
             done: false,
         }
-    }
-
-    fn meta(&self, asset: u32) -> Option<&AssetMeta> {
-        self.header.assets.iter().find(|a| a.asset_index == asset)
     }
 
     /// Read the next non-header record, validating it. `Ok(None)` at end of file.
@@ -769,31 +815,21 @@ impl<R: BufRead> Reader<R> {
                 "header" => Err(ReadError::DuplicateHeader { line: line_no }),
                 "block" => {
                     let block: Block = parse(&line, line_no)?;
-                    if block.height != self.next_height {
-                        return Err(ReadError::HeightGap {
-                            expected: self.next_height,
-                            found: block.height,
-                            line: line_no,
-                        });
-                    }
-                    if let Some(op) = block.ops.iter().find(|o| !self.assets.contains(&o.asset)) {
-                        return Err(ReadError::UnknownAsset {
-                            asset: op.asset,
-                            line: line_no,
-                        });
-                    }
-                    self.next_height = block.height + 1;
+                    self.rules.block(&block).map_err(|source| ReadError::Rule {
+                        line: line_no,
+                        source,
+                    })?;
                     Ok(Some(Record::Block(block)))
                 }
                 "l2_book" => {
-                    let book: L2Book = parse(&line, line_no)?;
-                    self.validate_l2(&book, line_no)?;
-                    Ok(Some(Record::Book(BookState::L2(book))))
+                    let book = BookState::L2(parse(&line, line_no)?);
+                    self.check_book(&book, line_no)?;
+                    Ok(Some(Record::Book(book)))
                 }
                 "l4_book" => {
-                    let book: L4Book = parse(&line, line_no)?;
-                    self.validate_l4(&book, line_no)?;
-                    Ok(Some(Record::Book(BookState::L4(book))))
+                    let book = BookState::L4(parse(&line, line_no)?);
+                    self.check_book(&book, line_no)?;
+                    Ok(Some(Record::Book(book)))
                 }
                 _ => Err(ReadError::UnknownKind {
                     line: line_no,
@@ -803,67 +839,36 @@ impl<R: BufRead> Reader<R> {
         }
     }
 
-    fn known_meta(&self, asset: u32, line: usize) -> Result<&AssetMeta, ReadError> {
-        self.meta(asset)
-            .ok_or(ReadError::UnknownAsset { asset, line })
-    }
-
-    fn validate_l2(&self, book: &L2Book, line: usize) -> Result<(), ReadError> {
-        let meta = self.known_meta(book.asset, line)?;
-        for (side, levels) in [("bids", &book.bids), ("asks", &book.asks)] {
-            check_sorted(side, levels.iter().map(|l| l.px_ticks), line)?;
-            for l in levels {
-                audit(l.px.as_deref(), l.px_ticks, meta.max_price_decimals, line)?;
-                audit(l.sz.as_deref(), l.sz_lots, meta.sz_decimals, line)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_l4(&self, book: &L4Book, line: usize) -> Result<(), ReadError> {
-        let meta = self.known_meta(book.asset, line)?;
-        for (side, levels) in [("bids", &book.bids), ("asks", &book.asks)] {
-            check_sorted(side, levels.iter().map(|l| l.px_ticks), line)?;
-            for l in levels {
-                audit(l.px.as_deref(), l.px_ticks, meta.max_price_decimals, line)?;
-            }
-        }
-        Ok(())
+    fn check_book(&mut self, book: &BookState, line: usize) -> Result<(), ReadError> {
+        self.rules
+            .book(book)
+            .map_err(|source| ReadError::Rule { line, source })
     }
 }
 
 /// Bids strictly descending, asks strictly ascending.
-fn check_sorted(
-    side: &'static str,
-    mut pxs: impl Iterator<Item = u64>,
-    line: usize,
-) -> Result<(), ReadError> {
+fn check_sorted(side: &'static str, mut pxs: impl Iterator<Item = u64>) -> Result<(), RuleError> {
     let Some(mut prev) = pxs.next() else {
         return Ok(());
     };
     for px in pxs {
         let ok = if side == "bids" { px < prev } else { px > prev };
         if !ok {
-            return Err(ReadError::UnsortedLevels {
-                side,
-                px_ticks: px,
-                line,
-            });
+            return Err(RuleError::UnsortedLevels { side, px_ticks: px });
         }
         prev = px;
     }
     Ok(())
 }
 
-fn audit(text: Option<&str>, units: u64, decimals: u32, line: usize) -> Result<(), ReadError> {
+fn audit(text: Option<&str>, units: u64, decimals: u32) -> Result<(), RuleError> {
     let Some(text) = text else { return Ok(()) };
     if decimal::parse_units(text, decimals) == Ok(units) {
         Ok(())
     } else {
-        Err(ReadError::DecimalMismatch {
+        Err(RuleError::DecimalMismatch {
             text: text.to_owned(),
             units,
-            line,
         })
     }
 }
@@ -891,23 +896,11 @@ impl<R: BufRead> Steps<R> {
                     }
                 }
                 Some(Record::Book(book)) => {
-                    let line = self.reader.line_no;
-                    let Some(step) = self
-                        .pending
-                        .as_mut()
-                        .filter(|s| s.block.height == book.height())
-                    else {
-                        return Err(ReadError::BookWithoutBlock {
-                            height: book.height(),
-                            line,
-                        });
+                    // The shared rules admitted it after the latest block,
+                    // which is the pending step.
+                    let Some(step) = self.pending.as_mut() else {
+                        unreachable!("rules admitted a book before any block");
                     };
-                    if step.books.iter().any(|b| b.asset() == book.asset()) {
-                        return Err(ReadError::DuplicateBook {
-                            asset: book.asset(),
-                            line,
-                        });
-                    }
                     step.books.push(book);
                 }
             }

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 47937dbfac1f09ca963f8e913b6af5419d5842f61b740b8554cb48a98bb064e7 # shrinks to recs = [Block(0), L2 { height: 0, bids: [(995, false)] }]

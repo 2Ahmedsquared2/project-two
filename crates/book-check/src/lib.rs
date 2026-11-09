@@ -24,7 +24,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::BufRead;
 
-use hl_book_ref::{Book, BookOp, BookSnapshot, L2Level, L2Snapshot, Level, Lots, Oid, Px, Side};
+use hl_book_ref::{
+    Book, BookOp, BookSnapshot, L2Level, L2Snapshot, Level, Lots, Oid, Px, Side, SizeOverflow,
+};
 use hl_dataset::{BookState, ReadError, Reader};
 
 pub mod replay;
@@ -40,9 +42,11 @@ pub trait Candidate {
     /// The whole book as plain data, bids highest first and asks lowest first.
     fn snapshot(&self) -> BookSnapshot;
 
-    /// The book aggregated to L2, at most `depth` levels per side. The default
-    /// aggregates [`Candidate::snapshot`]; a fast candidate should override it.
-    fn l2(&self, depth: Option<usize>) -> L2Snapshot {
+    /// The book aggregated to L2, at most `depth` levels per side, or the
+    /// first level whose total size overflows `u64`. The default aggregates
+    /// [`Candidate::snapshot`] with checked sums; a fast candidate should
+    /// override it and must never wrap or saturate a total.
+    fn l2(&self, depth: Option<usize>) -> Result<L2Snapshot, SizeOverflow> {
         self.snapshot().to_l2(depth)
     }
 }
@@ -58,7 +62,7 @@ impl Candidate for Book {
         Book::snapshot(self)
     }
 
-    fn l2(&self, depth: Option<usize>) -> L2Snapshot {
+    fn l2(&self, depth: Option<usize>) -> Result<L2Snapshot, SizeOverflow> {
         Book::l2(self, depth)
     }
 }
@@ -115,6 +119,22 @@ pub enum Field {
         /// Candidate order count at the level.
         candidate_orders: usize,
     },
+    /// A level's total size overflows `u64` lots, so it cannot be compared.
+    /// Reported as a divergence, never as equal: a wrapped total could match
+    /// a wrong recorded size.
+    SizeOverflow {
+        /// Which book holds the level.
+        book: Which,
+    },
+}
+
+/// The recorded book or the candidate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Which {
+    /// The dataset's book.
+    Recorded,
+    /// The book under test.
+    Candidate,
 }
 
 impl fmt::Display for Field {
@@ -169,6 +189,14 @@ impl fmt::Display for Field {
                 f,
                 "level not in recorded book: candidate has {} lots in {candidate_orders} order(s)",
                 candidate.0
+            ),
+            Field::SizeOverflow { book } => write!(
+                f,
+                "{} level total size overflows u64 lots",
+                match book {
+                    Which::Recorded => "recorded",
+                    Which::Candidate => "candidate",
+                }
             ),
         }
     }
@@ -334,7 +362,23 @@ fn compare_recorded<C: Candidate + ?Sized>(
         BookState::L2(r) => {
             report.l2_books_compared += 1;
             let depth = r.depth.map(|d| usize::try_from(d).unwrap_or(usize::MAX));
-            let cand = book.l2(depth);
+            let cand = match book.l2(depth) {
+                Ok(c) => c,
+                Err(o) => {
+                    return Err(divergence(
+                        height,
+                        asset,
+                        coins,
+                        LevelDiff {
+                            side: o.side,
+                            px: o.px,
+                            field: Field::SizeOverflow {
+                                book: Which::Candidate,
+                            },
+                        },
+                    ))
+                }
+            };
             let conv = |ls: &[hl_dataset::L2Level]| -> Vec<L2Level> {
                 ls.iter()
                     .map(|l| L2Level {
@@ -348,16 +392,20 @@ fn compare_recorded<C: Candidate + ?Sized>(
         }
     };
     match diff {
-        Some(d) => Err(CheckError::Divergence(Divergence {
-            height,
-            asset,
-            coin: coins.get(&asset).cloned().unwrap_or_default(),
-            side: d.side,
-            px: d.px,
-            field: d.field,
-        })),
+        Some(d) => Err(divergence(height, asset, coins, d)),
         None => Ok(()),
     }
+}
+
+fn divergence(height: u64, asset: u32, coins: &BTreeMap<u32, String>, d: LevelDiff) -> CheckError {
+    CheckError::Divergence(Divergence {
+        height,
+        asset,
+        coin: coins.get(&asset).cloned().unwrap_or_default(),
+        side: d.side,
+        px: d.px,
+        field: d.field,
+    })
 }
 
 /// What a raw-action replay covered.
@@ -443,11 +491,26 @@ pub fn check_replay<R: BufRead>(
     })
 }
 
-/// Compare two per-order books and return the first difference. Bids are
-/// checked before asks; within a side, levels are walked from best to worst;
-/// within a level, total size, then order count, then each queue position.
+/// Compare two per-order books and return the first difference. A level
+/// whose total size overflows `u64` (recorded book first, then candidate;
+/// bids before asks) is reported as [`Field::SizeOverflow`] before anything
+/// else. Then bids are checked before asks; within a side, levels are walked
+/// from best to worst; within a level, total size, then order count, then
+/// each queue position.
 #[must_use]
 pub fn compare_l4(recorded: &BookSnapshot, candidate: &BookSnapshot) -> Option<LevelDiff> {
+    for (book, snap) in [(Which::Recorded, recorded), (Which::Candidate, candidate)] {
+        for (side, levels) in [(Side::Bid, &snap.bids), (Side::Ask, &snap.asks)] {
+            if let Some(l) = levels.iter().find(|l| l.total().is_none()) {
+                return Some(LevelDiff {
+                    side,
+                    px: l.px,
+                    field: Field::SizeOverflow { book },
+                });
+            }
+        }
+    }
+    // Every total is representable from here on.
     compare_side(
         Side::Bid,
         &recorded.bids,
@@ -495,7 +558,15 @@ pub fn compare_l2(
 
 /// (price, total size, order count) of a level.
 fn l4_view(l: &Level) -> (Px, Lots, usize) {
-    (l.px, l.total(), l.orders.len())
+    (l.px, l4_total(l), l.orders.len())
+}
+
+/// A level total already checked by [`compare_l4`]'s overflow scan.
+fn l4_total(l: &Level) -> Lots {
+    let Some(total) = l.total() else {
+        unreachable!("compare_l4 reports overflowing levels before walking them");
+    };
+    total
 }
 
 fn l2_view(l: &L2Level) -> (Px, Lots, usize) {
@@ -589,7 +660,7 @@ fn compare_side<L>(
 }
 
 fn compare_level(recorded: &Level, candidate: &Level) -> Option<Field> {
-    let (rt, ct) = (recorded.total(), candidate.total());
+    let (rt, ct) = (l4_total(recorded), l4_total(candidate));
     if rt != ct {
         return Some(Field::Size {
             recorded: rt,

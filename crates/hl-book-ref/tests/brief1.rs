@@ -120,7 +120,7 @@ fn l2_aggregates_size_and_order_count_per_level_best_first() {
         order(5, Side::Ask, 102, 3),
         order(6, Side::Ask, 101, 4),
     ]);
-    let l2 = b.l2(None);
+    let l2 = b.l2(None).unwrap();
     assert_eq!(
         l2.bids,
         vec![
@@ -165,11 +165,11 @@ fn l2_top_n_truncates_each_side_independently() {
         order(2, Side::Bid, 99, 7),
         order(3, Side::Ask, 101, 1),
     ]);
-    let l2 = b.l2(Some(1));
+    let l2 = b.l2(Some(1)).unwrap();
     assert_eq!(l2.bids.len(), 1);
     assert_eq!(l2.bids[0].px, Px(100));
     assert_eq!(l2.asks.len(), 1);
-    assert_eq!(b.snapshot().to_l2(Some(1)), l2);
+    assert_eq!(b.snapshot().to_l2(Some(1)).unwrap(), l2);
 }
 
 // ---- matching ----

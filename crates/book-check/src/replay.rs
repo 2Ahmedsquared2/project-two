@@ -42,6 +42,7 @@ pub enum OidRule {
     /// A leg rejected before that (tick/lot, unknown asset or tif, trigger;
     /// `ACTION_ORDERING.md` §4.5) takes no oid. Whether Hyperliquid gives a
     /// rejected leg an oid is UNVERIFIED.
+    // TODO(UNVERIFIED-§4.5-oid): whether a per-order-rejected leg takes an oid.
     #[default]
     OnePerAcceptedLeg,
 }
@@ -193,6 +194,16 @@ fn count(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
 
+/// What validation made of a leg.
+enum Checked {
+    /// A limit leg ready for its book.
+    Limit(Leg),
+    /// A trigger leg: valid, but never on the book in Phase 1 (§2.3).
+    Trigger,
+    /// Rejected per order (tick/lot, unknown asset or tif; §4.5).
+    Rejected,
+}
+
 /// A validated limit leg, ready for its book.
 struct Leg {
     asset: u32,
@@ -253,10 +264,19 @@ impl Replayer {
         self.books.get(&asset)
     }
 
+    /// The (asset, synthetic oid) of the resting order `user` placed with
+    /// `cloid`, if it still rests.
+    #[must_use]
+    pub fn cloid_order(&self, user: &str, cloid: &str) -> Option<(u32, Oid)> {
+        self.resolve_cloid(*self.owners.get(user)?, cloid)
+    }
+
     /// Apply every tx of a block in file order. `block.ops` is ignored.
     pub fn apply_block(&mut self, block: &Block) {
         self.stats.blocks += 1;
         self.stats.ops_ignored += count(block.ops.len());
+        // TODO(UNVERIFIED-§1.2-tx-order): explorer file order is taken as
+        // execution order; UNVERIFIED against the node's replica_cmds.
         for tx in &block.txs {
             self.apply_tx(tx);
         }
@@ -264,6 +284,10 @@ impl Replayer {
 
     fn apply_tx(&mut self, tx: &Tx) {
         self.stats.txs += 1;
+        // TODO(UNVERIFIED-§1.5-errored-oid): an errored tx changes nothing and
+        // consumes no oid; whether it consumes an oid is UNVERIFIED.
+        // TODO(UNVERIFIED-§6.2-nonce): nonces are not checked; whether a
+        // nonce-rejected action appears in a block is UNVERIFIED.
         if tx.error.is_some() {
             self.stats.errored_txs_skipped += 1;
             return;
@@ -275,6 +299,8 @@ impl Replayer {
         let owner = self.owner(&tx.user);
         match parsed {
             Action::Order { orders } => {
+                // TODO(UNVERIFIED-§2.1-leg-order): legs apply in array order
+                // (INFERENCE from the positional statuses array).
                 for leg in &orders {
                     bump(&mut self.stats.order_legs, leg.t.name());
                     self.place_leg(owner, leg, None);
@@ -302,6 +328,9 @@ impl Replayer {
         }
     }
 
+    // TODO(UNVERIFIED-§3.4-stp-address): self-trade prevention compares the
+    // tx signer; whether Hyperliquid compares the master account is UNVERIFIED.
+    // STP itself is behind ReplayConfig::self_trade_prevention.
     fn owner(&mut self, user: &str) -> Owner {
         let next = Owner(u32::try_from(self.owners.len()).unwrap_or(u32::MAX));
         *self.owners.entry(user.to_owned()).or_insert(next)
@@ -339,36 +368,41 @@ impl Replayer {
     }
 
     /// Check a leg against tif, asset and tick/lot rules.
-    fn validate(&mut self, leg: &OrderWire) -> Option<Leg> {
+    fn validate(&mut self, leg: &OrderWire) -> Checked {
         let tif = match &leg.t {
             OrderKind::Trigger => {
                 self.stats.trigger_legs_skipped += 1;
-                return None;
+                return Checked::Trigger;
             }
             OrderKind::Limit(LimitTif::Alo) => Tif::Alo,
             OrderKind::Limit(LimitTif::Gtc) => Tif::Gtc,
             OrderKind::Limit(LimitTif::Ioc | LimitTif::FrontendMarket) => Tif::Ioc,
             OrderKind::Limit(LimitTif::Unknown(_)) => {
                 self.stats.legs_unknown_tif += 1;
-                return None;
+                return Checked::Rejected;
             }
         };
         let Some(meta) = self.metas.get(&leg.a) else {
             self.stats.legs_unknown_asset += 1;
-            return None;
+            return Checked::Rejected;
         };
         let (Ok(px), Ok(sz)) = (meta.order_px_ticks(&leg.p), meta.sz_lots(&leg.s)) else {
             self.stats.legs_invalid_tick_lot += 1;
-            return None;
+            return Checked::Rejected;
         };
         if sz == 0 {
             self.stats.legs_invalid_tick_lot += 1;
-            return None;
+            return Checked::Rejected;
         }
+        // TODO(UNVERIFIED-§2.3-reduce-only): reduce-only legs are placed as
+        // ordinary orders; reject-vs-clip is UNVERIFIED and positions are not
+        // modelled.
+        // TODO(UNVERIFIED-§3.6-min-notional): the $10 minimum value is not
+        // enforced; its per-asset threshold is UNVERIFIED.
         if leg.r {
             self.stats.reduce_only_legs += 1;
         }
-        Some(Leg {
+        Checked::Limit(Leg {
             asset: leg.a,
             side: if leg.b { Side::Bid } else { Side::Ask },
             px: Px(px),
@@ -378,10 +412,22 @@ impl Replayer {
     }
 
     /// Place one leg; `old` is a modify's resolved old order, cancelled first.
+    ///
+    /// The new leg is validated before anything else. A leg rejected per order
+    /// (tick/lot, unknown asset or tif) changes nothing: a modify's old order
+    /// keeps its place, oid and cloid, and no oid is consumed.
+    // TODO(INFERENCE-§4.5-modify): that a rejected modify leaves the original
+    // resting is INFERENCE (`ACTION_ORDERING.md` §4.5: the exchange returns a
+    // per-order error for the modify); confirm against node order statuses.
     fn place_leg(&mut self, owner: Owner, wire: &OrderWire, old: Option<(u32, Oid)>) {
-        let leg = self.validate(wire);
-        // A modify whose new leg cannot be placed, or that moves to another
-        // asset, still cancels the old order (modify = cancel + place).
+        let leg = match self.validate(wire) {
+            Checked::Rejected => return,
+            Checked::Trigger => None,
+            Checked::Limit(l) => Some(l),
+        };
+        // A modify into a trigger order, or onto another asset, cancels the
+        // old order and places the new one off this book (modify = cancel +
+        // place). A same-asset limit modify cancels inside `Book::modify`.
         if let Some((old_asset, old_oid)) = old {
             if leg.as_ref().is_none_or(|l| l.asset != old_asset) {
                 if let Some(b) = self.books.get_mut(&old_asset) {
@@ -391,6 +437,8 @@ impl Replayer {
             }
         }
         let Some(leg) = leg else { return };
+        // TODO(UNVERIFIED-§5.2-oid): oids are synthetic, one per leg handed to
+        // a book (OidRule::OnePerAcceptedLeg); the exchange's rule is UNVERIFIED.
         let oid = Oid(self.next_oid);
         self.next_oid += 1;
         let order = Order {

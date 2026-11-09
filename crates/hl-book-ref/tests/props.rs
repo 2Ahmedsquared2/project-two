@@ -95,7 +95,7 @@ proptest! {
         for (i, (side, px, sz, t)) in orders.into_iter().enumerate() {
             let side = if side { Side::Bid } else { Side::Ask };
             let order = Order { oid: Oid(u64::try_from(i).unwrap() + 1), side, px: Px(px), sz: Lots(sz) };
-            let opposite_before: u64 = book.l2(None).asks.iter().chain(book.l2(None).bids.iter())
+            let opposite_before: u64 = book.l2(None).unwrap().asks.iter().chain(book.l2(None).unwrap().bids.iter())
                 .map(|l| l.sz.0).sum();
             let tif = tif(t);
             match book.place(order, tif) {
@@ -111,7 +111,7 @@ proptest! {
                         let ok = match side { Side::Bid => f.px <= Px(px), Side::Ask => f.px >= Px(px) };
                         prop_assert!(ok);
                     }
-                    let after: u64 = book.l2(None).asks.iter().chain(book.l2(None).bids.iter())
+                    let after: u64 = book.l2(None).unwrap().asks.iter().chain(book.l2(None).unwrap().bids.iter())
                         .map(|l| l.sz.0).sum();
                     prop_assert_eq!(after + filled, opposite_before + rested);
                 }
@@ -123,7 +123,7 @@ proptest! {
             if let (Some(b), Some(a)) = (book.best_bid(), book.best_ask()) {
                 prop_assert!(b < a);
             }
-            prop_assert_eq!(book.l2(None), book.snapshot().to_l2(None));
+            prop_assert_eq!(book.l2(None).unwrap(), book.snapshot().to_l2(None).unwrap());
         }
     }
 }
