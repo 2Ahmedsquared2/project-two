@@ -120,6 +120,14 @@ One validator in `hl-dataset` enforces these for both the writer and the
 reader and reports a `RuleError` either way, so anything the writer accepts
 the reader reads (property-tested).
 
+The writer advances this validation state only after a record's whole line has
+reached the sink. If an output error happens before any byte of a record is
+written (for example `WouldBlock`), nothing changes and the record can be
+retried. If it happens after part of the line was written, the writer is
+poisoned: every later call returns `WriteError::Poisoned`, so it never adds to
+a file that holds a torn line. A property test drives the writer through
+scripted sink faults and checks that whatever it finishes is readable.
+
 1. The first line is a `header` with `format_version` 2 and valid, unique assets.
 2. Block heights are contiguous from `first_height`. A block at `u64::MAX`
    is allowed; any block after it is a `HeightOverflow` error.

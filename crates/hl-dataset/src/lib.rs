@@ -511,6 +511,10 @@ pub enum WriteError {
     /// [`Reader`] enforces), so it was not written.
     #[error(transparent)]
     Rule(#[from] RuleError),
+    /// An earlier output error may have left a torn record in the sink, so the
+    /// writer refuses every later call. Carries the original error's kind.
+    #[error("writer poisoned by an earlier output error ({0:?})")]
+    Poisoned(std::io::ErrorKind),
 }
 
 /// A structural rule of the format, enforced identically by [`Writer`] and
@@ -595,6 +599,13 @@ impl Rules {
 
     /// Check a block and, if it passes, record it as the latest.
     fn block(&mut self, block: &Block) -> Result<(), RuleError> {
+        self.check_block(block)?;
+        self.commit_block(block.height);
+        Ok(())
+    }
+
+    /// Check a block without changing any state.
+    fn check_block(&self, block: &Block) -> Result<(), RuleError> {
         let Some(expected) = self.next_height else {
             // The previous block was at u64::MAX.
             return Err(RuleError::HeightOverflow(u64::MAX));
@@ -612,14 +623,25 @@ impl Rules {
         {
             return Err(RuleError::UnknownAsset(op.asset));
         }
-        self.next_height = block.height.checked_add(1);
-        self.last_block = Some(block.height);
-        self.books_after_block.clear();
         Ok(())
+    }
+
+    /// Record a block that passed [`Rules::check_block`] as the latest.
+    fn commit_block(&mut self, height: u64) {
+        self.next_height = height.checked_add(1);
+        self.last_block = Some(height);
+        self.books_after_block.clear();
     }
 
     /// Check a book state and, if it passes, record it after the latest block.
     fn book(&mut self, book: &BookState) -> Result<(), RuleError> {
+        self.check_book(book)?;
+        self.commit_book(book.asset());
+        Ok(())
+    }
+
+    /// Check a book state without changing any state.
+    fn check_book(&self, book: &BookState) -> Result<(), RuleError> {
         if self.last_block != Some(book.height()) {
             return Err(RuleError::BookWithoutBlock(book.height()));
         }
@@ -657,69 +679,154 @@ impl Rules {
                 }
             }
         }
-        self.books_after_block.insert(asset);
         Ok(())
+    }
+
+    /// Record a book that passed [`Rules::check_book`] after the latest block.
+    fn commit_book(&mut self, asset: u32) {
+        self.books_after_block.insert(asset);
     }
 }
 
 /// Streaming dataset writer. Enforces the structural rules as it goes.
+///
+/// Each record is validated against the rules and serialised into an owned
+/// buffer first; the rules' state (next height, books after the latest block)
+/// advances only after the whole buffer has reached the sink. A record that is
+/// refused, or whose bytes never reached the sink, leaves the writer exactly as
+/// it was.
+///
+/// # Errors
+///
+/// Every method returns [`WriteError::Rule`] for a record that breaks a
+/// structural rule; nothing is written and the call may be retried with a
+/// corrected record.
+///
+/// On an output error the writer distinguishes two cases:
+///
+/// - **No byte of the record reached the sink** (the first `write` call of
+///   the record failed, e.g. `WouldBlock`, or returned `Ok(0)`, reported as
+///   `WriteZero`): the error is returned as [`WriteError::Io`], no state
+///   changes, and the same record may be retried.
+/// - **Some bytes reached the sink**, then a later `write` failed: the sink
+///   holds a torn line that cannot be undone. The error is returned once as
+///   [`WriteError::Io`]; from then on every call, [`Writer::finish`] included,
+///   returns [`WriteError::Poisoned`] with the original error's kind.
+///
+/// `Interrupted` is retried inside the writer, as [`Write::write_all`] does.
+/// This guarantee covers the bytes the sink `W` accepted: a buffering sink
+/// such as `BufWriter` reports its inner errors at a later call, so wrap the
+/// innermost sink you need the guarantee for. A failed `flush` in
+/// [`Writer::finish`] returns [`WriteError::Io`]; the data may be incomplete.
 #[derive(Debug)]
 pub struct Writer<W: Write> {
     out: W,
     rules: Rules,
+    buf: Vec<u8>,
+    /// Set by an output error after part of a record reached the sink.
+    poisoned: Option<std::io::ErrorKind>,
 }
 
 impl<W: Write> Writer<W> {
-    /// Start a dataset by writing its header.
-    pub fn new(mut out: W, header: &Header) -> Result<Self, WriteError> {
+    /// Start a dataset by writing its header. Any output error is returned and
+    /// no writer is made.
+    pub fn new(out: W, header: &Header) -> Result<Self, WriteError> {
         let rules = Rules::new(header).map_err(|(a, _)| WriteError::BadAssetMeta(a))?;
         let mut header = header.clone();
         header.extra.remove("kind");
-        write_tagged(&mut out, "header", &header)?;
-        Ok(Self { out, rules })
+        let mut w = Self {
+            out,
+            rules,
+            buf: Vec::new(),
+            poisoned: None,
+        };
+        encode_tagged(&mut w.buf, "header", &header)?;
+        w.emit()?;
+        Ok(w)
     }
 
     /// Append a block. Its height must be the next in the run.
     pub fn write_block(&mut self, block: &Block) -> Result<(), WriteError> {
-        self.rules.block(block)?;
-        write_tagged(&mut self.out, "block", block)
+        self.ready()?;
+        self.rules.check_block(block)?;
+        encode_tagged(&mut self.buf, "block", block)?;
+        self.emit()?;
+        self.rules.commit_block(block.height);
+        Ok(())
     }
 
     /// Append a book state after the block just written (at most one per
     /// asset). Its levels must be sorted best-first, its audit decimals must
     /// match their integers, and its L4 level totals must fit in `u64`.
     pub fn write_book(&mut self, book: &BookState) -> Result<(), WriteError> {
-        self.rules.book(book)?;
+        self.ready()?;
+        self.rules.check_book(book)?;
         match book {
-            BookState::L2(b) => write_tagged(&mut self.out, "l2_book", b),
-            BookState::L4(b) => write_tagged(&mut self.out, "l4_book", b),
+            BookState::L2(b) => encode_tagged(&mut self.buf, "l2_book", b)?,
+            BookState::L4(b) => encode_tagged(&mut self.buf, "l4_book", b)?,
         }
+        self.emit()?;
+        self.rules.commit_book(book.asset());
+        Ok(())
+    }
+
+    /// The underlying sink, for inspection. Writing to it directly bypasses
+    /// the format rules.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.out
     }
 
     /// Flush and return the underlying writer.
     pub fn finish(mut self) -> Result<W, WriteError> {
+        self.ready()?;
         self.out.flush()?;
         Ok(self.out)
     }
+
+    fn ready(&self) -> Result<(), WriteError> {
+        match self.poisoned {
+            Some(kind) => Err(WriteError::Poisoned(kind)),
+            None => Ok(()),
+        }
+    }
+
+    /// Write the whole of `self.buf` to the sink. Poisons the writer if an
+    /// error follows a partial write.
+    fn emit(&mut self) -> Result<(), WriteError> {
+        let mut done = 0;
+        while done < self.buf.len() {
+            let err = match self.out.write(&self.buf[done..]) {
+                Ok(0) => std::io::Error::from(std::io::ErrorKind::WriteZero),
+                Ok(n) => {
+                    done += n;
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => e,
+            };
+            if done > 0 {
+                self.poisoned = Some(err.kind());
+            }
+            return Err(err.into());
+        }
+        Ok(())
+    }
 }
 
-/// Write `{"kind":<kind>, ...fields of value}` and a newline. `value` must
-/// serialise to a JSON object.
-fn write_tagged<W: Write, T: Serialize>(
-    out: &mut W,
-    kind: &str,
-    value: &T,
-) -> Result<(), WriteError> {
+/// Serialise `{"kind":<kind>, ...fields of value}` and a newline into `buf`,
+/// replacing its contents. `value` must serialise to a JSON object.
+fn encode_tagged<T: Serialize>(buf: &mut Vec<u8>, kind: &str, value: &T) -> Result<(), WriteError> {
+    buf.clear();
     let body = serde_json::to_string(value)?;
     let rest = body
         .strip_prefix('{')
         .ok_or_else(|| std::io::Error::other("record did not serialise to an object"))?;
     let sep = if rest == "}" { "" } else { "," };
-    writeln!(
-        out,
-        "{{\"kind\":{}{sep}{rest}",
-        serde_json::to_string(kind)?
-    )?;
+    buf.extend_from_slice(b"{\"kind\":");
+    buf.extend_from_slice(serde_json::to_string(kind)?.as_bytes());
+    buf.extend_from_slice(sep.as_bytes());
+    buf.extend_from_slice(rest.as_bytes());
+    buf.push(b'\n');
     Ok(())
 }
 
