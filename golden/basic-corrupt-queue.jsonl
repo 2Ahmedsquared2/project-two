@@ -1,0 +1,13 @@
+{"kind":"header","format_version":2,"chain":"golden","first_height":1,"source":"hand-built golden vector; expected books derived by hand in golden/README.md","assets":[{"asset_index":0,"name":"GOLD","sz_decimals":5,"is_spot":false,"max_price_decimals":1}]}
+{"kind":"block","height":1,"time_ms":1000,"txs":[],"ops":[{"asset":0,"op":"insert","oid":1,"side":"bid","px":1000,"sz":500},{"asset":0,"op":"insert","oid":2,"side":"ask","px":1010,"sz":300}]}
+{"kind":"l4_book","height":1,"asset":0,"bids":[{"px_ticks":1000,"orders":[{"oid":1,"sz_lots":500}]}],"asks":[{"px_ticks":1010,"orders":[{"oid":2,"sz_lots":300}]}]}
+{"kind":"block","height":2,"time_ms":2000,"txs":[],"ops":[{"asset":0,"op":"insert","oid":3,"side":"bid","px":1000,"sz":200},{"asset":0,"op":"insert","oid":4,"side":"bid","px":995,"sz":100}]}
+{"kind":"l4_book","height":2,"asset":0,"bids":[{"px_ticks":1000,"orders":[{"oid":3,"sz_lots":200},{"oid":1,"sz_lots":500}]},{"px_ticks":995,"orders":[{"oid":4,"sz_lots":100}]}],"asks":[{"px_ticks":1010,"orders":[{"oid":2,"sz_lots":300}]}]}
+{"kind":"block","height":3,"time_ms":3000,"txs":[],"ops":[{"asset":0,"op":"resize","oid":1,"sz":150},{"asset":0,"op":"insert","oid":5,"side":"ask","px":1010,"sz":50}]}
+{"kind":"l4_book","height":3,"asset":0,"bids":[{"px_ticks":1000,"orders":[{"oid":1,"sz_lots":150},{"oid":3,"sz_lots":200}]},{"px_ticks":995,"orders":[{"oid":4,"sz_lots":100}]}],"asks":[{"px_ticks":1010,"orders":[{"oid":2,"sz_lots":300},{"oid":5,"sz_lots":50}]}]}
+{"kind":"block","height":4,"time_ms":4000,"txs":[],"ops":[{"asset":0,"op":"cancel","oid":1},{"asset":0,"op":"cancel","oid":2}]}
+{"kind":"l4_book","height":4,"asset":0,"bids":[{"px_ticks":1000,"orders":[{"oid":3,"sz_lots":200}]},{"px_ticks":995,"orders":[{"oid":4,"sz_lots":100}]}],"asks":[{"px_ticks":1010,"orders":[{"oid":5,"sz_lots":50}]}]}
+{"kind":"block","height":5,"time_ms":5000,"txs":[],"ops":[{"asset":0,"op":"insert","oid":6,"side":"ask","px":1005,"sz":75},{"asset":0,"op":"cancel","oid":4}]}
+{"kind":"l4_book","height":5,"asset":0,"bids":[{"px_ticks":1000,"orders":[{"oid":3,"sz_lots":200}]}],"asks":[{"px_ticks":1005,"orders":[{"oid":6,"sz_lots":75}]},{"px_ticks":1010,"orders":[{"oid":5,"sz_lots":50}]}]}
+{"kind":"block","height":6,"time_ms":6000,"txs":[],"ops":[]}
+{"kind":"l4_book","height":6,"asset":0,"bids":[{"px_ticks":1000,"orders":[{"oid":3,"sz_lots":200}]}],"asks":[{"px_ticks":1005,"orders":[{"oid":6,"sz_lots":75}]},{"px_ticks":1010,"orders":[{"oid":5,"sz_lots":50}]}]}

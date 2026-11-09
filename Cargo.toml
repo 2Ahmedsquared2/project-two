@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = ["crates/hl-book-ref", "crates/hl-dataset", "crates/book-check"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/2Ahmedsquared2/project-two"
+authors = ["Project Two contributors"]
+
+[workspace.dependencies]
+hl-book-ref = { path = "crates/hl-book-ref", version = "0.1.0" }
+hl-dataset = { path = "crates/hl-dataset", version = "0.1.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+proptest = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+float_arithmetic = "deny"
+float_cmp = "deny"
+as_conversions = "warn"
+missing_errors_doc = "allow"
+module_name_repetitions = "allow"
+
+[profile.release]
+debug = 1

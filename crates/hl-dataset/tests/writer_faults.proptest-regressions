@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b8185cd988eb5801b2d97df43aa99c7727a2fc0374b89061567ed0337ee50f69 # shrinks to recs = [(Block(1), false)], writes = [Accept, Fail(BrokenPipe)], flushes = []

@@ -1,0 +1,5 @@
+# Floats are banned in the book and dataset: prices are ticks, sizes are lots.
+disallowed-types = [
+  { path = "f32", reason = "prices are integer ticks and sizes integer lots; floats never enter the book" },
+  { path = "f64", reason = "prices are integer ticks and sizes integer lots; floats never enter the book" },
+]

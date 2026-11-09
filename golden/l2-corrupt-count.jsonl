@@ -1,0 +1,13 @@
+{"kind":"header","format_version":2,"chain":"golden","first_height":1,"source":"hand-built golden vector, L2 view of basic.jsonl; see golden/README.md","assets":[{"asset_index":0,"name":"GOLD","sz_decimals":5,"is_spot":false,"max_price_decimals":1}]}
+{"kind":"block","height":1,"time_ms":1000,"txs":[],"ops":[{"asset":0,"op":"insert","oid":1,"side":"bid","px":1000,"sz":500},{"asset":0,"op":"insert","oid":2,"side":"ask","px":1010,"sz":300}]}
+{"kind":"l2_book","height":1,"asset":0,"depth":1,"bids":[{"px_ticks":1000,"sz_lots":500,"n":1,"px":"100","sz":"0.005"}],"asks":[{"px_ticks":1010,"sz_lots":300,"n":1,"px":"101","sz":"0.003"}]}
+{"kind":"block","height":2,"time_ms":2000,"txs":[],"ops":[{"asset":0,"op":"insert","oid":3,"side":"bid","px":1000,"sz":200},{"asset":0,"op":"insert","oid":4,"side":"bid","px":995,"sz":100}]}
+{"kind":"l2_book","height":2,"asset":0,"depth":1,"bids":[{"px_ticks":1000,"sz_lots":700,"n":2,"px":"100","sz":"0.007"}],"asks":[{"px_ticks":1010,"sz_lots":300,"n":1,"px":"101","sz":"0.003"}]}
+{"kind":"block","height":3,"time_ms":3000,"txs":[],"ops":[{"asset":0,"op":"resize","oid":1,"sz":150},{"asset":0,"op":"insert","oid":5,"side":"ask","px":1010,"sz":50}]}
+{"kind":"l2_book","height":3,"asset":0,"depth":1,"bids":[{"px_ticks":1000,"sz_lots":350,"n":1,"px":"100","sz":"0.0035"}],"asks":[{"px_ticks":1010,"sz_lots":350,"n":2,"px":"101","sz":"0.0035"}]}
+{"kind":"block","height":4,"time_ms":4000,"txs":[],"ops":[{"asset":0,"op":"cancel","oid":1},{"asset":0,"op":"cancel","oid":2}]}
+{"kind":"l2_book","height":4,"asset":0,"depth":1,"bids":[{"px_ticks":1000,"sz_lots":200,"n":1,"px":"100","sz":"0.002"}],"asks":[{"px_ticks":1010,"sz_lots":50,"n":1,"px":"101","sz":"0.0005"}]}
+{"kind":"block","height":5,"time_ms":5000,"txs":[],"ops":[{"asset":0,"op":"insert","oid":6,"side":"ask","px":1005,"sz":75},{"asset":0,"op":"cancel","oid":4}]}
+{"kind":"l2_book","height":5,"asset":0,"depth":1,"bids":[{"px_ticks":1000,"sz_lots":200,"n":1,"px":"100","sz":"0.002"}],"asks":[{"px_ticks":1005,"sz_lots":75,"n":1,"px":"100.5","sz":"0.00075"}]}
+{"kind":"block","height":6,"time_ms":6000,"txs":[],"ops":[]}
+{"kind":"l2_book","height":6,"asset":0,"bids":[{"px_ticks":1000,"sz_lots":200,"n":1,"px":"100","sz":"0.002"}],"asks":[{"px_ticks":1005,"sz_lots":75,"n":1,"px":"100.5","sz":"0.00075"},{"px_ticks":1010,"sz_lots":50,"n":1,"px":"101","sz":"0.0005"}]}
