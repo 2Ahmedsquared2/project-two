@@ -93,6 +93,15 @@ pub enum BookOp {
         /// The order that leaves.
         oid: Oid,
     },
+    /// An order comes to rest directly in front of `before`, which must rest on
+    /// the same side at the same price. Mirrors hl-node's raw book diff
+    /// `insertBefore` (needed later for ALO priority).
+    InsertBefore {
+        /// The resting order the new one goes in front of.
+        before: Oid,
+        /// The new order.
+        order: Order,
+    },
     /// A resting order's remaining size changes in place; queue position is kept.
     Resize {
         /// The order that changes.
@@ -114,6 +123,24 @@ pub enum ApplyError {
     /// An insert or resize carried a zero size.
     #[error("order id {0:?} has zero size")]
     ZeroSize(Oid),
+    /// An `insert_before` anchor rests on another side or price than the new order.
+    #[error("order {oid:?} cannot go before {before:?}: different side or price")]
+    AnchorMismatch {
+        /// The new order.
+        oid: Oid,
+        /// The anchor it named.
+        before: Oid,
+    },
+    /// An add-liquidity-only order would cross the opposite best price, so it is rejected.
+    #[error("ALO order {oid:?} at {px:?} would cross opposite best {opposite_best:?}")]
+    AloWouldCross {
+        /// The rejected order.
+        oid: Oid,
+        /// Its price.
+        px: Px,
+        /// The opposite side's best price at the time.
+        opposite_best: Px,
+    },
     /// A resting insert would cross the opposite best price: the op stream is inconsistent.
     #[error("order {oid:?} at {px:?} crosses opposite best {opposite_best:?}")]
     Crossed {
@@ -135,12 +162,92 @@ pub struct Level {
     pub orders: Vec<(Oid, Lots)>,
 }
 
+impl BookSnapshot {
+    /// Aggregate to L2, keeping at most `depth` levels per side (all when `None`).
+    #[must_use]
+    pub fn to_l2(&self, depth: Option<usize>) -> L2Snapshot {
+        let agg = |levels: &[Level]| -> Vec<L2Level> {
+            levels
+                .iter()
+                .take(depth.unwrap_or(usize::MAX))
+                .map(L2Level::from)
+                .collect()
+        };
+        L2Snapshot {
+            bids: agg(&self.bids),
+            asks: agg(&self.asks),
+        }
+    }
+}
+
 impl Level {
     /// Total resting size at this level.
     #[must_use]
     pub fn total(&self) -> Lots {
         Lots(self.orders.iter().map(|(_, sz)| sz.0).sum())
     }
+}
+
+/// One aggregated price level, as in Hyperliquid's public `l2Book`: price,
+/// total resting size and number of resting orders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct L2Level {
+    /// Price in ticks.
+    pub px: Px,
+    /// Total resting size in lots.
+    pub sz: Lots,
+    /// Number of resting orders at the level.
+    pub n: u32,
+}
+
+impl From<&Level> for L2Level {
+    fn from(level: &Level) -> Self {
+        Self {
+            px: level.px,
+            sz: level.total(),
+            n: u32::try_from(level.orders.len()).unwrap_or(u32::MAX),
+        }
+    }
+}
+
+/// An aggregated book: bids best (highest) first, asks best (lowest) first.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub struct L2Snapshot {
+    /// Bid levels, highest price first.
+    pub bids: Vec<L2Level>,
+    /// Ask levels, lowest price first.
+    pub asks: Vec<L2Level>,
+}
+
+/// Time in force for [`Book::place`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Tif {
+    /// Good till cancelled: match, then rest any remainder.
+    Gtc,
+    /// Immediate or cancel: match, then drop any remainder. Never rests.
+    Ioc,
+    /// Add liquidity only: rejected if it would cross, otherwise rests without matching.
+    Alo,
+}
+
+/// One fill against a resting maker, at the maker's price.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Fill {
+    /// The resting order that was hit.
+    pub maker: Oid,
+    /// Fill price: the maker's resting price.
+    pub px: Px,
+    /// Filled size.
+    pub sz: Lots,
+}
+
+/// What [`Book::place`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Placed {
+    /// Fills in execution order.
+    pub fills: Vec<Fill>,
+    /// Size that came to rest under the incoming order's id, if any.
+    pub rested: Option<Lots>,
 }
 
 /// The whole book as plain data: bids best (highest) first, asks best (lowest) first.
@@ -192,37 +299,144 @@ impl Book {
     pub fn apply(&mut self, op: &BookOp) -> Result<(), ApplyError> {
         match *op {
             BookOp::Insert(order) => self.insert(order),
+            BookOp::InsertBefore { before, order } => self.insert_before(before, order),
             BookOp::Cancel { oid } => self.cancel(oid),
             BookOp::Resize { oid, sz } => self.resize(oid, sz),
         }
     }
 
-    fn insert(&mut self, order: Order) -> Result<(), ApplyError> {
+    /// Size and id checks shared by every way an order enters the book.
+    fn validate_new(&self, order: Order) -> Result<(), ApplyError> {
         if order.sz.0 == 0 {
             return Err(ApplyError::ZeroSize(order.oid));
         }
         if self.index.contains_key(&order.oid) {
             return Err(ApplyError::DuplicateOid(order.oid));
         }
-        if let Some(opposite_best) = self.best(order.side.opposite()) {
-            let crosses = match order.side {
-                Side::Bid => order.px >= opposite_best,
-                Side::Ask => order.px <= opposite_best,
-            };
-            if crosses {
-                return Err(ApplyError::Crossed {
-                    oid: order.oid,
-                    px: order.px,
-                    opposite_best,
-                });
-            }
+        Ok(())
+    }
+
+    /// The opposite best price if `order` would cross it.
+    fn crossing(&self, order: Order) -> Option<Px> {
+        let opposite_best = self.best(order.side.opposite())?;
+        let crosses = match order.side {
+            Side::Bid => order.px >= opposite_best,
+            Side::Ask => order.px <= opposite_best,
+        };
+        crosses.then_some(opposite_best)
+    }
+
+    fn check_resting(&self, order: Order) -> Result<(), ApplyError> {
+        self.validate_new(order)?;
+        if let Some(opposite_best) = self.crossing(order) {
+            return Err(ApplyError::Crossed {
+                oid: order.oid,
+                px: order.px,
+                opposite_best,
+            });
         }
+        Ok(())
+    }
+
+    fn insert(&mut self, order: Order) -> Result<(), ApplyError> {
+        self.check_resting(order)?;
         self.side_mut(order.side)
             .entry(order.px)
             .or_default()
             .push_back(order);
         self.index.insert(order.oid, (order.side, order.px));
         Ok(())
+    }
+
+    fn insert_before(&mut self, before: Oid, order: Order) -> Result<(), ApplyError> {
+        let (side, px) = *self
+            .index
+            .get(&before)
+            .ok_or(ApplyError::UnknownOid(before))?;
+        if side != order.side || px != order.px {
+            return Err(ApplyError::AnchorMismatch {
+                oid: order.oid,
+                before,
+            });
+        }
+        self.check_resting(order)?;
+        let Some(queue) = self.side_mut(side).get_mut(&px) else {
+            unreachable!("index points at a missing level for {before:?}");
+        };
+        let Some(pos) = queue.iter().position(|o| o.oid == before) else {
+            unreachable!("index points at a level that lacks {before:?}");
+        };
+        queue.insert(pos, order);
+        self.index.insert(order.oid, (side, px));
+        Ok(())
+    }
+
+    /// Place an incoming order: match it against the opposite side (best price
+    /// first, FIFO within a level, fills at the resting price), then rest the
+    /// remainder for [`Tif::Gtc`], drop it for [`Tif::Ioc`]. A [`Tif::Alo`]
+    /// order that would cross is rejected; otherwise it rests without matching.
+    ///
+    /// Self-trade prevention is not modelled (the Hyperliquid rule is
+    /// unverified). On error the book is unchanged.
+    pub fn place(&mut self, order: Order, tif: Tif) -> Result<Placed, ApplyError> {
+        self.validate_new(order)?;
+        if tif == Tif::Alo {
+            if let Some(opposite_best) = self.crossing(order) {
+                return Err(ApplyError::AloWouldCross {
+                    oid: order.oid,
+                    px: order.px,
+                    opposite_best,
+                });
+            }
+            self.insert(order)?;
+            return Ok(Placed {
+                fills: Vec::new(),
+                rested: Some(order.sz),
+            });
+        }
+        let mut remaining = order.sz.0;
+        let mut fills = Vec::new();
+        while remaining > 0 {
+            let Some(best) = self.crossing(Order {
+                sz: Lots(remaining),
+                ..order
+            }) else {
+                break;
+            };
+            let opposite = order.side.opposite();
+            let Some(queue) = self.side_mut(opposite).get_mut(&best) else {
+                unreachable!("best price {best:?} has no level");
+            };
+            let Some(maker) = queue.front_mut() else {
+                unreachable!("empty level at {best:?}");
+            };
+            let take = remaining.min(maker.sz.0);
+            fills.push(Fill {
+                maker: maker.oid,
+                px: best,
+                sz: Lots(take),
+            });
+            remaining -= take;
+            maker.sz.0 -= take;
+            if maker.sz.0 == 0 {
+                let oid = maker.oid;
+                queue.pop_front();
+                if queue.is_empty() {
+                    self.side_mut(opposite).remove(&best);
+                }
+                self.index.remove(&oid);
+            }
+        }
+        let rested = if remaining > 0 && tif == Tif::Gtc {
+            self.insert(Order {
+                sz: Lots(remaining),
+                ..order
+            })?;
+            Some(Lots(remaining))
+        } else {
+            None
+        };
+        Ok(Placed { fills, rested })
     }
 
     fn cancel(&mut self, oid: Oid) -> Result<(), ApplyError> {
@@ -316,6 +530,24 @@ impl Book {
             px,
             orders: queue.iter().map(|o| (o.oid, o.sz)).collect(),
         })
+    }
+
+    /// The book aggregated to L2, at most `depth` levels per side (all when `None`).
+    #[must_use]
+    pub fn l2(&self, depth: Option<usize>) -> L2Snapshot {
+        let agg = |it: &mut dyn Iterator<Item = (&Px, &VecDeque<Order>)>| -> Vec<L2Level> {
+            it.take(depth.unwrap_or(usize::MAX))
+                .map(|(px, q)| L2Level {
+                    px: *px,
+                    sz: Lots(q.iter().map(|o| o.sz.0).sum()),
+                    n: u32::try_from(q.len()).unwrap_or(u32::MAX),
+                })
+                .collect()
+        };
+        L2Snapshot {
+            bids: agg(&mut self.bids.iter().rev()),
+            asks: agg(&mut self.asks.iter()),
+        }
     }
 
     /// The whole book as plain data, bids highest first and asks lowest first.

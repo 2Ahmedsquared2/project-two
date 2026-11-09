@@ -20,7 +20,7 @@ fn golden(name: &str) -> PathBuf {
 
 fn run(name: &str) -> Result<book_check::Report, CheckError> {
     let reader = Reader::new(BufReader::new(File::open(golden(name)).unwrap())).unwrap();
-    check(reader, &mut Book::new())
+    check(reader, |_| Book::new())
 }
 
 fn divergence(name: &str) -> Divergence {
@@ -34,7 +34,7 @@ fn divergence(name: &str) -> Divergence {
 fn the_golden_dataset_replays_cleanly() {
     let report = run("basic.jsonl").unwrap();
     assert_eq!(report.blocks, 6);
-    assert_eq!(report.books_compared, 6);
+    assert_eq!(report.l4_books_compared, 6);
     assert_eq!(report.ops, 10);
 }
 
@@ -44,6 +44,8 @@ fn a_corrupted_size_is_caught() {
         divergence("basic-corrupt-size.jsonl"),
         Divergence {
             height: 4,
+            asset: 0,
+            coin: "GOLD".to_owned(),
             side: Side::Bid,
             px: Px(1000),
             field: Field::Size {
@@ -60,6 +62,8 @@ fn a_corrupted_queue_order_is_caught() {
         divergence("basic-corrupt-queue.jsonl"),
         Divergence {
             height: 2,
+            asset: 0,
+            coin: "GOLD".to_owned(),
             side: Side::Bid,
             px: Px(1000),
             field: Field::QueuePosition {
@@ -77,11 +81,39 @@ fn a_missing_level_is_caught() {
         divergence("basic-corrupt-level.jsonl"),
         Divergence {
             height: 5,
+            asset: 0,
+            coin: "GOLD".to_owned(),
             side: Side::Ask,
             px: Px(1005),
             field: Field::ExtraLevel {
                 candidate: Lots(75),
                 candidate_orders: 1,
+            },
+        }
+    );
+}
+
+#[test]
+fn the_l2_golden_dataset_replays_cleanly() {
+    let report = run("l2.jsonl").unwrap();
+    assert_eq!(report.blocks, 6);
+    assert_eq!(report.l2_books_compared, 6);
+    assert_eq!(report.l4_books_compared, 0);
+}
+
+#[test]
+fn a_corrupted_l2_order_count_is_caught() {
+    assert_eq!(
+        divergence("l2-corrupt-count.jsonl"),
+        Divergence {
+            height: 3,
+            asset: 0,
+            coin: "GOLD".to_owned(),
+            side: Side::Bid,
+            px: Px(1000),
+            field: Field::OrderCount {
+                recorded: 1,
+                candidate: 2,
             },
         }
     );
@@ -111,6 +143,7 @@ fn the_binary_exits_one_and_names_the_divergence() {
     let (code, stdout, stderr) = run_binary("basic-corrupt-size.jsonl");
     assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
     assert!(stderr.contains("block 4"), "{stderr}");
+    assert!(stderr.contains("GOLD"), "{stderr}");
     assert!(stderr.contains("bid"), "{stderr}");
     assert!(stderr.contains("1000"), "{stderr}");
     assert!(stderr.contains("size"), "{stderr}");

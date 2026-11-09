@@ -2,17 +2,29 @@
 //! first place the candidate disagrees with the recorded book.
 //!
 //! The candidate is anything that implements [`Candidate`]: the reference
-//! book from `hl-book-ref` today, every faster design later. After each block
-//! that has a recorded book the two snapshots are compared level by level in
-//! integer ticks and lots; the first [`Divergence`] names the block, side,
-//! price level and the field that differs (size, order count, queue position,
-//! a per-order size, or a level present on one side only).
+//! book from `hl-book-ref` today, every faster design later. The checker keeps
+//! one candidate per asset declared in the dataset header and applies each
+//! block's per-order effects to the asset they name. After each block, every
+//! recorded book state is compared with that asset's candidate in integer
+//! ticks and lots:
+//!
+//! - `l4_book`: level by level and order by order (size, order count, queue
+//!   position, per-order size, missing or extra level);
+//! - `l2_book`: level by level on (price, total size, order count), over the
+//!   top `depth` levels when the record says the source was truncated.
+//!
+//! The first [`Divergence`] names the block, asset, side, price level and field.
+//!
+//! Raw transactions (`txs`) are counted but not replayed: turning signed
+//! actions into book effects needs the oid-assignment rule, which is not yet
+//! verified. See the report's `txs` count.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::BufRead;
 
-use hl_book_ref::{Book, BookOp, BookSnapshot, Level, Lots, Oid, Px, Side};
-use hl_dataset::{ReadError, Reader};
+use hl_book_ref::{Book, BookOp, BookSnapshot, L2Level, L2Snapshot, Level, Lots, Oid, Px, Side};
+use hl_dataset::{BookState, ReadError, Reader};
 
 /// An order book under test.
 pub trait Candidate {
@@ -24,6 +36,12 @@ pub trait Candidate {
 
     /// The whole book as plain data, bids highest first and asks lowest first.
     fn snapshot(&self) -> BookSnapshot;
+
+    /// The book aggregated to L2, at most `depth` levels per side. The default
+    /// aggregates [`Candidate::snapshot`]; a fast candidate should override it.
+    fn l2(&self, depth: Option<usize>) -> L2Snapshot {
+        self.snapshot().to_l2(depth)
+    }
 }
 
 impl Candidate for Book {
@@ -35,6 +53,10 @@ impl Candidate for Book {
 
     fn snapshot(&self) -> BookSnapshot {
         Book::snapshot(self)
+    }
+
+    fn l2(&self, depth: Option<usize>) -> L2Snapshot {
+        Book::l2(self, depth)
     }
 }
 
@@ -149,11 +171,26 @@ impl fmt::Display for Field {
     }
 }
 
-/// The first disagreement between the recorded book and the candidate.
+/// Where two books first differ within one asset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LevelDiff {
+    /// Side of the differing level.
+    pub side: Side,
+    /// Price of the differing level, in ticks.
+    pub px: Px,
+    /// What differs.
+    pub field: Field,
+}
+
+/// The first disagreement between a recorded book and the candidate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Divergence {
     /// Block after which the books differ.
     pub height: u64,
+    /// Asset index.
+    pub asset: u32,
+    /// Coin name from the dataset header.
+    pub coin: String,
     /// Side of the differing level.
     pub side: Side,
     /// Price of the differing level, in ticks.
@@ -170,8 +207,8 @@ impl fmt::Display for Divergence {
         };
         write!(
             f,
-            "divergence at block {} on the {side} side at price {} ticks: {}",
-            self.height, self.px.0, self.field
+            "divergence at block {} in {} (asset {}) on the {side} side at price {} ticks: {}",
+            self.height, self.coin, self.asset, self.px.0, self.field
         )
     }
 }
@@ -183,10 +220,14 @@ pub enum CheckError {
     #[error("dataset: {0}")]
     Read(#[from] ReadError),
     /// The candidate refused an op.
-    #[error("block {height}, op {op_index} ({op:?}): candidate rejected it: {message}")]
+    #[error(
+        "block {height}, op {op_index} (asset {asset}, {op:?}): candidate rejected it: {message}"
+    )]
     Apply {
         /// Block height.
         height: u64,
+        /// Asset the op applies to.
+        asset: u32,
         /// 0-based index of the op within the block.
         op_index: usize,
         /// The op.
@@ -204,63 +245,178 @@ pub enum CheckError {
 pub struct Report {
     /// Blocks replayed.
     pub blocks: u64,
-    /// Ops applied.
+    /// Per-order effects applied.
     pub ops: u64,
-    /// Recorded books compared (blocks with a book record).
-    pub books_compared: u64,
+    /// Raw transactions carried by the blocks (counted, not replayed).
+    pub txs: u64,
+    /// Recorded `l4_book` states compared.
+    pub l4_books_compared: u64,
+    /// Recorded `l2_book` states compared.
+    pub l2_books_compared: u64,
 }
 
 impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "ok: {} blocks, {} ops, {} recorded books compared, no divergence",
-            self.blocks, self.ops, self.books_compared
-        )
+            "ok: {} blocks, {} ops, {} L4 + {} L2 recorded books compared, no divergence",
+            self.blocks, self.ops, self.l4_books_compared, self.l2_books_compared
+        )?;
+        if self.txs > 0 {
+            write!(f, " ({} txs not replayed)", self.txs)?;
+        }
+        Ok(())
     }
 }
 
-/// Replay every block of `reader` through `candidate`, comparing after each
-/// block that has a recorded book. Stops at the first problem.
+/// Replay every block of `reader`, one candidate per declared asset (built
+/// by `new_candidate` from the asset index), comparing after each block with
+/// every recorded book state. Stops at the first problem.
 pub fn check<R: BufRead, C: Candidate>(
     reader: Reader<R>,
-    candidate: &mut C,
+    mut new_candidate: impl FnMut(u32) -> C,
 ) -> Result<Report, CheckError> {
+    let coins: BTreeMap<u32, String> = reader
+        .header()
+        .assets
+        .iter()
+        .map(|a| (a.asset_index, a.name.clone()))
+        .collect();
+    let mut books: BTreeMap<u32, C> = coins.keys().map(|&a| (a, new_candidate(a))).collect();
     let mut report = Report::default();
     for step in reader.steps() {
         let step = step?;
         let height = step.block.height;
-        for (op_index, op) in step.block.ops.iter().enumerate() {
-            candidate.apply(op).map_err(|e| CheckError::Apply {
+        for (op_index, aop) in step.block.ops.iter().enumerate() {
+            // The reader guarantees every op's asset is declared.
+            let Some(book) = books.get_mut(&aop.asset) else {
+                unreachable!("reader admitted undeclared asset {}", aop.asset);
+            };
+            book.apply(&aop.op).map_err(|e| CheckError::Apply {
                 height,
+                asset: aop.asset,
                 op_index,
-                op: *op,
+                op: aop.op,
                 message: e.to_string(),
             })?;
             report.ops += 1;
         }
+        report.txs += u64::try_from(step.block.txs.len()).unwrap_or(u64::MAX);
         report.blocks += 1;
-        if let Some(recorded) = &step.book {
-            if let Some(d) = compare_books(height, recorded, &candidate.snapshot()) {
-                return Err(CheckError::Divergence(d));
+        for recorded in &step.books {
+            let asset = recorded.asset();
+            let Some(book) = books.get(&asset) else {
+                unreachable!("reader admitted undeclared asset {asset}");
+            };
+            let diff = match recorded {
+                BookState::L4(r) => {
+                    report.l4_books_compared += 1;
+                    compare_l4(&r.to_snapshot(), &book.snapshot())
+                }
+                BookState::L2(r) => {
+                    report.l2_books_compared += 1;
+                    let depth = r.depth.map(|d| usize::try_from(d).unwrap_or(usize::MAX));
+                    let cand = book.l2(depth);
+                    let conv = |ls: &[hl_dataset::L2Level]| -> Vec<L2Level> {
+                        ls.iter()
+                            .map(|l| L2Level {
+                                px: Px(l.px_ticks),
+                                sz: Lots(l.sz_lots),
+                                n: l.n,
+                            })
+                            .collect()
+                    };
+                    compare_l2(&conv(&r.bids), &conv(&r.asks), &cand.bids, &cand.asks)
+                }
+            };
+            if let Some(d) = diff {
+                return Err(CheckError::Divergence(Divergence {
+                    height,
+                    asset,
+                    coin: coins.get(&asset).cloned().unwrap_or_default(),
+                    side: d.side,
+                    px: d.px,
+                    field: d.field,
+                }));
             }
-            report.books_compared += 1;
         }
     }
     Ok(report)
 }
 
-/// Compare two books level by level and return the first difference. Bids are
+/// Compare two per-order books and return the first difference. Bids are
 /// checked before asks; within a side, levels are walked from best to worst;
 /// within a level, total size, then order count, then each queue position.
 #[must_use]
-pub fn compare_books(
-    height: u64,
-    recorded: &BookSnapshot,
-    candidate: &BookSnapshot,
-) -> Option<Divergence> {
-    compare_side(height, Side::Bid, &recorded.bids, &candidate.bids)
-        .or_else(|| compare_side(height, Side::Ask, &recorded.asks, &candidate.asks))
+pub fn compare_l4(recorded: &BookSnapshot, candidate: &BookSnapshot) -> Option<LevelDiff> {
+    compare_side(
+        Side::Bid,
+        &recorded.bids,
+        &candidate.bids,
+        l4_view,
+        compare_level,
+    )
+    .or_else(|| {
+        compare_side(
+            Side::Ask,
+            &recorded.asks,
+            &candidate.asks,
+            l4_view,
+            compare_level,
+        )
+    })
+}
+
+/// Compare two aggregated books (bids, asks per side) and return the first
+/// difference: missing or extra level, then total size, then order count.
+#[must_use]
+pub fn compare_l2(
+    recorded_bids: &[L2Level],
+    recorded_asks: &[L2Level],
+    candidate_bids: &[L2Level],
+    candidate_asks: &[L2Level],
+) -> Option<LevelDiff> {
+    compare_side(
+        Side::Bid,
+        recorded_bids,
+        candidate_bids,
+        l2_view,
+        compare_l2_level,
+    )
+    .or_else(|| {
+        compare_side(
+            Side::Ask,
+            recorded_asks,
+            candidate_asks,
+            l2_view,
+            compare_l2_level,
+        )
+    })
+}
+
+/// (price, total size, order count) of a level.
+fn l4_view(l: &Level) -> (Px, Lots, usize) {
+    (l.px, l.total(), l.orders.len())
+}
+
+fn l2_view(l: &L2Level) -> (Px, Lots, usize) {
+    (l.px, l.sz, usize::try_from(l.n).unwrap_or(usize::MAX))
+}
+
+fn compare_l2_level(recorded: &L2Level, candidate: &L2Level) -> Option<Field> {
+    if recorded.sz != candidate.sz {
+        return Some(Field::Size {
+            recorded: recorded.sz,
+            candidate: candidate.sz,
+        });
+    }
+    if recorded.n != candidate.n {
+        return Some(Field::OrderCount {
+            recorded: l2_view(recorded).2,
+            candidate: l2_view(candidate).2,
+        });
+    }
+    None
 }
 
 /// Does `a` come before `b` when walking `side` from best to worst?
@@ -271,65 +427,65 @@ fn better(side: Side, a: Px, b: Px) -> bool {
     }
 }
 
-fn compare_side(
-    height: u64,
+fn compare_side<L>(
     side: Side,
-    recorded: &[Level],
-    candidate: &[Level],
-) -> Option<Divergence> {
+    recorded: &[L],
+    candidate: &[L],
+    view: fn(&L) -> (Px, Lots, usize),
+    compare: fn(&L, &L) -> Option<Field>,
+) -> Option<LevelDiff> {
+    let missing = |l: &L| {
+        let (px, total, orders) = view(l);
+        LevelDiff {
+            side,
+            px,
+            field: Field::MissingLevel {
+                recorded: total,
+                recorded_orders: orders,
+            },
+        }
+    };
+    let extra = |l: &L| {
+        let (px, total, orders) = view(l);
+        LevelDiff {
+            side,
+            px,
+            field: Field::ExtraLevel {
+                candidate: total,
+                candidate_orders: orders,
+            },
+        }
+    };
     let mut r = recorded.iter().peekable();
     let mut c = candidate.iter().peekable();
     loop {
         match (r.peek(), c.peek()) {
             (None, None) => return None,
-            (Some(rl), None) => return Some(missing(height, side, rl)),
-            (None, Some(cl)) => return Some(extra(height, side, cl)),
-            (Some(rl), Some(cl)) if rl.px == cl.px => {
-                if let Some(field) = compare_level(rl, cl) {
-                    return Some(Divergence {
-                        height,
-                        side,
-                        px: rl.px,
-                        field,
+            (Some(rl), None) => return Some(missing(rl)),
+            (None, Some(cl)) => return Some(extra(cl)),
+            (Some(rl), Some(cl)) => {
+                let (rpx, cpx) = (view(rl).0, view(cl).0);
+                if rpx == cpx {
+                    if let Some(field) = compare(rl, cl) {
+                        return Some(LevelDiff {
+                            side,
+                            px: rpx,
+                            field,
+                        });
+                    }
+                    r.next();
+                    c.next();
+                } else {
+                    // Prices differ: whichever is better comes first in the walk, so it
+                    // is the one the other book lacks.
+                    return Some(if better(side, rpx, cpx) {
+                        missing(rl)
+                    } else {
+                        extra(cl)
                     });
                 }
-                r.next();
-                c.next();
-            }
-            (Some(rl), Some(cl)) => {
-                // Prices differ: whichever is better comes first in the walk, so it is
-                // the one the other book lacks.
-                return Some(if better(side, rl.px, cl.px) {
-                    missing(height, side, rl)
-                } else {
-                    extra(height, side, cl)
-                });
             }
         }
-    }
-}
-
-fn missing(height: u64, side: Side, level: &Level) -> Divergence {
-    Divergence {
-        height,
-        side,
-        px: level.px,
-        field: Field::MissingLevel {
-            recorded: level.total(),
-            recorded_orders: level.orders.len(),
-        },
-    }
-}
-
-fn extra(height: u64, side: Side, level: &Level) -> Divergence {
-    Divergence {
-        height,
-        side,
-        px: level.px,
-        field: Field::ExtraLevel {
-            candidate: level.total(),
-            candidate_orders: level.orders.len(),
-        },
     }
 }
 

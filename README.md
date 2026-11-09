@@ -9,16 +9,17 @@ against; this repository starts there.
 
 | crate          | what it is                                                                                     |
 |----------------|------------------------------------------------------------------------------------------------|
-| `hl-book-ref`  | The simplest correct reference order book: a `BTreeMap` per side keyed by integer price ticks, each level a FIFO queue, plus an order-id index. Integer ticks and lots only; floats are banned by `clippy.toml`. Every faster design is diffed against this. |
-| `hl-dataset`   | A versioned JSON Lines format for a recorded dataset (blocks plus the full book after each block), with a validating reader and writer. Spec: [docs/dataset-format.md](docs/dataset-format.md). |
-| `book-check`   | Replays a dataset through a candidate book and reports the first divergence: block, side, price level and the field that differs (size, order count, queue position). Exits non-zero on divergence. |
+| `hl-book-ref`  | The simplest correct reference order book: a `BTreeMap` per side keyed by integer price ticks, each level a FIFO queue, plus an order-id index. Insert, insert-before, cancel, resize, L2 top-N aggregation, and replay matching (GTC/IOC/ALO, price-time priority). Integer ticks and lots only; floats are banned by `clippy.toml`. Every faster design is diffed against this. |
+| `hl-dataset`   | A versioned JSON Lines format (v2) for a recorded dataset: blocks with raw transactions and per-order effects, plus `l2_book` / `l4_book` states per asset, integer ticks/lots with audit decimal strings. Validating reader and writer. Spec: [docs/dataset-format.md](docs/dataset-format.md). |
+| `book-check`   | Replays a dataset through one candidate book per asset and reports the first divergence: block, coin, side, price level and the field that differs (size, order count, queue position). Exits non-zero on divergence. |
 
-`golden/` holds a hand-built dataset with a known expected book and three
+`golden/` holds hand-built datasets (L4 and L2) with known expected books and
 deliberately corrupted copies that the checker must catch
 ([golden/README.md](golden/README.md)).
 
 Out of scope for this phase, on purpose: latency work, pre-allocation,
-array-vs-tree book layouts, networking, matching rules.
+array-vs-tree book layouts, networking, replaying raw actions (needs the
+unverified oid-assignment rule).
 
 ## Build and check
 
@@ -29,7 +30,7 @@ scripts/check.sh
 ```
 
 which runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-`cargo test`, `cargo doc` and the golden vector. There is no CI on GitHub for
+`cargo test`, `cargo doc` and the golden vectors. There is no CI on GitHub for
 now (no Actions minutes); every PR description carries the output of this
 script, with the failing test shown before the code that made it pass.
 

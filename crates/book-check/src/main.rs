@@ -52,7 +52,7 @@ fn run(args: &Args) -> Result<book_check::Report, CheckError> {
     let file = File::open(&args.dataset).map_err(hl_dataset::ReadError::from)?;
     let reader = Reader::new(BufReader::new(file))?;
     match args.candidate.as_str() {
-        "ref" => check(reader, &mut Book::new()),
+        "ref" => check(reader, |_| Book::new()),
         other => Err(CheckError::Read(hl_dataset::ReadError::Io(
             std::io::Error::other(format!("unknown candidate {other:?}; known: ref")),
         ))),

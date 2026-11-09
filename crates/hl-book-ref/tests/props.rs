@@ -76,3 +76,54 @@ proptest! {
         }
     }
 }
+
+fn tif(i: u8) -> hl_book_ref::Tif {
+    match i % 3 {
+        0 => hl_book_ref::Tif::Gtc,
+        1 => hl_book_ref::Tif::Ioc,
+        _ => hl_book_ref::Tif::Alo,
+    }
+}
+
+proptest! {
+    /// Matching conserves size, never leaves the book crossed, and L2 agrees with the L4 snapshot.
+    #[test]
+    fn matching_invariants_hold(
+        orders in prop::collection::vec((any::<bool>(), 90u64..110, 1u64..20, any::<u8>()), 0..200)
+    ) {
+        let mut book = Book::new();
+        for (i, (side, px, sz, t)) in orders.into_iter().enumerate() {
+            let side = if side { Side::Bid } else { Side::Ask };
+            let order = Order { oid: Oid(u64::try_from(i).unwrap() + 1), side, px: Px(px), sz: Lots(sz) };
+            let opposite_before: u64 = book.l2(None).asks.iter().chain(book.l2(None).bids.iter())
+                .map(|l| l.sz.0).sum();
+            let tif = tif(t);
+            match book.place(order, tif) {
+                Ok(placed) => {
+                    let filled: u64 = placed.fills.iter().map(|f| f.sz.0).sum();
+                    let rested = placed.rested.map_or(0, |l| l.0);
+                    prop_assert!(filled + rested <= sz);
+                    if tif == hl_book_ref::Tif::Gtc {
+                        prop_assert_eq!(filled + rested, sz);
+                    }
+                    // Every fill is at a price no worse than the limit.
+                    for f in &placed.fills {
+                        let ok = match side { Side::Bid => f.px <= Px(px), Side::Ask => f.px >= Px(px) };
+                        prop_assert!(ok);
+                    }
+                    let after: u64 = book.l2(None).asks.iter().chain(book.l2(None).bids.iter())
+                        .map(|l| l.sz.0).sum();
+                    prop_assert_eq!(after + filled, opposite_before + rested);
+                }
+                Err(e) => {
+                    let alo = matches!(e, hl_book_ref::ApplyError::AloWouldCross { .. });
+                    prop_assert!(alo);
+                }
+            }
+            if let (Some(b), Some(a)) = (book.best_bid(), book.best_ask()) {
+                prop_assert!(b < a);
+            }
+            prop_assert_eq!(book.l2(None), book.snapshot().to_l2(None));
+        }
+    }
+}

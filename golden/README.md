@@ -1,7 +1,8 @@
 # Golden vector
 
-`basic.jsonl` is a hand-built six-block dataset for the asset `GOLD`
-(`px_decimals` 1, `sz_decimals` 2). The expected book after each block was
+`basic.jsonl` is a hand-built six-block dataset (format v2) for one perp
+asset `GOLD` (asset index 0, `sz_decimals` 5, so `max_price_decimals` 1: 1000
+ticks = 100.0). Each block carries per-order `ops` and an `l4_book` after it. The expected book after each block was
 derived by hand below, and `book-check` must replay it cleanly through the
 reference book.
 
@@ -24,9 +25,19 @@ checker reports exactly that block, side, price and field:
 | `basic-corrupt-queue.jsonl` | block 2, bid 1000 queue recorded as [3, 1]          | block 2, bid, 1000, queue position 0: recorded 3, cand. 1 |
 | `basic-corrupt-level.jsonl` | block 5, recorded asks lack the 1005 level          | block 5, ask, 1005, level not in recorded book            |
 
+`l2.jsonl` is the same six blocks with `l2_book` records instead (the public
+`l2Book` shape, with audit decimal strings): blocks 1-5 record only the top
+level per side (`depth` 1, so e.g. the 995 bid of blocks 2-4 is out of view and
+must not be reported), block 6 records the whole book (no `depth`).
+`l2-corrupt-count.jsonl` records the block-3 bid 1000 level with `n` 1 instead
+of 2 (orders 1 and 3 rest there); the checker must report block 3, bid, 1000,
+order count: recorded 1, candidate 2.
+
 Run them yourself:
 
 ```bash
 cargo run -q -p book-check -- golden/basic.jsonl              # exit 0
 cargo run -q -p book-check -- golden/basic-corrupt-size.jsonl # exit 1
+cargo run -q -p book-check -- golden/l2.jsonl                 # exit 0
+cargo run -q -p book-check -- golden/l2-corrupt-count.jsonl   # exit 1
 ```

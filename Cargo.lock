@@ -162,6 +162,7 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -170,6 +171,7 @@ name = "hl-dataset"
 version = "0.1.0"
 dependencies = [
  "hl-book-ref",
+ "proptest",
  "serde",
  "serde_json",
  "thiserror",
