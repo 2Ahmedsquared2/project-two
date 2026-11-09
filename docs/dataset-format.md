@@ -154,7 +154,7 @@ zcat blocks_core.ndjson.gz | cargo run --release -p hl-dataset --bin hl-convert 
 
 `book-check DATASET --replay` replays the `txs` (ignoring `ops`) through the
 reference book with `book_check::replay::Replayer`, following
-[ACTION_ORDERING.md](ACTION_ORDERING.md) §7, the spec of record. Each rule's
+[ACTION_ORDERING.md](ACTION_ORDERING.md) §7, the spec of record ([PHASE1_FINDINGS.md](PHASE1_FINDINGS.md) is its plain-language companion). Each rule's
 status (VERIFIED / OBSERVED / INFERENCE / UNVERIFIED) is in that spec and in the
 `replay` module docs. `--no-stp` turns self-trade prevention off;
 `--no-compare` replays without comparing recorded books and prints the counts.
