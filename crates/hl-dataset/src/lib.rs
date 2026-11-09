@@ -24,6 +24,8 @@ use std::io::{BufRead, Write};
 use hl_book_ref::{BookSnapshot, Level, Lots, Oid, Px};
 use serde::{Deserialize, Serialize};
 
+pub mod action;
+pub mod convert;
 pub mod decimal;
 
 pub use records::{AssetOp, Header};
@@ -157,10 +159,43 @@ impl AssetMeta {
         decimal::parse_units(px, self.max_price_decimals)
     }
 
+    /// An order or resting-level price in ticks under the full tick rule: at
+    /// most `max_price_decimals` decimals and at most 5 significant figures,
+    /// unless the price is an integer (Hyperliquid docs, "Tick and lot size";
+    /// `ACTION_ORDERING.md` §4.1).
+    pub fn order_px_ticks(&self, px: &str) -> Result<u64, TickError> {
+        let ticks = self.px_ticks(px).map_err(TickError::Decimal)?;
+        let (int, frac) = px.split_once('.').unwrap_or((px, ""));
+        let frac = frac.trim_end_matches('0');
+        if !frac.is_empty() {
+            let digits = int.trim_start_matches('0').len() + frac.len();
+            let significant = if int.trim_start_matches('0').is_empty() {
+                frac.trim_start_matches('0').len()
+            } else {
+                digits
+            };
+            if significant > 5 {
+                return Err(TickError::TooManySignificantFigures);
+            }
+        }
+        Ok(ticks)
+    }
+
     /// A decimal size string in integer lots.
     pub fn sz_lots(&self, sz: &str) -> Result<u64, decimal::DecimalError> {
         decimal::parse_units(sz, self.sz_decimals)
     }
+}
+
+/// Why a price breaks the tick rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, thiserror::Error)]
+pub enum TickError {
+    /// Not a decimal, or more decimals than `max_price_decimals`.
+    #[error("{0}")]
+    Decimal(decimal::DecimalError),
+    /// A non-integer price with more than 5 significant figures.
+    #[error("more than 5 significant figures in a non-integer price")]
+    TooManySignificantFigures,
 }
 
 /// A raw JSON value kept byte for byte (key order, spacing, number strings):
@@ -179,6 +214,12 @@ impl RawJson {
     #[must_use]
     pub fn get(&self) -> &str {
         self.0.get()
+    }
+}
+
+impl From<Box<serde_json::value::RawValue>> for RawJson {
+    fn from(raw: Box<serde_json::value::RawValue>) -> Self {
+        Self(raw)
     }
 }
 

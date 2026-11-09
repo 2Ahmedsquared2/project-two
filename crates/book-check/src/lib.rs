@@ -15,9 +15,10 @@
 //!
 //! The first [`Divergence`] names the block, asset, side, price level and field.
 //!
-//! Raw transactions (`txs`) are counted but not replayed: turning signed
-//! actions into book effects needs the oid-assignment rule, which is not yet
-//! verified. See the report's `txs` count.
+//! [`check`] replays per-order `ops` and only counts raw transactions
+//! (`txs`). [`check_replay`] instead replays the raw signed actions through
+//! the reference book with [`replay::Replayer`] (public data has no oids, so
+//! `ops` are empty there) and compares the same recorded states.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -25,6 +26,8 @@ use std::io::BufRead;
 
 use hl_book_ref::{Book, BookOp, BookSnapshot, L2Level, L2Snapshot, Level, Lots, Oid, Px, Side};
 use hl_dataset::{BookState, ReadError, Reader};
+
+pub mod replay;
 
 /// An order book under test.
 pub trait Candidate {
@@ -308,40 +311,136 @@ pub fn check<R: BufRead, C: Candidate>(
             let Some(book) = books.get(&asset) else {
                 unreachable!("reader admitted undeclared asset {asset}");
             };
-            let diff = match recorded {
-                BookState::L4(r) => {
-                    report.l4_books_compared += 1;
-                    compare_l4(&r.to_snapshot(), &book.snapshot())
-                }
-                BookState::L2(r) => {
-                    report.l2_books_compared += 1;
-                    let depth = r.depth.map(|d| usize::try_from(d).unwrap_or(usize::MAX));
-                    let cand = book.l2(depth);
-                    let conv = |ls: &[hl_dataset::L2Level]| -> Vec<L2Level> {
-                        ls.iter()
-                            .map(|l| L2Level {
-                                px: Px(l.px_ticks),
-                                sz: Lots(l.sz_lots),
-                                n: l.n,
-                            })
-                            .collect()
-                    };
-                    compare_l2(&conv(&r.bids), &conv(&r.asks), &cand.bids, &cand.asks)
-                }
-            };
-            if let Some(d) = diff {
-                return Err(CheckError::Divergence(Divergence {
-                    height,
-                    asset,
-                    coin: coins.get(&asset).cloned().unwrap_or_default(),
-                    side: d.side,
-                    px: d.px,
-                    field: d.field,
-                }));
-            }
+            compare_recorded(height, recorded, book, &coins, &mut report)?;
         }
     }
     Ok(report)
+}
+
+/// Compare one recorded state with the candidate's book, counting it in `report`.
+fn compare_recorded<C: Candidate + ?Sized>(
+    height: u64,
+    recorded: &BookState,
+    book: &C,
+    coins: &BTreeMap<u32, String>,
+    report: &mut Report,
+) -> Result<(), CheckError> {
+    let asset = recorded.asset();
+    let diff = match recorded {
+        BookState::L4(r) => {
+            report.l4_books_compared += 1;
+            compare_l4(&r.to_snapshot(), &book.snapshot())
+        }
+        BookState::L2(r) => {
+            report.l2_books_compared += 1;
+            let depth = r.depth.map(|d| usize::try_from(d).unwrap_or(usize::MAX));
+            let cand = book.l2(depth);
+            let conv = |ls: &[hl_dataset::L2Level]| -> Vec<L2Level> {
+                ls.iter()
+                    .map(|l| L2Level {
+                        px: Px(l.px_ticks),
+                        sz: Lots(l.sz_lots),
+                        n: l.n,
+                    })
+                    .collect()
+            };
+            compare_l2(&conv(&r.bids), &conv(&r.asks), &cand.bids, &cand.asks)
+        }
+    };
+    match diff {
+        Some(d) => Err(CheckError::Divergence(Divergence {
+            height,
+            asset,
+            coin: coins.get(&asset).cloned().unwrap_or_default(),
+            side: d.side,
+            px: d.px,
+            field: d.field,
+        })),
+        None => Ok(()),
+    }
+}
+
+/// What a raw-action replay covered.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReplayReport {
+    /// Recorded states compared (blocks, L4 and L2 counts; `ops` and `txs` unused).
+    pub compared: Report,
+    /// What the replayer did.
+    pub stats: replay::ReplayStats,
+}
+
+impl fmt::Display for ReplayReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "ok: replayed {} blocks of raw actions, {} L4 + {} L2 recorded books compared, no divergence",
+            self.stats.blocks, self.compared.l4_books_compared, self.compared.l2_books_compared
+        )?;
+        write!(f, "{}", self.stats)
+    }
+}
+
+/// A divergence (or read error) together with the replay counts up to it.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct ReplayFailure {
+    /// What stopped the replay.
+    pub error: CheckError,
+    /// Counts up to and including the failing block.
+    pub report: ReplayReport,
+}
+
+/// Replay the raw actions of every block through [`replay::Replayer`] and,
+/// when `compare` is true, compare each recorded book state after its block.
+/// With `compare` false the whole dataset is read and replayed and only the
+/// counts are returned (used for real public data, which has no seed book).
+pub fn check_replay<R: BufRead>(
+    reader: Reader<R>,
+    config: replay::ReplayConfig,
+    compare: bool,
+) -> Result<ReplayReport, Box<ReplayFailure>> {
+    let coins: BTreeMap<u32, String> = reader
+        .header()
+        .assets
+        .iter()
+        .map(|a| (a.asset_index, a.name.clone()))
+        .collect();
+    let mut r = replay::Replayer::new(&reader.header().assets, config);
+    let mut compared = Report::default();
+    let fail = |error: CheckError, compared: Report, r: &replay::Replayer| {
+        Box::new(ReplayFailure {
+            error,
+            report: ReplayReport {
+                compared,
+                stats: r.stats().clone(),
+            },
+        })
+    };
+    for step in reader.steps() {
+        let step = match step {
+            Ok(s) => s,
+            Err(e) => return Err(fail(e.into(), compared, &r)),
+        };
+        r.apply_block(&step.block);
+        compared.blocks += 1;
+        if !compare {
+            continue;
+        }
+        for recorded in &step.books {
+            let Some(book) = r.book(recorded.asset()) else {
+                unreachable!("reader admitted undeclared asset {}", recorded.asset());
+            };
+            if let Err(e) =
+                compare_recorded(step.block.height, recorded, book, &coins, &mut compared)
+            {
+                return Err(fail(e, compared, &r));
+            }
+        }
+    }
+    Ok(ReplayReport {
+        compared,
+        stats: r.stats().clone(),
+    })
 }
 
 /// Compare two per-order books and return the first difference. Bids are

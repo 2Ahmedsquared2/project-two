@@ -15,4 +15,11 @@ for bad in golden/basic-corrupt-*.jsonl golden/l2-corrupt-*.jsonl; do
     echo "golden corrupt vector $bad was NOT caught"; exit 1
   fi
 done
+cargo run -q -p book-check -- golden/replay.jsonl --replay > /dev/null
+for bad in "golden/replay-corrupt-modify-queue.jsonl --replay" "golden/replay.jsonl --replay --no-stp"; do
+  # shellcheck disable=SC2086
+  if cargo run -q -p book-check -- $bad > /dev/null 2>&1; then
+    echo "golden replay vector '$bad' was NOT caught"; exit 1
+  fi
+done
 echo "all checks passed"

@@ -48,6 +48,44 @@ pub struct Lots(pub u64);
 #[serde(transparent)]
 pub struct Oid(pub u64);
 
+/// An opaque owner id for self-trade prevention: the dataset producer maps
+/// each account address to one. Two orders self-trade when their owners are
+/// equal. Which address Hyperliquid compares (master account vs exact signer)
+/// is unverified (`ACTION_ORDERING.md` §3.4); the producer decides the mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Owner(pub u32);
+
+/// Matching rules that are configurable because Hyperliquid's behaviour is
+/// only partly verified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MatchConfig {
+    /// Self-trade prevention: when an incoming order would match a resting
+    /// order with the same [`Owner`], the resting order is cancelled with no
+    /// fill and the incoming order continues. VERIFIED in Hyperliquid's docs
+    /// (trading/self-trade-prevention); default on.
+    pub self_trade_prevention: bool,
+}
+
+impl Default for MatchConfig {
+    fn default() -> Self {
+        Self {
+            self_trade_prevention: true,
+        }
+    }
+}
+
+/// What [`Book::modify`] did: modify is cancel of the old order plus
+/// placement of a new one with a new id (never an in-place resize).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Modified {
+    /// The old order was resting and has been removed.
+    pub cancelled: bool,
+    /// The placement of the new order, attempted whether or not the cancel
+    /// succeeded (Hyperliquid's `always_place`; `ACTION_ORDERING.md` §1.1, §5).
+    pub placed: Result<Placed, ApplyError>,
+}
+
 /// Which side of the book an order rests on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -248,6 +286,9 @@ pub struct Placed {
     pub fills: Vec<Fill>,
     /// Size that came to rest under the incoming order's id, if any.
     pub rested: Option<Lots>,
+    /// Resting orders of the same owner removed by self-trade prevention, in
+    /// the order they were met.
+    pub self_trade_cancels: Vec<Oid>,
 }
 
 /// The whole book as plain data: bids best (highest) first, asks best (lowest) first.
@@ -265,6 +306,8 @@ pub struct Book {
     bids: BTreeMap<Px, VecDeque<Order>>,
     asks: BTreeMap<Px, VecDeque<Order>>,
     index: HashMap<Oid, (Side, Px)>,
+    owners: HashMap<Oid, Owner>,
+    config: MatchConfig,
 }
 
 impl Book {
@@ -272,6 +315,27 @@ impl Book {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty book with the given matching rules.
+    #[must_use]
+    pub fn with_config(config: MatchConfig) -> Self {
+        Self {
+            config,
+            ..Self::default()
+        }
+    }
+
+    /// The matching rules in force.
+    #[must_use]
+    pub fn config(&self) -> MatchConfig {
+        self.config
+    }
+
+    /// The owner of a resting order, if it was placed with one.
+    #[must_use]
+    pub fn owner(&self, oid: Oid) -> Option<Owner> {
+        self.owners.get(&oid).copied()
     }
 
     /// Rebuild a book from a snapshot, preserving queue order within each level.
@@ -371,14 +435,50 @@ impl Book {
         Ok(())
     }
 
-    /// Place an incoming order: match it against the opposite side (best price
-    /// first, FIFO within a level, fills at the resting price), then rest the
-    /// remainder for [`Tif::Gtc`], drop it for [`Tif::Ioc`]. A [`Tif::Alo`]
-    /// order that would cross is rejected; otherwise it rests without matching.
-    ///
-    /// Self-trade prevention is not modelled (the Hyperliquid rule is
-    /// unverified). On error the book is unchanged.
+    /// Place an incoming order with no owner: see [`Book::place_owned`].
+    /// Without an owner self-trade prevention never applies.
     pub fn place(&mut self, order: Order, tif: Tif) -> Result<Placed, ApplyError> {
+        self.place_inner(None, order, tif)
+    }
+
+    /// Place an incoming order owned by `owner`: match it against the
+    /// opposite side (best price first, FIFO within a level, fills at the
+    /// resting price), then rest the remainder for [`Tif::Gtc`], drop it for
+    /// [`Tif::Ioc`]. A [`Tif::Alo`] order that would cross is rejected;
+    /// otherwise it rests without matching. With
+    /// [`MatchConfig::self_trade_prevention`] on, a resting order of the same
+    /// owner is cancelled instead of filled and matching continues.
+    ///
+    /// Fill-at-resting-price is INFERENCE (`ACTION_ORDERING.md` §3.5). On error
+    /// the book is unchanged.
+    pub fn place_owned(
+        &mut self,
+        owner: Owner,
+        order: Order,
+        tif: Tif,
+    ) -> Result<Placed, ApplyError> {
+        self.place_inner(Some(owner), order, tif)
+    }
+
+    /// Modify = cancel `old` (if it rests) then place `new` as a new order
+    /// with its own id at the back of its level. The new order is placed even
+    /// if the cancel found nothing. Hyperliquid categorises a modify by the
+    /// new order it places and documents `always_place`; that a smaller
+    /// modify loses queue position is INFERENCE (`ACTION_ORDERING.md` §1.1).
+    pub fn modify(&mut self, old: Oid, owner: Option<Owner>, new: Order, tif: Tif) -> Modified {
+        let cancelled = self.cancel(old).is_ok();
+        Modified {
+            cancelled,
+            placed: self.place_inner(owner, new, tif),
+        }
+    }
+
+    fn place_inner(
+        &mut self,
+        owner: Option<Owner>,
+        order: Order,
+        tif: Tif,
+    ) -> Result<Placed, ApplyError> {
         self.validate_new(order)?;
         if tif == Tif::Alo {
             if let Some(opposite_best) = self.crossing(order) {
@@ -388,14 +488,15 @@ impl Book {
                     opposite_best,
                 });
             }
-            self.insert(order)?;
+            self.rest(owner, order)?;
             return Ok(Placed {
-                fills: Vec::new(),
                 rested: Some(order.sz),
+                ..Placed::default()
             });
         }
+        let stp_owner = owner.filter(|_| self.config.self_trade_prevention);
         let mut remaining = order.sz.0;
-        let mut fills = Vec::new();
+        let mut placed = Placed::default();
         while remaining > 0 {
             let Some(best) = self.crossing(Order {
                 sz: Lots(remaining),
@@ -404,39 +505,51 @@ impl Book {
                 break;
             };
             let opposite = order.side.opposite();
-            let Some(queue) = self.side_mut(opposite).get_mut(&best) else {
-                unreachable!("best price {best:?} has no level");
+            let Some(maker) = self
+                .side_ref(opposite)
+                .get(&best)
+                .and_then(VecDeque::front)
+                .copied()
+            else {
+                unreachable!("best price {best:?} has no order");
             };
-            let Some(maker) = queue.front_mut() else {
-                unreachable!("empty level at {best:?}");
-            };
+            if stp_owner.is_some() && self.owners.get(&maker.oid).copied() == stp_owner {
+                self.cancel(maker.oid)?;
+                placed.self_trade_cancels.push(maker.oid);
+                continue;
+            }
             let take = remaining.min(maker.sz.0);
-            fills.push(Fill {
+            placed.fills.push(Fill {
                 maker: maker.oid,
                 px: best,
                 sz: Lots(take),
             });
             remaining -= take;
-            maker.sz.0 -= take;
-            if maker.sz.0 == 0 {
-                let oid = maker.oid;
-                queue.pop_front();
-                if queue.is_empty() {
-                    self.side_mut(opposite).remove(&best);
-                }
-                self.index.remove(&oid);
+            if take == maker.sz.0 {
+                self.cancel(maker.oid)?;
+            } else {
+                self.resize(maker.oid, Lots(maker.sz.0 - take))?;
             }
         }
-        let rested = if remaining > 0 && tif == Tif::Gtc {
-            self.insert(Order {
-                sz: Lots(remaining),
-                ..order
-            })?;
-            Some(Lots(remaining))
-        } else {
-            None
-        };
-        Ok(Placed { fills, rested })
+        if remaining > 0 && tif == Tif::Gtc {
+            self.rest(
+                owner,
+                Order {
+                    sz: Lots(remaining),
+                    ..order
+                },
+            )?;
+            placed.rested = Some(Lots(remaining));
+        }
+        Ok(placed)
+    }
+
+    fn rest(&mut self, owner: Option<Owner>, order: Order) -> Result<(), ApplyError> {
+        self.insert(order)?;
+        if let Some(owner) = owner {
+            self.owners.insert(order.oid, owner);
+        }
+        Ok(())
     }
 
     fn cancel(&mut self, oid: Oid) -> Result<(), ApplyError> {
@@ -454,6 +567,7 @@ impl Book {
             levels.remove(&px);
         }
         self.index.remove(&oid);
+        self.owners.remove(&oid);
         Ok(())
     }
 

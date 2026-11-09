@@ -157,3 +157,95 @@ fn the_binary_exits_two_on_an_unreadable_dataset() {
         .unwrap();
     assert_eq!(out.status.code().unwrap(), 2);
 }
+
+// ---- Brief #2: raw-action replay golden vector (golden/replay.jsonl) ----
+
+fn replay(
+    name: &str,
+    stp: bool,
+) -> Result<book_check::ReplayReport, Box<book_check::ReplayFailure>> {
+    let reader = Reader::new(BufReader::new(File::open(golden(name)).unwrap())).unwrap();
+    let config = book_check::replay::ReplayConfig {
+        self_trade_prevention: stp,
+        ..Default::default()
+    };
+    book_check::check_replay(reader, config, true)
+}
+
+fn replay_divergence(name: &str, stp: bool) -> Divergence {
+    match replay(name, stp).unwrap_err().error {
+        CheckError::Divergence(d) => d,
+        other => panic!("{name}: expected a divergence, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_replay_golden_vector_exercises_every_brief2_rule_and_replays_cleanly() {
+    let r = replay("replay.jsonl", true).unwrap();
+    assert_eq!(r.compared.blocks, 6);
+    assert_eq!(r.compared.l4_books_compared, 6);
+    let s = &r.stats;
+    assert_eq!(s.errored_txs_skipped, 1); // block 2: expired GTC changes nothing
+    assert_eq!(s.legs_alo_rejected, 1); // block 2: crossing ALO rejected
+    assert_eq!(s.fills, 4);
+    assert_eq!(s.self_trade_cancels, 2); // block 4: C's own bids cancelled
+    assert_eq!(s.modify_old_resolved, 1); // block 5: modify by cloid
+    assert_eq!(s.cancel_by_cloid_resolved, 1); // block 6
+}
+
+#[test]
+fn a_modify_that_kept_queue_position_is_caught() {
+    assert_eq!(
+        replay_divergence("replay-corrupt-modify-queue.jsonl", true),
+        Divergence {
+            height: 5,
+            asset: 0,
+            coin: "GOLD".to_owned(),
+            side: Side::Ask,
+            px: Px(990),
+            field: Field::QueuePosition {
+                position: 0,
+                recorded: Oid(11),
+                candidate: Oid(8),
+            },
+        }
+    );
+}
+
+#[test]
+fn replay_without_self_trade_prevention_diverges_at_the_self_trade_block() {
+    assert_eq!(
+        replay_divergence("replay.jsonl", false),
+        Divergence {
+            height: 4,
+            asset: 0,
+            coin: "GOLD".to_owned(),
+            side: Side::Bid,
+            px: Px(990),
+            field: Field::ExtraLevel {
+                candidate: Lots(250_000),
+                candidate_orders: 2,
+            },
+        }
+    );
+}
+
+#[test]
+fn the_binary_replays_with_exit_codes() {
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_book-check"))
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .code()
+            .unwrap()
+    };
+    let clean = golden("replay.jsonl");
+    let bad = golden("replay-corrupt-modify-queue.jsonl");
+    let clean = clean.to_str().unwrap();
+    assert_eq!(run(&[clean, "--replay"]), 0);
+    assert_eq!(run(&[bad.to_str().unwrap(), "--replay"]), 1);
+    assert_eq!(run(&[clean, "--replay", "--no-stp"]), 1);
+    assert_eq!(run(&[clean, "--no-stp"]), 2);
+}

@@ -126,15 +126,57 @@ block `height`. `depth` is how many levels per side the source returns at most
 7. Blank lines are ignored; a malformed line or unknown `kind` is reported
    with its 1-based line number.
 
-## What the checker can and cannot do with this today
+## Converting the public-data capture (`hl-convert`)
 
-- `ops` are replayed; `txs` are counted, **not replayed**. Turning raw actions
-  into book effects needs the oid-assignment rule (unverified; the Hyperliquid
-  Reason is testing it) and the matching engine (`Book::place` exists for
-  GTC/IOC/ALO, but self-trade prevention, triggers, margin and liquidations
-  are not modelled).
-- A replay starts from an empty book. A capture that starts mid-history needs
-  a seed `l4_book` (with order ids) for the first height; public `l2Book`
-  cannot seed a replay because it has no order ids.
-- An `l2_book` anchored by `time_ms` to a height is only as good as that
-  anchoring (unverified: whether `l2Book.time` equals a `blockTime`).
+The Hyperliquid Reason's Phase 1 capture (explorer `blockDetails`, anchored
+public `l2Book` snapshots and `meta.json`) converts to this format with:
+
+```bash
+zcat blocks_core.ndjson.gz | cargo run --release -p hl-dataset --bin hl-convert -- \
+  --meta meta.json --blocks - --l2 l2_anchored.ndjson --out phase1-v2.jsonl
+```
+
+- Every block becomes a `block` with every tx; the action is copied byte for
+  byte. `ops` stay empty (see limitations).
+- Every snapshot becomes an `l2_book` with `depth: 20` after the block whose
+  `blockTime` equals its `time` (all 253 matched).
+- The header lists every perp (asset = position in `meta.universe`) and every
+  spot pair (asset = `10000 + spotMeta.universe[].index`, `sz_decimals` of the
+  base token, looked up by the token's `index` field, not array position).
+  Builder perps (`100000 + dex * 10000 + index`) are **not** in `meta.json` and
+  so not in the header; their legs are counted as unknown-asset.
+- Every order and modify leg on a known asset is checked against the full tick
+  rule (decimals and 5 significant figures, `AssetMeta::order_px_ticks`) and the
+  lot rule; the counts and the first 20 violations are printed as JSON. With
+  `--strict` any violation or parse failure exits 1.
+
+## Replaying raw actions (`book-check --replay`)
+
+`book-check DATASET --replay` replays the `txs` (ignoring `ops`) through the
+reference book with `book_check::replay::Replayer`, following
+[ACTION_ORDERING.md](ACTION_ORDERING.md) §7, the spec of record. Each rule's
+status (VERIFIED / OBSERVED / INFERENCE / UNVERIFIED) is in that spec and in the
+`replay` module docs. `--no-stp` turns self-trade prevention off;
+`--no-compare` replays without comparing recorded books and prints the counts.
+
+## Limitations of public data (Phase 1)
+
+1. **No oids for new orders.** `blockDetails` shows orders as submitted, not
+   the oid each one got, and the oid counter is not exactly one per leg
+   (ACTION_ORDERING.md §5.2). So `ops` cannot be derived, the replayer's oids
+   are synthetic (`OidRule::OnePerAcceptedLeg`), and plain `cancel {a, o}` and
+   `modify` by oid are never resolved (counted, not guessed). `cancelByCloid`
+   and modify-by-cloid resolve by (user, cloid) only when the order was placed
+   inside the window.
+2. **No seed book.** Public `l2Book` has no order ids and cannot seed a
+   per-order replay, so a replay starts empty and its L2 diverges from the
+   first anchored snapshot. A real-data equality check needs a node's
+   `l4Snapshots` plus order statuses (or raw book diffs).
+3. **L2 only**, 20 levels per side, about every 40 blocks per coin; no fills.
+4. **Builder-perp metadata** is not in `meta.json`.
+5. Margin, liquidations, funding, ADL, TWAP slices, CoreWriter orders from
+   `evmRawTx`, trigger activation and reduce-only clipping are not modelled;
+   the checker reports the divergences they cause.
+
+The checker itself is proven on hand-built golden vectors (`golden/`), not on
+real data.

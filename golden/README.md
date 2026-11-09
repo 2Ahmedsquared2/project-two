@@ -41,3 +41,32 @@ cargo run -q -p book-check -- golden/basic-corrupt-size.jsonl # exit 1
 cargo run -q -p book-check -- golden/l2.jsonl                 # exit 0
 cargo run -q -p book-check -- golden/l2-corrupt-count.jsonl   # exit 1
 ```
+
+## Raw-action replay vector (Brief #2)
+
+`replay.jsonl` replays raw signed `txs` (no `ops`) for asset `GOLD` (asset 0,
+`sz_decimals` 5: "100" = 1000 ticks, "1" = 100000 lots) with users A, B, C,
+and records an `l4_book` after each block. Oids are synthetic: one per leg
+handed to the book, in execution order, starting at 1 (an errored tx, a
+trigger or an invalid leg takes none). Expected books derived by hand:
+
+| block | txs | oids | bids (px: queue) | asks (px: queue) | rule |
+|---|---|---|---|---|---|
+| 1 | B ALO sell 1@101; A GTC buy 1@99; C GTC buy 2@99 | 1, 2, 3 | 990: [2×1, 3×2] | 1010: [1×1] | rest |
+| 2 | A ALO buy 1@101; A GTC buy 5@102 (error); C IOC buy 3@101 | 4, -, 5 | 990: [2, 3] | (empty) | ALO reject; errored tx no-op; IOC fills 1 and drops 2 |
+| 3 | B ALO sell 1@100; C GTC buy 3@100 | 6, 7 | 1000: [7×2]; 990: [2, 3] | (empty) | GTC rests after partial fill |
+| 4 | C GTC sell 2.5@99 | 8 | (empty) | 990: [8×1.5] | self-trade: C's #7 cancelled, fills A's #2, C's #3 cancelled, 1.5 rests |
+| 5 | A ALO sell 1@99 c=0xa1; B ALO sell 1@99; A modify 0xa1 → 0.5@99 c=0xa2 | 9, 10, 11 | (empty) | 990: [8×1.5, 10×1, 11×0.5] | modify = cancel #9 + new #11 at the back |
+| 6 | B IOC buy 0.5@99; A cancelByCloid 0xa2 | 12 | (empty) | 990: [8×1, 10×1] | partial fill keeps place; cancel by cloid |
+
+`replay-corrupt-modify-queue.jsonl` records block 5's asks as [11, 8, 10], what
+a book that let a modify keep (or jump) queue position would show; the
+checker reports block 5, ask, 990, queue position 0: recorded 11, candidate 8.
+Replaying `replay.jsonl` with `--no-stp` diverges at block 4 (bid 990 level
+not in the recorded book), proving the self-trade rule is load-bearing.
+
+```bash
+cargo run -q -p book-check -- golden/replay.jsonl --replay                       # exit 0
+cargo run -q -p book-check -- golden/replay-corrupt-modify-queue.jsonl --replay  # exit 1
+cargo run -q -p book-check -- golden/replay.jsonl --replay --no-stp              # exit 1
+```

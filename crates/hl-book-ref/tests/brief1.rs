@@ -205,6 +205,7 @@ fn a_gtc_taker_fills_best_price_first_fifo_at_the_resting_price_then_rests() {
                 },
             ],
             rested: None,
+            self_trade_cancels: vec![],
         }
     );
     // Maker 3 partially filled and keeps its place; 101 level gone.
