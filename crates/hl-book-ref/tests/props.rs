@@ -1,0 +1,78 @@
+//! Property tests: invariants hold under random op sequences.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use hl_book_ref::{Book, BookOp, Lots, Oid, Order, Px, Side};
+use proptest::prelude::*;
+
+#[derive(Debug, Clone)]
+enum RawOp {
+    Insert { side: bool, px: u64, sz: u64 },
+    Cancel { idx: usize },
+    Resize { idx: usize, sz: u64 },
+}
+
+fn raw_op() -> impl Strategy<Value = RawOp> {
+    prop_oneof![
+        3 => (any::<bool>(), 90u64..110, 1u64..20)
+            .prop_map(|(side, px, sz)| RawOp::Insert { side, px, sz }),
+        1 => (0usize..64).prop_map(|idx| RawOp::Cancel { idx }),
+        1 => (0usize..64, 1u64..20).prop_map(|(idx, sz)| RawOp::Resize { idx, sz }),
+    ]
+}
+
+proptest! {
+    #[test]
+    fn invariants_hold(ops in prop::collection::vec(raw_op(), 0..200)) {
+        let mut book = Book::new();
+        let mut next_oid = 1u64;
+        let mut live: Vec<Oid> = Vec::new();
+        for op in ops {
+            match op {
+                RawOp::Insert { side, px, sz } => {
+                    let side = if side { Side::Bid } else { Side::Ask };
+                    let oid = Oid(next_oid);
+                    next_oid += 1;
+                    let order = Order { oid, side, px: Px(px), sz: Lots(sz) };
+                    if book.apply(&BookOp::Insert(order)).is_ok() {
+                        live.push(oid);
+                    }
+                }
+                RawOp::Cancel { idx } => {
+                    if !live.is_empty() {
+                        let oid = live.swap_remove(idx % live.len());
+                        book.apply(&BookOp::Cancel { oid }).unwrap();
+                    }
+                }
+                RawOp::Resize { idx, sz } => {
+                    if !live.is_empty() {
+                        let oid = live[idx % live.len()];
+                        book.apply(&BookOp::Resize { oid, sz: Lots(sz) }).unwrap();
+                    }
+                }
+            }
+            let snap = book.snapshot();
+            // Every live order is in exactly one level; the index agrees with the levels.
+            let in_levels: usize = snap
+                .bids
+                .iter()
+                .chain(snap.asks.iter())
+                .map(|l| l.orders.len())
+                .sum();
+            prop_assert_eq!(in_levels, book.order_count());
+            prop_assert_eq!(in_levels, live.len());
+            // No empty levels, no zero sizes.
+            for l in snap.bids.iter().chain(snap.asks.iter()) {
+                prop_assert!(!l.orders.is_empty());
+                prop_assert!(l.orders.iter().all(|(_, sz)| sz.0 > 0));
+            }
+            // Bids strictly descending, asks strictly ascending, never crossed.
+            prop_assert!(snap.bids.windows(2).all(|w| w[0].px > w[1].px));
+            prop_assert!(snap.asks.windows(2).all(|w| w[0].px < w[1].px));
+            if let (Some(b), Some(a)) = (book.best_bid(), book.best_ask()) {
+                prop_assert!(b < a);
+            }
+            // Snapshot round trip is lossless.
+            prop_assert_eq!(Book::from_snapshot(&snap).unwrap().snapshot(), snap);
+        }
+    }
+}

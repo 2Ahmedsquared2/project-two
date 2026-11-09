@@ -1,0 +1,13 @@
+{"kind":"header","format_version":1,"chain":"golden","asset":"GOLD","px_decimals":1,"sz_decimals":2,"first_height":1,"source":"hand-built golden vector; expected books derived by hand in golden/README.md"}
+{"kind":"block","height":1,"time_ms":1000,"ops":[{"op":"insert","oid":1,"side":"bid","px":1000,"sz":500},{"op":"insert","oid":2,"side":"ask","px":1010,"sz":300}]}
+{"kind":"book","height":1,"bids":[{"px":1000,"orders":[[1,500]]}],"asks":[{"px":1010,"orders":[[2,300]]}]}
+{"kind":"block","height":2,"time_ms":2000,"ops":[{"op":"insert","oid":3,"side":"bid","px":1000,"sz":200},{"op":"insert","oid":4,"side":"bid","px":995,"sz":100}]}
+{"kind":"book","height":2,"bids":[{"px":1000,"orders":[[1,500],[3,200]]},{"px":995,"orders":[[4,100]]}],"asks":[{"px":1010,"orders":[[2,300]]}]}
+{"kind":"block","height":3,"time_ms":3000,"ops":[{"op":"resize","oid":1,"sz":150},{"op":"insert","oid":5,"side":"ask","px":1010,"sz":50}]}
+{"kind":"book","height":3,"bids":[{"px":1000,"orders":[[1,150],[3,200]]},{"px":995,"orders":[[4,100]]}],"asks":[{"px":1010,"orders":[[2,300],[5,50]]}]}
+{"kind":"block","height":4,"time_ms":4000,"ops":[{"op":"cancel","oid":1},{"op":"cancel","oid":2}]}
+{"kind":"book","height":4,"bids":[{"px":1000,"orders":[[3,200]]},{"px":995,"orders":[[4,100]]}],"asks":[{"px":1010,"orders":[[5,50]]}]}
+{"kind":"block","height":5,"time_ms":5000,"ops":[{"op":"insert","oid":6,"side":"ask","px":1005,"sz":75},{"op":"cancel","oid":4}]}
+{"kind":"book","height":5,"bids":[{"px":1000,"orders":[[3,200]]}],"asks":[{"px":1005,"orders":[[6,75]]},{"px":1010,"orders":[[5,50]]}]}
+{"kind":"block","height":6,"time_ms":6000,"ops":[]}
+{"kind":"book","height":6,"bids":[{"px":1000,"orders":[[3,200]]}],"asks":[{"px":1005,"orders":[[6,75]]},{"px":1010,"orders":[[5,50]]}]}
