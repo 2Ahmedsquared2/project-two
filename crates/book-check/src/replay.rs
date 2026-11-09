@@ -39,6 +39,9 @@ pub enum OidRule {
     /// One oid, counting from 1, for every leg handed to a book (a limit leg
     /// on a known asset with a valid price and size, in a tx without an
     /// error), whether it then rests, fills or is rejected as a crossing ALO.
+    /// A leg rejected before that (tick/lot, unknown asset or tif, trigger;
+    /// `ACTION_ORDERING.md` §4.5) takes no oid. Whether Hyperliquid gives a
+    /// rejected leg an oid is UNVERIFIED.
     #[default]
     OnePerAcceptedLeg,
 }

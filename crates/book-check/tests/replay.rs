@@ -195,3 +195,39 @@ fn an_unresolvable_modify_still_places_the_new_order() {
     assert_eq!(queue(&r, Side::Ask, 1010), vec![(1, 100_000)]);
     assert_eq!(r.stats().modify_old_unresolved, 1);
 }
+
+#[test]
+fn legs_rejected_inside_an_ok_action_take_no_oid() {
+    // ACTION_ORDERING.md §4.5: a tx without an error can still hold legs that
+    // break the tick/lot rule; each is rejected and the action continues.
+    // Under OidRule::OnePerAcceptedLeg those legs consume no oid.
+    let mut r = Replayer::new(&assets(), ReplayConfig::default());
+    let legs = [
+        ("99", "1"),        // valid: oid 1
+        ("99.05", "1"),     // too many price decimals
+        ("12345.6", "1"),   // 6 significant figures
+        ("99", "0.000001"), // finer than the lot
+        ("98", "1"),        // valid: oid 2
+    ];
+    let orders: Vec<String> = legs
+        .iter()
+        .map(|(p, s)| {
+            format!(
+                r#"{{"a":0,"b":true,"p":"{p}","s":"{s}","r":false,"t":{{"limit":{{"tif":"Gtc"}}}}}}"#
+            )
+        })
+        .collect();
+    let action = format!(
+        r#"{{"type":"order","orders":[{}],"grouping":"na"}}"#,
+        orders.join(",")
+    );
+    r.apply_block(&block(1, vec![tx("0xa", None, &action)]));
+    r.apply_block(&block(
+        2,
+        vec![tx("0xa", None, &order(0, true, "97", "1", "Gtc", None))],
+    ));
+    assert_eq!(r.stats().legs_invalid_tick_lot, 3);
+    assert_eq!(queue(&r, Side::Bid, 990), vec![(1, 100_000)]);
+    assert_eq!(queue(&r, Side::Bid, 980), vec![(2, 100_000)]);
+    assert_eq!(queue(&r, Side::Bid, 970), vec![(3, 100_000)]);
+}

@@ -87,6 +87,8 @@ Source keys (all docs are `https://hyperliquid.gitbook.io/hyperliquid-docs/<path
 
 4.4 **VERIFIED** [OB] "Orders are added where price is an integer multiple of the tick size, and size is an integer multiple of lot size." **INFERENCE** tick size for a given price is `10^−(decimals allowed by the 5-sig-fig rule)`; it changes with price magnitude, which is why the book must key on the integer `px_ticks` at the asset's maximum resolution, not on a fixed tick.
 
+4.5 **VERIFIED** [EXCH] A non-errored action can still reject individual orders: the exchange response is `"status":"ok"` with a positional `statuses` array whose entries may be `{"error": "..."}` (the docs' own example is the $10 minimum-value error). The explorer's tx-level `error` field only reports action-level failure. **OBSERVED** in the Phase 1 dataset: 1,240 of ~865k order/modify legs in txs with `error: null` break 4.1 (e.g. BTC `74653.7` = 6 significant figures; spot `74.19981144` = more than `8 − szDecimals` decimals; BTC size `0.000034` > 5 szDecimals). **INFERENCE** these are per-order rejections: the replay must reject the leg, leave the book unchanged and continue with the next leg. **UNVERIFIED** whether a rejected leg consumes an oid (see 5.2). This does not change rule 4.1.
+
 ## 5. Order ids (oid)
 
 5.1 **VERIFIED** [EXCH] An accepted order receives an integer `oid` returned in `resting`/`filled` statuses; cancels reference `oid` (or `cloid` via `cancelByCloid`); `modify` references `oid` (or cloid).
