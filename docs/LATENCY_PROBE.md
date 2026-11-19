@@ -47,7 +47,8 @@ Observation line format (one per arrival):
 
 - ENA Express off on the interface.
 - chrony on the Amazon Time Sync source (PHC where present); record
-  `chronyc tracking` offset before and after each run.
+  `chronyc tracking` offset before and after each run, and at the end of
+  the 24 h run (the clock can drift over a day).
 - Verify PHC on the instance: `ls /dev/ptp*` and `ethtool -T <iface>`.
 - Probe pinned to its own core (`taskset`), away from the node's cores.
 - CPU governor `performance` if the instance allows it; record either way.
