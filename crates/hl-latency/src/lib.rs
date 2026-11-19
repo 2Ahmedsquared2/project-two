@@ -11,7 +11,8 @@
 //! and the public `l2Book` and `trades` messages carry the block time as
 //! `time` (OBSERVED in Phase 1: 253 of 253 `l2Book` snapshots had `time` equal
 //! to the block's `blockTime`). Blocks are ~70 ms apart, so the millisecond is
-//! a unique key in practice; a collision is counted, not hidden.
+//! a unique key in practice; a key the node reports with two heights is
+//! counted as ambiguous and excluded, never paired.
 //!
 //! The crate is I/O-free: parsing, pairing and statistics only. The capture
 //! side (tailing the node's files, holding the `WebSocket`) is a separate
@@ -251,14 +252,24 @@ pub struct Pairing {
     /// Node lines whose block time repeated an earlier node line with a
     /// different height (the join key collided).
     pub key_collisions: u64,
+    /// Block-time keys the node saw with more than one height. They are left
+    /// out of `pairs`, `node_only` and `ws_only`: the public `WebSocket`
+    /// carries no height, so its arrival cannot be matched to either block.
+    pub ambiguous: u64,
 }
 
 /// Joins observations on block time, keeping the first arrival per source.
+///
+/// A block time the node reports with more than one height is ambiguous: the
+/// public `WebSocket` has no height, so its arrival cannot be attributed to one
+/// block. Such keys are counted in [`Pairing::ambiguous`] and left out of
+/// every other field, so they never reach the lead distribution.
 pub fn pair<I: IntoIterator<Item = Observation>>(obs: I) -> Pairing {
     #[derive(Default)]
     struct Seen {
         node: Option<(u64, Option<u64>)>,
         ws: Option<u64>,
+        ambiguous: bool,
     }
     let mut by_time: BTreeMap<u64, Seen> = BTreeMap::new();
     let mut key_collisions = 0;
@@ -270,6 +281,7 @@ pub fn pair<I: IntoIterator<Item = Observation>>(obs: I) -> Pairing {
                 Some((ns, height)) => {
                     if *height != o.block_number {
                         key_collisions += 1;
+                        seen.ambiguous = true;
                     }
                     *ns = (*ns).min(o.recv_ns);
                 }
@@ -282,6 +294,10 @@ pub fn pair<I: IntoIterator<Item = Observation>>(obs: I) -> Pairing {
         ..Pairing::default()
     };
     for (block_time_ms, seen) in by_time {
+        if seen.ambiguous {
+            out.ambiguous += 1;
+            continue;
+        }
         match (seen.node, seen.ws) {
             (Some((node_ns, block_number)), Some(ws_ns)) => out.pairs.push(Pair {
                 block_time_ms,
@@ -308,6 +324,8 @@ pub struct Summary {
     pub ws_only: u64,
     /// Join-key collisions.
     pub key_collisions: u64,
+    /// Ambiguous block-time keys, excluded from the distribution.
+    pub ambiguous: u64,
     /// Matched blocks where the node arrived strictly first.
     pub node_first: u64,
     /// Nearest-rank percentiles of the node lead in ns; `None` when empty.
@@ -322,6 +340,24 @@ pub struct Summary {
     pub p999_ns: Option<i64>,
     /// Maximum.
     pub max_ns: Option<i64>,
+    /// Matched blocks grouped by the UTC hour of their block time, ascending;
+    /// hours with no matched block are omitted. Catches drift over a run.
+    pub per_hour: Vec<HourBucket>,
+}
+
+/// The node lead for blocks whose block time falls in one UTC hour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct HourBucket {
+    /// Start of the hour, Unix milliseconds.
+    pub hour_start_ms: u64,
+    /// Sample count for this hour.
+    pub matched: u64,
+    /// Nearest-rank median lead, ns.
+    pub p50_ns: i64,
+    /// p99 lead, ns (weak below ~100 samples).
+    pub p99_ns: i64,
+    /// Maximum lead, ns.
+    pub max_ns: i64,
 }
 
 /// Summarises a pairing.
@@ -335,6 +371,7 @@ pub fn summarize(p: &Pairing) -> Summary {
         node_only: p.node_only,
         ws_only: p.ws_only,
         key_collisions: p.key_collisions,
+        ambiguous: p.ambiguous,
         node_first: u64::try_from(leads.iter().filter(|&&l| l > 0).count()).unwrap_or(u64::MAX),
         min_ns: leads.first().copied(),
         p50_ns: q(500),
@@ -342,7 +379,33 @@ pub fn summarize(p: &Pairing) -> Summary {
         p99_ns: q(990),
         p999_ns: q(999),
         max_ns: leads.last().copied(),
+        per_hour: per_hour(&p.pairs),
     }
+}
+
+const HOUR_MS: u64 = 3_600_000;
+
+fn per_hour(pairs: &[Pair]) -> Vec<HourBucket> {
+    let mut by_hour: BTreeMap<u64, Vec<i64>> = BTreeMap::new();
+    for p in pairs {
+        by_hour
+            .entry(p.block_time_ms - p.block_time_ms % HOUR_MS)
+            .or_default()
+            .push(p.node_lead_ns());
+    }
+    by_hour
+        .into_iter()
+        .filter_map(|(hour_start_ms, mut v)| {
+            v.sort_unstable();
+            Some(HourBucket {
+                hour_start_ms,
+                matched: u64::try_from(v.len()).unwrap_or(u64::MAX),
+                p50_ns: percentile_sorted(&v, 500)?,
+                p99_ns: percentile_sorted(&v, 990)?,
+                max_ns: *v.last()?,
+            })
+        })
+        .collect()
 }
 
 /// Nearest-rank percentile of an ascending-sorted slice, `per_mille` in

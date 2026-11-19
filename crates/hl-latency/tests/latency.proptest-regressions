@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 2aadfdf35ca281a359a7b7e67bca7ab1ac51754a6ad0a6572ae67ff298e0ee48 # shrinks to secs = 0
+cc 0a4405479153e4f1cc8f7d4a010bc9d2f8c3dceb52fd928ceb8b903b018d1dc3 # shrinks to node_obs = [(27, 0, 0), (27, 1, 0)], ws_obs = []

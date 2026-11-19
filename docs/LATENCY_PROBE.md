@@ -20,12 +20,21 @@ sync with anyone else).
   `hl_latency::parse_ws_message`. **Drop the first frame after every
   (re)subscribe:** it is a snapshot (the first `trades` frame on 2026-11-19
   carried trades ~15 s old).
+- **Stamp point (both arms):** `recv_ns` is taken immediately after the
+  socket/file `read` returns, before any parsing or JSON decode. `hl-latency`
+  never stamps; it only receives `recv_ns` from the capture side, so the
+  capture binary owns this rule and must test it.
 - **Join:** block time in ms (`hl_latency::pair`); the node line also gives the
-  height. Blocks seen by one side only and key collisions are counted, never
-  dropped silently.
+  height. Blocks seen by one side only are counted, never dropped silently. A
+  block time the node reports with two heights is *ambiguous*: counted and
+  excluded from the distribution (the WS has no height to tell them apart).
 - **Report:** `hl-latency observations.jsonl` prints the node lead
-  (`ws_ns - node_ns`, positive = node earlier): matched, node-only, ws-only,
-  node-first count, min/p50/p90/p99/p99.9/max in ns.
+  (`ws_ns - node_ns`, positive = node earlier): `matched` (the sample count
+  behind every percentile), `node_only`, `ws_only`, `ambiguous`,
+  `key_collisions`, node-first count, min/p50/p90/p99/p99.9/max in ns, and
+  `per_hour` buckets (sample count, p50, p99, max per UTC hour of block time)
+  to catch drift. One-side-only counts are results, not noise. Treat p99.9 as
+  weak under about 10,000 matched blocks (about 12 minutes at ~70 ms blocks).
 
 Observation line format (one per arrival):
 
@@ -34,12 +43,23 @@ Observation line format (one per arrival):
 {"source":"public_ws","block_time_ms":1753606210051,"recv_ns":1753606210467000000}
 ```
 
+## Host prep (before every run; done with/through the AWS Reason)
+
+- ENA Express off on the interface.
+- chrony on the Amazon Time Sync source (PHC where present); record
+  `chronyc tracking` offset before and after each run.
+- Verify PHC on the instance: `ls /dev/ptp*` and `ethtool -T <iface>`.
+- Probe pinned to its own core (`taskset`), away from the node's cores.
+- CPU governor `performance` if the instance allows it; record either way.
+- `ethtool -S` allowance counters (`*_allowance_exceeded`) before/after each run;
+  any increase invalidates the run.
+
 ## Run plan
 
-1. 1 h smoke run, then 24 h, same host, both arms simultaneously.
+1. 1 h smoke run, then 24 h, same host, both arms simultaneously; read the
+   `per_hour` buckets for drift.
 2. Repeat with the WS arm on a second region-local box only if the first host's
    CPU load could skew the WS arm (check probe CPU < 5 %).
-3. Capture `ethtool -S` allowance counters before/after; non-zero invalidates.
 4. Second experiment (later): our own node's output vs `hl-node`'s, same method.
 
 ## Caveats
@@ -53,6 +73,8 @@ Observation line format (one per arrival):
 
 ## Status
 
-Done (this PR): parser, join, nearest-rank statistics, report CLI, tests
-including real captured WS frames. Next: the capture binary (inotify tailer +
+Done (this PR): parser, join, nearest-rank statistics, ambiguous-key
+exclusion, per-hour buckets, report CLI with contract tests, proptests and a
+cargo-fuzz target (`fuzz/`, `cargo +nightly fuzz run hl_latency_parsers`),
+tests including real captured WS frames. Next: the capture binary (inotify tailer +
 WS client) behind the ingest trait once the runtime A/B lands.

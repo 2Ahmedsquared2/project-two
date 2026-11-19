@@ -1,0 +1,21 @@
+[package]
+name = "project-two-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+hl-latency = { path = "../crates/hl-latency" }
+
+[[bin]]
+name = "hl_latency_parsers"
+path = "fuzz_targets/hl_latency_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

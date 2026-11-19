@@ -228,11 +228,43 @@ fn pair_orders_by_block_time_and_counts_key_collisions() {
         ws(100, 2),
         node(100, 99, 3),
     ]);
+    // Block time 100 was claimed by heights 10 and 99: the key is ambiguous,
+    // so it is left out of the pairs instead of pairing an arbitrary height.
     assert_eq!(
         p.pairs.iter().map(|x| x.block_time_ms).collect::<Vec<_>>(),
-        vec![100, 300]
+        vec![300]
     );
     assert_eq!(p.key_collisions, 1);
+    assert_eq!(p.ambiguous, 1);
+    assert_eq!((p.node_only, p.ws_only), (0, 0));
+}
+
+#[test]
+fn cross_height_collision_does_not_contaminate_percentiles() {
+    // CI/CD repro: two heights share block time 100. The second height's
+    // early stamp (ns 1) used to be paired with the WS arrival and inflate
+    // the lead to 9_999. Ambiguous keys must not reach the distribution.
+    let p = pair([
+        node(100, 10, 9_000),
+        node(100, 11, 1),
+        ws(100, 10_000),
+        node(170, 12, 20_000),
+        ws(170, 20_100),
+    ]);
+    assert_eq!(p.ambiguous, 1);
+    assert_eq!(p.key_collisions, 1);
+    assert_eq!(p.pairs.len(), 1);
+    assert_eq!(p.pairs[0].block_number, Some(12));
+    let s = summarize(&p);
+    assert_eq!((s.matched, s.ambiguous), (1, 1));
+    assert_eq!((s.min_ns, s.max_ns), (Some(100), Some(100)));
+}
+
+#[test]
+fn same_height_repeat_is_not_a_collision() {
+    let p = pair([node(100, 10, 5), node(100, 10, 3), ws(100, 9)]);
+    assert_eq!((p.ambiguous, p.key_collisions), (0, 0));
+    assert_eq!(p.pairs[0].node_ns, 3);
 }
 
 #[test]
@@ -297,6 +329,45 @@ proptest! {
         prop_assert_eq!(p.node_only, node_times.len() as u64 - both);
         prop_assert_eq!(p.ws_only, ws_times.len() as u64 - both);
         prop_assert!(p.pairs.iter().all(|x| x.node_lead_ns() == 1));
+        prop_assert_eq!(p.ambiguous, 0);
+    }
+
+    #[test]
+    fn ambiguous_keys_never_pair_and_blocks_are_conserved(
+        node_obs in proptest::collection::vec((0u64..40, 0u64..4, 0u64..1000), 0..80),
+        ws_obs in proptest::collection::vec((0u64..40, 0u64..1000), 0..80),
+    ) {
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut heights: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+        for &(t, h, _) in &node_obs { heights.entry(t).or_default().insert(h); }
+        let ws_keys: BTreeSet<u64> = ws_obs.iter().map(|&(t, _)| t).collect();
+        let obs: Vec<_> = node_obs.iter().map(|&(t, h, ns)| node(t, h, ns))
+            .chain(ws_obs.iter().map(|&(t, ns)| ws(t, ns))).collect();
+        let p = pair(obs);
+        let ambiguous: BTreeSet<u64> = heights.iter().filter(|(_, hs)| hs.len() > 1).map(|(&t, _)| t).collect();
+        prop_assert_eq!(p.ambiguous, ambiguous.len() as u64);
+        prop_assert!(p.pairs.iter().all(|x| !ambiguous.contains(&x.block_time_ms)));
+        let all: BTreeSet<u64> = heights.keys().copied().chain(ws_keys.iter().copied()).collect();
+        prop_assert_eq!(p.pairs.len() as u64 + p.node_only + p.ws_only + p.ambiguous, all.len() as u64);
+    }
+
+    #[test]
+    fn parsers_never_panic_on_arbitrary_text(s in "\\PC{0,200}") {
+        let _ = parse_node_line(&s, 0);
+        let _ = parse_ws_message(&s, 0);
+        let _ = hl_latency::read_observations(s.as_bytes());
+    }
+
+    #[test]
+    fn parsers_never_panic_on_json_shaped_text(
+        bt in "\\PC{0,30}", n in any::<i64>(), ch in "(l2Book|trades|pong|)", t in any::<i64>(),
+    ) {
+        let node_line = format!(r#"{{"block_time":{bt:?},"block_number":{n},"events":[]}}"#);
+        let _ = parse_node_line(&node_line, 0);
+        let ws1 = format!(r#"{{"channel":"{ch}","data":{{"time":{t}}}}}"#);
+        let ws2 = format!(r#"{{"channel":"{ch}","data":[{{"time":{t}}},{{"time":"x"}}]}}"#);
+        let _ = parse_ws_message(&ws1, 0);
+        let _ = parse_ws_message(&ws2, 0);
     }
 
     #[test]
@@ -335,4 +406,31 @@ fn ws_real_captured_frames_parse() {
     assert!(o
         .iter()
         .all(|x| x.source == Source::PublicWs && x.block_time_ms > 1_700_000_000_000));
+}
+
+// ---- per-hour drift (Latency review item 4) -------------------------------------
+
+#[test]
+fn per_hour_buckets_by_block_time_with_sample_counts() {
+    const H: u64 = 3_600_000;
+    let mut obs = Vec::new();
+    // hour 0: leads 100, 300 ; hour 2: lead 50 ; hour 1 has no matched blocks
+    obs.extend([node(10, 1, 0), ws(10, 100), node(20, 2, 0), ws(20, 300)]);
+    obs.extend([node(2 * H + 5, 3, 1_000), ws(2 * H + 5, 1_050)]);
+    obs.push(node(H + 1, 4, 0)); // node-only, not in any bucket
+    let s = summarize(&pair(obs));
+    let got: Vec<_> = s
+        .per_hour
+        .iter()
+        .map(|b| (b.hour_start_ms, b.matched, b.p50_ns, b.max_ns))
+        .collect();
+    assert_eq!(got, vec![(0, 2, 100, 300), (2 * H, 1, 50, 50)]);
+}
+
+#[test]
+fn summary_json_names_sample_count_and_hours() {
+    let s = summarize(&pair([node(1, 1, 0), ws(1, 5)]));
+    let v = serde_json::to_value(&s).unwrap();
+    assert_eq!(v["matched"], 1);
+    assert_eq!(v["per_hour"][0]["matched"], 1);
 }

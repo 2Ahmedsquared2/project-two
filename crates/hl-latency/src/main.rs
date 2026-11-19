@@ -10,7 +10,8 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
+    // `args_os`: a non-UTF-8 path must be an error, not a panic.
+    let mut args = std::env::args_os().skip(1);
     let (Some(path), None) = (args.next(), args.next()) else {
         eprintln!("usage: hl-latency <observations.jsonl>");
         return ExitCode::from(2);
@@ -21,7 +22,7 @@ fn main() -> ExitCode {
     {
         Ok(obs) => obs,
         Err(e) => {
-            eprintln!("{path}: {e}");
+            eprintln!("{}: {e}", std::path::Path::new(&path).display());
             return ExitCode::from(2);
         }
     };
