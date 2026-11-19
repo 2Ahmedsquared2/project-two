@@ -8,9 +8,13 @@ backtest speed come second. Nothing here has run on the Tokyo host yet.
 
 - `hl-node` is a closed-source binary. Its only documented outputs are files
   under `~/hl/data/` (see [NODE_SETUP.md](NODE_SETUP.md)), written line by line.
-  `--disable-output-file-buffering` flushes each line. We know of no shared
-  memory, socket or pipe output. To confirm on the host, run `hl-node --help`
-  and ask Hyperliquid; until then treat files as the only interface.
+  `--disable-output-file-buffering` flushes each line. The Hyperliquid Reason
+  confirms (from memory of the hyperliquid-dex/node README, not re-fetched)
+  there is no socket, pipe, shared-memory or streaming output for event data.
+  `--batch-by-block` and `--stream-with-block-info` change file grouping only;
+  `--serve-info` (local `/info` on port 3001) and `--serve-eth-rpc` are
+  request/response servers, not feeds. Hyperliquid's own `order_book_server`
+  also builds books by tailing these files. Check `hl-node --help` on the host.
 - So the first hop is fixed for now: **hl-node writes, then we read**. Our own
   code controls every hop after that.
 - The long-term way to remove the file hop is our own Rust node, which replays
@@ -73,8 +77,10 @@ only host numbers count; this shared cloud sandbox is too noisy to quote.
 
 - Orders leave **from the same Tokyo host**, from the strategy process itself,
   over a pre-opened TLS connection to the Hyperliquid API (`/exchange`).
-  Non-validator nodes do not accept or forward user orders as far as we know;
-  confirm with the Hyperliquid Reason.
+  Non-validator nodes do not accept or forward user orders (Hyperliquid
+  Reason, citing the GitBook Exchange endpoint page and the node README; not
+  re-fetched). The node speeds up what we see, not how fast orders arrive.
+  Rate limits are per IP and per address, the same in every region.
 - Tick-to-order is stamped in one process on one clock:
   `t0` = reader sees the line, `t1` = strategy decides, `t2` = signed bytes
   handed to `write()` on the socket. Report `t2 - t0` with p50 to p99.9.
@@ -87,9 +93,14 @@ only host numbers count; this shared cloud sandbox is too noisy to quote.
   approval. Until then, measure `t2` against a local sink or a dry-run signer
   that builds and signs the bytes but does not send them.
 
+- Order-path round trip (send to ack) from `apne1-az1` vs a second region,
+  using actions that cannot fill (e.g. `scheduleCancel`, or an order rejected
+  below minimum size). This still signs with a wallet, so it waits for Ahmed's
+  approval of the wallet and network. "API servers are in Tokyo" is a community
+  claim; this measurement replaces it with a number.
+
 ## 5. Open questions
 
-- Does `hl-node` have any non-file output or a flag we have missed? (Hyperliquid Reason)
 - Is putting hl-node's output dir on tmpfs safe for disk/RAM over a week? (measure on host)
 - Testnet vs mainnet for the first signed-order path test, and with which
   wallet? Ahmed's decision; nothing is sent until he approves.
