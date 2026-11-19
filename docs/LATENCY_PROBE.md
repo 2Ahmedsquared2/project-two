@@ -73,8 +73,23 @@ Observation line format (one per arrival):
 
 ## Status
 
-Done (this PR): parser, join, nearest-rank statistics, ambiguous-key
-exclusion, per-hour buckets, report CLI with contract tests, proptests and a
-cargo-fuzz target (`fuzz/`, `cargo +nightly fuzz run hl_latency_parsers`),
-tests including real captured WS frames. Next: the capture binary (inotify tailer +
-WS client) behind the ingest trait once the runtime A/B lands.
+Done: parser, join, nearest-rank statistics, ambiguous-key exclusion,
+per-hour buckets, report CLI with contract tests, proptests and a cargo-fuzz
+target (`fuzz/`, `cargo +nightly fuzz run hl_latency_parsers`), tests
+including real captured WS frames.
+
+Done (capture, `crates/hl-capture`): node arm. `hl-capture node <dir> --out
+obs.jsonl [--poll-us N] [--duration-s N]` follows the newest hourly file
+(numeric `{date}/{hour}` order, so hour 10 is newer than 9), reads a file that
+exists at start from its end and every later file from byte 0, drains the old
+file before switching at rotation, and stamps `CLOCK_REALTIME` once per `read`
+that returns data, before parsing; a line split across reads carries the stamp
+of the read that delivered its newline. Bad lines are counted, not fatal.
+Polling (default 100 us, on a pinned core) rather than inotify for now.
+`WsFilter` drops the first `l2Book`/`trades` frame per coin after each
+(re)connect and counts malformed frames. Tested against fake node files
+(append, partial line, rotation, late-appearing file) and synthetic and
+captured WS frames.
+
+Next: the WS socket client feeding `WsFilter` (stamp at TLS read), then
+the 1 h run on the host.
