@@ -1,0 +1,24 @@
+[package]
+name = "hl-node-convert"
+description = "Converts hl-node output (raw book diffs, order statuses, l4Snapshots) into hl-dataset L4 records for book-check."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+hl-book-ref = { workspace = true }
+hl-dataset = { workspace = true }
+hl-latency = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+book-check = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

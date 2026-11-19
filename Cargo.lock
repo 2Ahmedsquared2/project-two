@@ -188,6 +188,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hl-node-convert"
+version = "0.1.0"
+dependencies = [
+ "book-check",
+ "hl-book-ref",
+ "hl-dataset",
+ "hl-latency",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

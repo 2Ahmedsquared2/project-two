@@ -173,6 +173,106 @@ status (VERIFIED / OBSERVED / INFERENCE / UNVERIFIED) is in that spec and in the
 `replay` module docs. `--no-stp` turns self-trade prevention off;
 `--no-compare` replays without comparing recorded books and prints the counts.
 
+## Converting hl-node output (`hl-node-convert`)
+
+Real L4 ground truth comes from a non-validator `hl-node` run with
+`--write-raw-book-diffs --write-order-statuses --stream-with-block-info`
+(see [NODE_SETUP.md](NODE_SETUP.md)). The `hl-node-convert` crate turns that
+output into this format so `book-check` can verify it:
+
+```bash
+cargo run --release -p hl-node-convert -- --meta meta.json \
+  --diffs ~/hl/data/node_raw_book_diffs/hourly/20261120/9 \
+  --diffs ~/hl/data/node_raw_book_diffs/hourly/20261120/10 \
+  --statuses ~/hl/data/node_order_statuses/hourly/20261120/9 \
+  --statuses ~/hl/data/node_order_statuses/hourly/20261120/10 \
+  --seed l4_at_H0.json --check l4_at_H1.json --coin BTC --coin ETH \
+  --out node.jsonl
+cargo run --release -p book-check -- node.jsonl
+```
+
+Pass hourly files oldest first: the hour directory names are not zero-padded,
+so a shell glob sorts `10` before `9`. A block number that goes backwards is an
+error. `meta.json` is `{"meta": <meta>, "spotMeta": <spotMeta>}` (the local
+info server serves both). The stats print as JSON. Exit codes: 0 converted,
+1 a `--strict` finding, 2 usage or conversion error.
+
+### Node schemas (primary sources, read only, nothing copied)
+
+Sources: `hyperliquid-dex/node` README at commit `405cc08` (flags section);
+`hyperliquid-dex/order_book_server` at commit `8b4f237`
+(`server/src/types/node_data.rs`, `server/src/types/mod.rs`,
+`server/src/listeners/order_book/state.rs`, `server/src/order_book/multi_book.rs`);
+Hyperliquid docs, "L1 data schemas"
+(<https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/nodes/l1-data-schemas>),
+all read 2026-11-19.
+
+| input | shape | used fields |
+|---|---|---|
+| batch line (both streams) | `{local_time, block_time, block_number, events}`; times are naive UTC (`chrono::NaiveDateTime`) | `block_number`, `block_time` (to ms) |
+| raw book diff | `{user, oid, coin, px, side?, raw_book_diff}` with `raw_book_diff` one of `{"new":{"sz","insertBefore"?}}`, `{"update":{"origSz","newSz"}}`, `"remove"` | all; any other kind is an error |
+| order status | `{time, user, status, order:{coin, side "A"/"B", limitPx, sz, oid, isTrigger, tif, ...}}` | `order.oid`, `order.side`, and the inserting rule below |
+| `l4Snapshots` (`fileSnapshot`, `includeUsers: true`, `includeHeightInOutput: true`) | `[height, [[coin, [[[user, order], ...bids], [...asks]]], ...]]` | user, side, `limitPx`, `sz`, `oid`, `isTrigger` |
+
+Coins are perp names (`BTC`), spot `@index` or `PURR/USDC` (as
+`spotMeta.universe[].name`), builder perps `dex:NAME`.
+
+### Mapping
+
+| node | dataset |
+|---|---|
+| `block_number`, `block_time` | `block.height`, `block.time_ms` (`txs` empty) |
+| `new` without `insertBefore` | `insert {oid, side, px, sz}` (`px` from the diff, `sz` from `new.sz`) |
+| `new` with `insertBefore: B` | `insert_before {before: B, order}` |
+| `update` | `resize {oid, sz: newSz}`; `newSz` 0 becomes `cancel` (counted) |
+| `remove` | `cancel {oid}` |
+| seed `l4Snapshots` at `H` | block `H` with one `insert` per resting order, levels and queues in file order; header `seed_height: H` |
+| check `l4Snapshots` at `H` | an `l4_book` for every header asset after block `H` (empty if the coin is absent) |
+
+Rules:
+
+1. **Side of a `new` diff.** The diff's own `side` (`"Bid"`/`"Ask"`, shown in
+   the docs example) if present, else the side of an order status for that
+   oid **in the same block** that puts the order on the book: `open` and not
+   a trigger and not `Ioc`, or `triggered` for a trigger order (the rule of
+   `NodeDataOrderStatus::is_inserted_into_book` in `order_book_server`).
+   If both exist and disagree, or neither exists, conversion stops.
+2. **Several lines of one block** (streaming mode writes events as processed)
+   are merged in file order. A block number that goes back is an error.
+3. **Missing heights.** A height in the status stream but not the diff stream
+   is an empty block with the status time. A height in neither is an empty
+   block counted as `gap_blocks`; `--no-gaps` makes it an error.
+4. **Seed.** With `--seed`, every diff is emitted as written, and an op the
+   reference book cannot apply is reported by `book-check` at its block.
+   Without a seed the book starts empty at the first diff block, and diffs
+   on orders the converter never saw inserted (resting before the data
+   started) are skipped and counted as `untracked_diffs`.
+5. **Soft findings**, counted with up to 20 examples, and errors under
+   `--strict`: diffs on coins not in `meta.json` (builder perps); an `update`
+   whose `origSz` differs from the size the converter tracked; a check
+   snapshot outside the written heights. Diffs on coins outside `--coin`
+   are counted as `filtered_diffs`.
+6. Prices and sizes convert exactly with the header's ticks and lots;
+   a string that does not convert stops conversion.
+
+### Open schema questions (not expert-checked)
+
+The Hyperliquid Reason answered these on 2026-11-19 and called its answers
+unverified: Q3 and Q4 are inferences from the `order_book_server` code; for
+Q1, Q2 and Q5 it does not know. The converter handles each case either way,
+and the first real run settles them by checking a later `l4Snapshot`:
+
+| # | question | converter's handling |
+|---|---|---|
+| Q1 | Does streaming mode split one block across several lines? Does it write a line for a block with no events? | merges consecutive lines; fills missing heights (rule 3) |
+| Q2 | Does every raw book diff carry `side`? | accepts either form (rule 1) |
+| Q3 | Are diffs in application order across coins, and are a block's statuses in the same `block_number` batch as its `new` diffs? (INFERENCE from `order_book_server`) | assumes yes; a `new` with no side source stops conversion |
+| Q4 | Is `l4Snapshots` at `height` the book after that block, levels best first, queues in time order? (INFERENCE) | assumes after the block; regroups levels by price, keeps queue order |
+| Q5 | Can `update` carry `newSz` 0? Is `origSz` always the size before? | 0 becomes `cancel` (Hyperliquid Reason's advice); `origSz` checked and counted |
+
+No real `hl-node` output exists yet (no host). Every test runs on fixtures
+built by hand from the schemas above (`golden/node/`, see `golden/README.md`).
+
 ## Limitations of public data (Phase 1)
 
 1. **No oids for new orders.** `blockDetails` shows orders as submitted, not
@@ -185,7 +285,8 @@ status (VERIFIED / OBSERVED / INFERENCE / UNVERIFIED) is in that spec and in the
 2. **No seed book.** Public `l2Book` has no order ids and cannot seed a
    per-order replay, so a replay starts empty and its L2 diverges from the
    first anchored snapshot. A real-data equality check needs a node's
-   `l4Snapshots` plus order statuses (or raw book diffs).
+   `l4Snapshots` plus raw book diffs and order statuses, converted with
+   `hl-node-convert` (above).
 3. **L2 only**, 20 levels per side, about every 40 blocks per coin; no fills.
 4. **Builder-perp metadata** is not in `meta.json`.
 5. Margin, liquidations, funding, ADL, TWAP slices, CoreWriter orders from
