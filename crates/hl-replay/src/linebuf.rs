@@ -17,6 +17,8 @@ pub struct LineBuf {
     end: usize,
     /// Bytes in `start..scanned` are known to hold no newline.
     scanned: usize,
+    /// Where the line last returned by `next_line` sits in `buf`.
+    last: (usize, usize),
 }
 
 impl LineBuf {
@@ -28,6 +30,7 @@ impl LineBuf {
             start: 0,
             end: 0,
             scanned: 0,
+            last: (0, 0),
         }
     }
 
@@ -44,6 +47,8 @@ impl LineBuf {
             self.end -= self.start;
             self.scanned -= self.start;
             self.start = 0;
+            // The last line's bytes may just have been overwritten.
+            self.last = (0, 0);
         }
         if self.end == self.buf.len() {
             return Err(ReplayError::LineTooLong {
@@ -69,6 +74,10 @@ impl LineBuf {
         let capacity = self.buf.len();
         if bytes.is_empty() {
             return Ok(());
+        }
+        let free = self.buf.len() - (self.end - self.start);
+        if bytes.len() > free {
+            return Err(ReplayError::LineTooLong { capacity });
         }
         match self.spare_mut() {
             Ok(spare) if spare.len() >= bytes.len() => {
@@ -104,7 +113,15 @@ impl LineBuf {
             self.end = 0;
             self.scanned = 0;
         }
+        self.last = (a, b);
         Some(&self.buf[a..b])
+    }
+
+    /// The line [`LineBuf::next_line`] last returned, for as long as nothing
+    /// has been read into the buffer since; empty after that.
+    #[must_use]
+    pub fn last_line(&self) -> &[u8] {
+        &self.buf[self.last.0..self.last.1]
     }
 
     /// Bytes buffered and not yet returned as a line.

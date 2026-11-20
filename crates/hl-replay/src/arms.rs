@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::core::{BusyTick, Core, Hists, Polled, Step};
 use crate::sink::{ensure_loopback_peer, loopback_pair, LoopbackAddr, Sink, SinkStats};
-use crate::stage::{active_pipeline, ActivePipeline};
+use crate::stage::{active_parser_mode, active_pipeline, ActivePipeline, ParserMode};
 use crate::{Clock, ReplayError};
 
 /// One way of getting lines in and orders out. The pipeline between is the
@@ -455,6 +455,10 @@ fn join<T>(h: std::thread::JoinHandle<T>, what: &str) -> Result<T, ReplayError> 
         .map_err(|_| ReplayError::Thread(format!("{what} thread panicked")))
 }
 
+/// With a header-scan parser, every this-many-th line is re-parsed by the
+/// strict parser after its `t2` (see [`Core::with_strict_validation`]).
+const VALIDATE_EVERY: u64 = 16;
+
 static TAIL_FILES: AtomicU64 = AtomicU64::new(0);
 
 /// The feeder's end of the source.
@@ -522,7 +526,12 @@ pub fn run_round(arm: Arm, cfg: &RoundConfig) -> Result<RoundOutcome, ReplayErro
     let sink = Sink::spawn_on(cfg.sink_bind, cfg.feeder_core)?;
     let sink_stream = sink.connect()?;
     let core = Core::new(active_pipeline(), clock, cfg.warmup, line_capacity)
-        .with_feed_stamps(Arc::clone(&stamps));
+        .with_feed_stamps(Arc::clone(&stamps))
+        .with_strict_validation(match active_parser_mode() {
+            // The strict parser is its own validator.
+            ParserMode::Strict => 0,
+            ParserMode::HeaderScan => VALIDATE_EVERY,
+        });
 
     let (feed_end, source, tail_path) = open_source(arm, cfg)?;
 
@@ -600,23 +609,41 @@ pub fn run_round(arm: Arm, cfg: &RoundConfig) -> Result<RoundOutcome, ReplayErro
     cleanup(&tail_path);
     drop(feed_end?);
     let (hists, hot_pinned) = hot_result?;
-    let sink_stats = sink_stats?;
+    checked(arm, total, hists, sink_stats?, hot_pinned)
+}
+
+/// A round counts only if what reached the sink is what was fed and no
+/// scanned line failed the strict check.
+fn checked(
+    arm: Arm,
+    total: u64,
+    hists: Option<Hists>,
+    sink: SinkStats,
+    hot_pinned: Option<bool>,
+) -> Result<RoundOutcome, ReplayError> {
     let Some(hists) = hists else {
         return Err(ReplayError::Thread(format!(
             "{} reported ready and then produced nothing",
             arm.name()
         )));
     };
-    if sink_stats.orders != total {
+    if hists.scan_strict_mismatches > 0 {
+        return Err(ReplayError::ScanStrictMismatch {
+            arm: arm.name(),
+            mismatches: hists.scan_strict_mismatches,
+            validated: hists.validated,
+        });
+    }
+    if sink.orders != total {
         return Err(ReplayError::Mismatch {
             arm: arm.name(),
             fed: total,
-            orders: sink_stats.orders,
+            orders: sink.orders,
         });
     }
     Ok(RoundOutcome::Ran(Box::new(RoundResult {
         hists,
-        sink: sink_stats,
+        sink,
         fed: total,
         hot_pinned,
     })))

@@ -93,6 +93,28 @@ It is not tick-to-trade. Every row is tagged `parser=strict` or
 A header-scan parser is for stamping and routing only: a decision stage that
 reads prices or sizes must take them from a strict parse.
 
+### Complete lines only, and the strict validator
+
+A header scan can return a result for a line cut right after a nested `}`,
+where the strict parse fails. So a parser here is only ever handed a line the
+reader has seen the newline of: `LineBuf::next_line` is the only source of
+lines, and `tests/complete_lines.rs` writes half a line to a tailed file,
+checks that nothing is parsed, finishes the line and checks that exactly one
+parse happens. `Pipeline::on_line` carries a `debug_assert` and a `TODO(PR #7)`
+to take `hl_latency::CompleteLine` once that type exists.
+
+When the active parser's mode is `header scan`, every 16th line is re-parsed
+by the strict parser after its `t2` (off the timed path). A line the scan
+accepted and strict refuses is counted, printed per arm as
+`scan-vs-strict: validated=N mismatches=M`, and any mismatch fails the run.
+With today's strict parser the report says `not applicable`.
+
+### Not measured yet
+
+- Last-byte cache miss on real ~100 KB lines: generated lines are about 3 KB.
+  Needs the Tokyo run with `--input` on real node output.
+- Anything past the socket: TLS, WebSocket framing, the NIC, the network.
+
 ### Swapping a stage
 
 Stages are type parameters of `Pipeline` (static dispatch). The active ones

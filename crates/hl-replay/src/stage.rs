@@ -345,6 +345,15 @@ impl<P: Parser, B: Book, D: Decision, S: Signer> Handle for Pipeline<P, B, D, S>
         out: &mut Vec<u8>,
     ) -> Result<LineOutcome, ReplayError> {
         out.clear();
+        // Complete lines only: a header scan can accept a line cut after a
+        // nested '}', so a parser must never see a partial one. Here that
+        // holds by construction (the only caller passes what
+        // `LineBuf::next_line` returned, which needs the newline) and this
+        // assert catches a slice that spans lines.
+        // TODO(PR #7): take `hl_latency::CompleteLine`, built in
+        // `LineBuf::next_line` at the point the newline is seen, once that
+        // type has landed; then this is enforced by the type, not asserted.
+        debug_assert!(!line.contains(&b'\n'), "parser handed more than one line");
         // The UTF-8 check is part of parsing: the parser takes `&str`.
         let line = std::str::from_utf8(line).map_err(|_| ReplayError::NotUtf8)?;
         let obs = self.parser.parse(line, t0_ns)?;

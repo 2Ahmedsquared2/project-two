@@ -60,6 +60,17 @@ pub enum ReplayError {
         /// Orders counted at the sink.
         orders: u64,
     },
+    /// A header-scan parser accepted lines the strict parser refuses: the
+    /// run's numbers are void.
+    #[error("{arm}: the scan accepted {mismatches} of {validated} checked lines that the strict parser refuses")]
+    ScanStrictMismatch {
+        /// The arm.
+        arm: &'static str,
+        /// Lines the strict parser refused.
+        mismatches: u64,
+        /// Lines checked.
+        validated: u64,
+    },
     /// A harness thread panicked or vanished.
     #[error("thread: {0}")]
     Thread(String),

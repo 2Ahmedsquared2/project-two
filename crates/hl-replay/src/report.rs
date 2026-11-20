@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::arms::ArmReport;
-use crate::stage::{active_parser_mode, stage_table};
+use crate::stage::{active_parser_mode, stage_table, ParserMode};
 use crate::{LatencyHist, ReplayError};
 
 /// The commit this harness was built from (`git rev-parse HEAD` at build
@@ -131,6 +131,24 @@ pub fn render_report(meta: &RunMeta, arms: &[ArmReport]) -> String {
         "  t2   = write of the signed order to the sink socket returned"
     );
     let _ = writeln!(s, "unit: nanoseconds; rounds are merged histograms");
+    match active_parser_mode() {
+        ParserMode::Strict => {
+            let _ = writeln!(
+                s,
+                "scan-vs-strict: not applicable, the active parser is strict (it is its own validator)"
+            );
+        }
+        ParserMode::HeaderScan => {
+            let _ = writeln!(
+                s,
+                "scan-vs-strict: sampled lines are re-parsed strictly after t2; any mismatch fails the run"
+            );
+        }
+    }
+    let _ = writeln!(
+        s,
+        "unmeasured: last-byte cache miss on real ~100 KB lines (needs the Tokyo run on real node lines)"
+    );
     let _ = writeln!(s);
     for a in arms {
         if let Some(why) = &a.unavailable {
@@ -157,6 +175,15 @@ pub fn render_report(meta: &RunMeta, arms: &[ArmReport]) -> String {
                 m.p9999,
                 m.max,
                 active_parser_mode(),
+            );
+        }
+        if active_parser_mode() == ParserMode::HeaderScan {
+            let _ = writeln!(
+                s,
+                "{:<21} scan-vs-strict: validated={} mismatches={}",
+                a.arm.name(),
+                a.hists.validated,
+                a.hists.scan_strict_mismatches
             );
         }
     }

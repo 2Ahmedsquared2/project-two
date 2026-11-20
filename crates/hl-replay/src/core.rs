@@ -36,6 +36,8 @@ impl Hists {
         self.e2e.merge(&other.e2e);
         self.detect.merge(&other.detect);
         self.total.merge(&other.total);
+        self.validated += other.validated;
+        self.scan_strict_mismatches += other.scan_strict_mismatches;
     }
 }
 
@@ -67,6 +69,7 @@ pub struct Core<H> {
     feed_stamps: Option<Arc<[AtomicU64]>>,
     t0: u64,
     t1: u64,
+    validate_every: u64,
 }
 
 impl<H: Handle> Core<H> {
@@ -85,6 +88,7 @@ impl<H: Handle> Core<H> {
             feed_stamps: None,
             t0: 0,
             t1: 0,
+            validate_every: 0,
         }
     }
 
@@ -96,9 +100,16 @@ impl<H: Handle> Core<H> {
         self
     }
 
-    /// Stub: validation is not implemented yet.
+    /// Re-parses every `every`-th line (0 = never) with the strict parser,
+    /// [`hl_latency::parse_node_line`], **after** `t2` has been stamped and
+    /// the latencies recorded, so it is off the timed path. A line the
+    /// pipeline's parser accepted and the strict parse refuses is counted in
+    /// [`Hists::scan_strict_mismatches`]. For header-scan parsers, which can
+    /// accept a line whose body is broken. It allocates (the strict parser
+    /// does), so the allocation gates run without it.
     #[must_use]
-    pub fn with_strict_validation(self, _every: u64) -> Self {
+    pub fn with_strict_validation(mut self, every: u64) -> Self {
+        self.validate_every = every;
         self
     }
 
@@ -172,6 +183,9 @@ impl<H: Handle> Core<H> {
         let t2 = self.clock.now_ns();
         let index = self.seen;
         self.seen += 1;
+        if self.validate_every > 0 && index.is_multiple_of(self.validate_every) {
+            self.validate_last_line();
+        }
         if index < self.warmup {
             return;
         }
@@ -185,6 +199,19 @@ impl<H: Handle> Core<H> {
         if let Some(fed) = fed {
             self.hists.detect.record(self.t0.saturating_sub(fed));
             self.hists.total.record(t2.saturating_sub(fed));
+        }
+    }
+
+    /// The strict check of the line just sent. Cold on purpose: it runs after
+    /// `t2` and must not be inlined into the timed path.
+    #[cold]
+    #[inline(never)]
+    fn validate_last_line(&mut self) {
+        self.hists.validated += 1;
+        let strict_ok = std::str::from_utf8(self.lines.last_line())
+            .is_ok_and(|l| hl_latency::parse_node_line(l, 0).is_ok());
+        if !strict_ok {
+            self.hists.scan_strict_mismatches += 1;
         }
     }
 
