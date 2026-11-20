@@ -70,3 +70,35 @@ cargo run -q -p book-check -- golden/replay.jsonl --replay                      
 cargo run -q -p book-check -- golden/replay-corrupt-modify-queue.jsonl --replay  # exit 1
 cargo run -q -p book-check -- golden/replay.jsonl --replay --no-stp              # exit 1
 ```
+
+## Node-output vector (`node/`)
+
+Hand-built `hl-node` output in the documented schemas (see
+`docs/dataset-format.md`, "Converting hl-node output"), **not** real node data:
+no node host exists yet. `meta.json` has perps BTC (asset 0, `sz_decimals` 5,
+so "100000.0" = 1000000 ticks and "0.5" = 50000 lots) and ETH, and spot
+PURR/USDC (asset 10000, `sz_decimals` 0, 8 price decimals). The scenario is
+converted with `--coin BTC --coin PURR/USDC`, so ETH is filtered out.
+
+| height | input | dataset ops (hand-derived) | why |
+|---|---|---|---|
+| 999 | diff: new 11 | (skipped) | at or below the seed height |
+| 1000 | `seed.json` | insert 11, 12 (bid 100000.0), 13 (bid 99990.0), 14 (ask 100010.0), 15 (ask 100020.0), 21 (PURR bid 0.2), 22 (PURR ask 0.21) | seed block; trigger 16 and ETH 17 skipped |
+| 1001 | two diff lines | resize 11 to 0.4; cancel 14; insert 31 ask 100010.0 (side from its `open` status); insert 32 before 12; `xyz:FOO` skipped (unknown coin); ETH remove skipped (filtered) | lines merged in order |
+| 1002 | status line only | empty block, time from the status line | not a gap |
+| 1003 | diff line | cancel 13; insert 33 PURR bid (side from status); resize 22 to 20; resize 15 to 1.0 (origSz 1.5 vs tracked 2.0: counted) | |
+
+Book after 1003 (`check.json`): BTC bids 100000.0: [11×0.4, 32×0.2, 12×0.25];
+asks 100010.0: [31×0.1], 100020.0: [15×1.0]; PURR bid 0.2: [21×100, 33×10],
+ask 0.21: [22×20]. `expected.jsonl` is that dataset, written by hand; it
+passes `book-check` by itself. `check-corrupt-queue.json` records the
+100000.0 bid queue as [32, 11, 12]; `book-check` must report block 1003, bid,
+1000000 ticks, queue position 0: recorded 32, candidate 11.
+
+```bash
+cargo run -q -p hl-node-convert -- --meta golden/node/meta.json \
+  --diffs golden/node/node_raw_book_diffs --statuses golden/node/node_order_statuses \
+  --seed golden/node/seed.json --check golden/node/check.json \
+  --coin BTC --coin PURR/USDC --out /tmp/node.jsonl
+cargo run -q -p book-check -- /tmp/node.jsonl   # exit 0
+```

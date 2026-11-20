@@ -1,0 +1,1 @@
+{"meta":{"universe":[{"name":"BTC","szDecimals":5,"maxLeverage":40},{"name":"ETH","szDecimals":4,"maxLeverage":25}]},"spotMeta":{"universe":[{"name":"PURR/USDC","index":0,"tokens":[1,0],"isCanonical":true}],"tokens":[{"name":"USDC","index":0,"szDecimals":8},{"name":"PURR","index":1,"szDecimals":0}]}}

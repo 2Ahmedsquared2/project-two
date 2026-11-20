@@ -14,7 +14,9 @@ mod support;
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use hl_latency::{parse_node_line, parse_ws_message_into, scan_node_header, Observation};
+use hl_latency::{
+    parse_node_line, parse_ws_message_into, scan_node_header, CompleteLine, Observation,
+};
 
 fn node(c: &mut Criterion) {
     for (name, events) in [("small_2_events", 2), ("busy_600_events", 600)] {
@@ -27,7 +29,12 @@ fn node(c: &mut Criterion) {
             b.iter(|| parse_node_line(black_box(&line), 1).unwrap());
         });
         g.bench_function("header_scan", |b| {
-            b.iter(|| scan_node_header(black_box(line.as_bytes())).unwrap());
+            b.iter(|| {
+                scan_node_header(CompleteLine::assume_newline_seen(black_box(
+                    line.as_bytes(),
+                )))
+                .unwrap()
+            });
         });
         g.finish();
     }

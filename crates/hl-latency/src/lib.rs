@@ -210,6 +210,15 @@ pub fn parse_node_line(line: &str, recv_ns: u64) -> Result<Observation, ParseErr
 /// let line: &[u8] = br#"{"local_time":"x","block_time":"2025-07-27T08:50:10.051000","block_number":1}"#;
 /// let _ = hl_latency::scan_node_header(line);
 /// ```
+///
+/// The caller says so explicitly:
+///
+/// ```
+/// use hl_latency::{scan_node_header, CompleteLine};
+/// let line: &[u8] = br#"{"local_time":"x","block_time":"2025-07-27T08:50:10.051000","block_number":1}"#;
+/// let line = CompleteLine::assume_newline_seen(line);
+/// assert_eq!(scan_node_header(line), Some((1_753_606_210_051, 1)));
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct CompleteLine<'a>(&'a [u8]);
@@ -263,13 +272,21 @@ impl<'a> CompleteLine<'a> {
 ///
 /// # Contract
 ///
-/// Pass complete lines only: call this after the reader has seen the line's
-/// newline, never on a partial read. A `Some` is a statement about the
-/// prefix and the last byte, nothing in between:
+/// The argument is a [`CompleteLine`]: the type is how "call this after the
+/// reader has seen the line's newline, never on a partial read" is
+/// enforced. A `Some` is a statement about the prefix and the last byte,
+/// nothing in between:
 ///
 /// - End of line: a line cut short gives `None`, unless the cut lands right
-///   after a nested `}` (the end of an event object), which looks like a
-///   complete line. Passing complete lines only is what rules that case out.
+///   after a nested `}` (the end of an event object) or inside a string
+///   whose last byte is `}`, which looks like a complete line. The caller's
+///   [`CompleteLine`] claim rules out a partial read.
+/// - What the claim does not rule out is a line the *writer* tore: a torn
+///   event followed by a newline, or a torn line with the next line joined
+///   onto it (the scan then reports the torn line's header and the next
+///   block's is lost). In every such case [`parse_node_line`] returns an
+///   error, so a consumer that pairs on a scan stamp must drop it when the
+///   strict parse of the same line fails, and count how often that happens.
 /// - The tail between the header and the closing `}` is not read. A line
 ///   corrupt after `block_number` that still ends with `}` gives `Some`,
 ///   where [`parse_node_line`] gives an error.
@@ -284,15 +301,16 @@ impl<'a> CompleteLine<'a> {
 /// height. Each case above is pinned by a test in `tests/parse_equiv.rs`.
 ///
 /// ```
+/// use hl_latency::{scan_node_header, CompleteLine};
 /// let line = br#"{"local_time":"2025-07-27T08:50:10.334741319","block_time":"2025-07-27T08:50:10.051000","block_number":676607012,"events":[]}"#;
-/// let header = Some((1_753_606_210_051, 676_607_012));
-/// assert_eq!(hl_latency::scan_node_header(line), header);
+/// let scan = |b| scan_node_header(CompleteLine::assume_newline_seen(b));
+/// assert_eq!(scan(line), Some((1_753_606_210_051, 676_607_012)));
 /// // Not a node line, and a node line cut short: both fall back.
-/// assert_eq!(hl_latency::scan_node_header(br#"{"block_number":1}"#), None);
-/// assert_eq!(hl_latency::scan_node_header(&line[..line.len() - 1]), None);
+/// assert_eq!(scan(br#"{"block_number":1}"#), None);
+/// assert_eq!(scan(&line[..line.len() - 1]), None);
 /// ```
 #[must_use]
-pub fn scan_node_header(line: &[u8]) -> Option<(u64, u64)> {
+pub fn scan_node_header(line: CompleteLine<'_>) -> Option<(u64, u64)> {
     /// Splits at the closing quote of a string with no escapes.
     fn plain_string(b: &[u8]) -> Option<(&[u8], &[u8])> {
         let end = b.iter().position(|&c| c == b'"' || c == b'\\')?;
@@ -301,6 +319,7 @@ pub fn scan_node_header(line: &[u8]) -> Option<(u64, u64)> {
         }
         Some((&b[..end], &b[end + 1..]))
     }
+    let line = line.as_bytes();
     let rest = line.strip_prefix(br#"{"local_time":""#)?;
     let (_local_time, rest) = plain_string(rest)?;
     let rest = rest.strip_prefix(br#","block_time":""#)?;

@@ -9,7 +9,9 @@ mod support;
 use std::hint::black_box;
 
 use hl_alloc_gate::{assert_no_alloc_after_warmup, count_ticks};
-use hl_latency::{parse_node_line, parse_ws_message_into, scan_node_header, Observation};
+use hl_latency::{
+    parse_node_line, parse_ws_message_into, scan_node_header, CompleteLine, Observation,
+};
 
 const WARMUP: u64 = 16;
 const TICKS: u64 = 1000;
@@ -72,7 +74,9 @@ fn header_scan_does_not_allocate() {
     for (what, lines) in [("2 events", small_lines()), ("600 events", busy_lines())] {
         assert_no_alloc_after_warmup(&format!("scan_node_header, {what}"), WARMUP, TICKS, |i| {
             let line = pick(&lines, i);
-            let got = scan_node_header(black_box(line.as_bytes()));
+            let got = scan_node_header(CompleteLine::assume_newline_seen(black_box(
+                line.as_bytes(),
+            )));
             assert!(black_box(got).is_some(), "no header in a {what} line");
         });
     }

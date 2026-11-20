@@ -22,4 +22,28 @@ for bad in "golden/replay-corrupt-modify-queue.jsonl --replay" "golden/replay.js
     echo "golden replay vector '$bad' was NOT caught"; exit 1
   fi
 done
+# Node-output converter: golden node files -> dataset -> book-check.
+node_out="$(mktemp -d)"
+trap 'rm -rf "$node_out"' EXIT
+node_convert() {
+  cargo run -q -p hl-node-convert -- --meta golden/node/meta.json \
+    --diffs golden/node/node_raw_book_diffs --statuses golden/node/node_order_statuses \
+    --seed golden/node/seed.json --coin BTC --coin PURR/USDC --check "$1" --out "$2" > /dev/null
+}
+node_convert golden/node/check.json "$node_out/ok.jsonl"
+cargo run -q -p book-check -- "$node_out/ok.jsonl"
+node_convert golden/node/check-corrupt-queue.json "$node_out/bad.jsonl"
+if cargo run -q -p book-check -- "$node_out/bad.jsonl"; then
+  echo "golden node vector check-corrupt-queue.json was NOT caught"; exit 1
+fi
+echo "== hl-order golden vectors (testnet signer vs Python SDK)"
+cargo test -q -p hl-order --test golden
+# Regenerate the vectors and diff them when the pinned SDK is importable
+# (pip install --target "$HOME/pysdk" hyperliquid-python-sdk==0.24.0). Offline: no network calls.
+if PYTHONPATH="${HL_PYSDK:-$HOME/pysdk}" python3 -c "import hyperliquid.utils.signing" 2>/dev/null; then
+  PYTHONPATH="${HL_PYSDK:-$HOME/pysdk}" python3 scripts/gen_hl_order_golden.py | diff -q - golden/hl-order/vectors.json \
+    || { echo "golden/hl-order/vectors.json drifted from the SDK generator"; exit 1; }
+else
+  echo "(python SDK not installed: skipping hl-order vector regeneration diff)"
+fi
 echo "all checks passed"

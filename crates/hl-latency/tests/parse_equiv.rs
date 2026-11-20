@@ -6,11 +6,18 @@
 mod oracle;
 
 use hl_latency::{
-    parse_node_line, parse_ws_message, parse_ws_message_into, scan_node_header, Observation,
+    parse_node_line, parse_ws_message, parse_ws_message_into, CompleteLine, Observation,
     ParseError, Source,
 };
 use proptest::prelude::*;
 use proptest::sample::{select, Index};
+
+/// The header scan on bytes these tests declare to be a whole line. Tests that
+/// cut a line short on purpose go through here too: they pin what the scan
+/// answers when a caller makes the `CompleteLine` claim wrongly.
+fn scan_node_header(line: &[u8]) -> Option<(u64, u64)> {
+    hl_latency::scan_node_header(CompleteLine::assume_newline_seen(line))
+}
 
 // ---- the comparisons ----------------------------------------------------------
 
@@ -319,6 +326,36 @@ fn header_scan_answers_for_a_line_cut_right_after_a_nested_closing_brace() {
         parse_node_line(&cut, 0),
         Err(ParseError::Malformed(_))
     ));
+}
+
+/// Lines the writer tore, which a correct `CompleteLine` claim cannot rule
+/// out (found by the CI/CD review of adf68bc): the scan answers, the strict
+/// parser rejects. A consumer must drop a scan stamp whose line then fails
+/// the strict parse.
+#[test]
+fn header_scan_answers_for_writer_torn_lines_that_end_with_a_closing_brace() {
+    let head = format!(r#"{{"local_time":"x","block_time":"{TS}","block_number":5,"events":["#);
+    let next = format!(r#"{{"local_time":"x","block_time":"{TS}","block_number":6,"events":[]}}"#);
+    for torn in [
+        // A torn event followed by the newline.
+        format!("{head}{{\"a\":1}}\n"),
+        format!("{head}{{\"a\":1}}\r\n"),
+        // A cut inside a string whose last byte is `}`.
+        format!("{head}\"a}}"),
+        // A torn line with the next line joined on: the first header wins
+        // and block 6 is not reported.
+        format!("{head}{{\"a\":1{next}"),
+    ] {
+        assert_eq!(
+            scan_node_header(torn.as_bytes()),
+            Some((1_753_606_210_051, 5)),
+            "{torn:?}"
+        );
+        assert!(
+            matches!(parse_node_line(&torn, 0), Err(ParseError::Malformed(_))),
+            "strict accepted {torn:?}"
+        );
+    }
 }
 
 /// The tail between the header and the closing brace is not read: a line
@@ -708,7 +745,8 @@ proptest! {
     }
 
     /// Whatever the bytes, a `Some` means the line's last non-whitespace
-    /// byte is `}`; and cutting an hl-node line anywhere else gives `None`.
+    /// byte is `}` (so a cut that does not end on `}` gives `None`); and a
+    /// whole hl-node line, with or without trailing whitespace, gives `Some`.
     #[test]
     fn scan_some_implies_the_line_ends_with_a_closing_brace(
         s in hl_node_line(),
