@@ -107,6 +107,13 @@ pub fn render_report(meta: &RunMeta, arms: &[ArmReport]) -> String {
             core(meta.hot_core)
         );
     }
+    let parser = stage_table()[1];
+    let _ = writeln!(s, "parser: {} ({})", parser.name, active_parser_mode());
+    // TODO(PR #7): say `CompleteLine` here once `Pipeline::on_line` takes it.
+    let _ = writeln!(
+        s,
+        "complete lines: by construction and debug_assert; CompleteLine type not used"
+    );
     let _ = writeln!(s, "input: {}", meta.input);
     let _ = writeln!(
         s,

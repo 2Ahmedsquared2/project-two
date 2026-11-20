@@ -172,7 +172,9 @@ fn the_report_says_what_was_checked_and_what_is_still_unmeasured() {
         "{text}"
     );
     assert!(
-        text.contains("complete lines: by construction and debug_assert; CompleteLine type not used"),
+        text.contains(
+            "complete lines: by construction and debug_assert; CompleteLine type not used"
+        ),
         "{text}"
     );
     assert!(
