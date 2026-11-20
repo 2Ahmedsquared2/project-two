@@ -72,6 +72,8 @@ and the validators also sets it).
 1. `applied block` lines advance; height within a few blocks of the public API.
 2. `node_order_statuses`, `node_raw_book_diffs`, `node_fills` hourly files grow.
 3. `hl-latency` probe runs for 1 h (see `docs/LATENCY_PROBE.md`).
-4. One hour of node output converted into a dataset and checked by `book-check`
-   (needs the node-output converter, next PR).
+4. One hour of node output converted into a dataset with `hl-node-convert` and
+   checked by `book-check`: take an `l4Snapshots` at the start (`--seed`) and
+   one at the end (`--check`); see `docs/dataset-format.md`, "Converting
+   hl-node output". This also answers the open schema questions listed there.
 5. `ethtool -S` allowance counters captured before and after.

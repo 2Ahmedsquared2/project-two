@@ -14,6 +14,7 @@ against; this repository starts there.
 | `hl-latency`   | Joins arrivals of the same block from our node's output and from the public WebSocket (block time key, one host clock) and reports the node's lead: p50/p90/p99/p99.9. Plan: [docs/LATENCY_PROBE.md](docs/LATENCY_PROBE.md). |
 | `hl-order`     | Testnet-only signer and order client: limit order (Alo/Gtc/Ioc), cancel by oid, `scheduleCancel`. Byte-identical to the Python SDK by golden vectors; no transport, nothing sent. Mainnet is not constructible. [docs/ORDER_CLIENT.md](docs/ORDER_CLIENT.md). |
 | `book-check`   | Replays a dataset through one candidate book per asset and reports the first divergence: block, coin, side, price level and the field that differs (size, order count, queue position). Exits non-zero on divergence. `--replay` replays raw signed actions per [docs/ACTION_ORDERING.md](docs/ACTION_ORDERING.md) (the spec of record). |
+| `hl-node-convert` | Converts `hl-node` output (raw book diffs, order statuses, `l4Snapshots` seed and check books) into a v2 dataset of per-order ops that `book-check` verifies. Schemas, sources and open questions: [docs/dataset-format.md](docs/dataset-format.md#converting-hl-node-output-hl-node-convert). |
 
 `golden/` holds hand-built datasets (L4 and L2) with known expected books and
 deliberately corrupted copies that the checker must catch

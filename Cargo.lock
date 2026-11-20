@@ -486,6 +486,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hl-node-convert"
+version = "0.1.0"
+dependencies = [
+ "book-check",
+ "hl-book-ref",
+ "hl-dataset",
+ "hl-latency",
+ "proptest",
+ "same-file",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "hl-order"
 version = "0.1.0"
 dependencies = [
