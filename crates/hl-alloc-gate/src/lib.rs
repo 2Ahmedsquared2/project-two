@@ -13,6 +13,9 @@
 //! [`measure`] or [`count_ticks`] are seen. A tick that hands work to another
 //! thread must be gated on that thread.
 //!
+//! A panic inside a measured region is passed on to the caller and leaves the
+//! counter usable; see [`measure`].
+//!
 //! ```
 //! let mut buf: Vec<u8> = Vec::new();
 //! hl_alloc_gate::assert_no_alloc_after_warmup("copy into a reused buffer", 8, 1000, |_| {
@@ -20,6 +23,9 @@
 //!     buf.extend_from_slice(b"same size every tick");
 //! });
 //! ```
+
+use std::cell::Cell;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 /// Heap activity of one measured region, on the calling thread.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -48,18 +54,69 @@ pub struct TickReport {
 }
 
 /// Deepest supported nesting of [`measure`] calls on one thread.
+///
+/// Kept well under the 64 levels the `allocation-counter` crate has room for:
+/// it aborts the process when its own limit is hit, so the limit is enforced
+/// here, before the counter is touched.
 pub const MAX_NESTING: u32 = 32;
 
+thread_local! {
+    /// How many [`measure`] calls are open on this thread.
+    static DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// One open [`measure`] call. Dropping it closes the level, on return and on
+/// unwind alike.
+struct Level;
+
+impl Level {
+    fn enter() -> Self {
+        DEPTH.with(|d| {
+            let open = d.get();
+            assert!(
+                open < MAX_NESTING,
+                "hl_alloc_gate::measure nested more than {MAX_NESTING} deep"
+            );
+            d.set(open + 1);
+        });
+        Self
+    }
+}
+
+impl Drop for Level {
+    fn drop(&mut self) {
+        DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 /// Runs `f` and reports what it allocated on this thread.
+///
+/// Calls may nest up to [`MAX_NESTING`] deep; an outer call sees what the
+/// inner ones allocated. If `f` panics, the panic is passed on with its
+/// original payload after the counter is closed, so a caller that catches it
+/// can keep measuring: what the region allocated before panicking (and the
+/// unwind's own exception object) still counts towards any enclosing call.
+///
+/// # Panics
+///
+/// When `f` panics, or when the call would nest more than [`MAX_NESTING`]
+/// deep. Neither leaves the counter in a bad state.
 pub fn measure<R>(f: impl FnOnce() -> R) -> (R, Allocs) {
+    let level = Level::enter();
+    // `allocation_counter::measure` does not restore its nesting depth when
+    // its closure unwinds, and aborts once that depth reaches 64. So the
+    // closure handed to it never unwinds: a panic in `f` is caught inside and
+    // raised again once the counter has closed the level.
     let mut out = None;
-    let info = allocation_counter::measure(|| out = Some(f()));
+    let info = allocation_counter::measure(|| out = Some(catch_unwind(AssertUnwindSafe(f))));
+    drop(level);
     let allocs = Allocs {
         count: info.count_total,
         bytes: info.bytes_total,
     };
     match out {
-        Some(r) => (r, allocs),
+        Some(Ok(r)) => (r, allocs),
+        Some(Err(payload)) => resume_unwind(payload),
         // `allocation_counter::measure` calls its closure exactly once.
         None => unreachable!("measured closure did not run"),
     }
