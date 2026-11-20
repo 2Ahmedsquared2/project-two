@@ -47,6 +47,9 @@ pub struct TickReport {
     pub worst: Option<(u64, Allocs)>,
 }
 
+/// Deepest supported nesting of [`measure`] calls on one thread.
+pub const MAX_NESTING: u32 = 32;
+
 /// Runs `f` and reports what it allocated on this thread.
 pub fn measure<R>(f: impl FnOnce() -> R) -> (R, Allocs) {
     let mut out = None;
