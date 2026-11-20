@@ -2,16 +2,63 @@
 //! tests of their own (`cargo test --lib` in this directory; the fuzz
 //! binaries need `cargo fuzz`).
 
+use std::fmt;
+
+use serde::de::{Deserialize, Deserializer, IgnoredAny, MapAccess, Visitor};
+
 /// Whether a scan/strict disagreement on `line` is the one the scan's
-/// contract allows: the line repeats `block_time` or `block_number`, where
-/// [`hl_latency::scan_node_header`] reports the first value and
-/// [`hl_latency::parse_node_line`] the last.
+/// contract allows: the line's top-level object has a second `block_time`
+/// or `block_number` key, where [`hl_latency::scan_node_header`] reports the
+/// first value and [`hl_latency::parse_node_line`] the last.
 ///
-/// Call it only for a line the strict parse accepted.
+/// Keys are compared after JSON unescaping, so `"block_tim\u0065"` counts.
+/// Nothing else does: not a backslash elsewhere in the line, and not a key
+/// name that appears in a value, in a nested object or as part of a longer
+/// key.
+///
+/// Call it only for a line the strict parse accepted; a line that is not a
+/// JSON object gives `false`.
 #[must_use]
 pub fn repeats_header_key(line: &str) -> bool {
-    let repeated = |key: &str| line.matches(key).count() > 1;
-    repeated("block_time") || repeated("block_number") || line.contains('\\')
+    serde_json::from_str::<HeaderKeyCounts>(line)
+        .is_ok_and(|c| c.block_time > 1 || c.block_number > 1)
+}
+
+/// How many times each header key appears in the top-level object.
+struct HeaderKeyCounts {
+    block_time: u32,
+    block_number: u32,
+}
+
+impl<'de> Deserialize<'de> for HeaderKeyCounts {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Counter;
+        impl<'de> Visitor<'de> for Counter {
+            type Value = HeaderKeyCounts;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a JSON object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut counts = HeaderKeyCounts {
+                    block_time: 0,
+                    block_number: 0,
+                };
+                // An owned key: serde_json hands it over already unescaped.
+                while let Some(key) = map.next_key::<String>()? {
+                    map.next_value::<IgnoredAny>()?;
+                    match key.as_str() {
+                        "block_time" => counts.block_time += 1,
+                        "block_number" => counts.block_number += 1,
+                        _ => {}
+                    }
+                }
+                Ok(counts)
+            }
+        }
+        d.deserialize_map(Counter)
+    }
 }
 
 #[cfg(test)]
@@ -27,6 +74,8 @@ mod tests {
     #[test]
     fn a_plain_line_repeats_nothing() {
         assert!(!repeats_header_key(&line(r#","events":[]"#)));
+        assert!(!repeats_header_key("[]"));
+        assert!(!repeats_header_key("not json"));
     }
 
     #[test]
@@ -48,7 +97,9 @@ mod tests {
     #[test]
     fn a_backslash_alone_is_not_a_repeat() {
         assert!(!repeats_header_key(&line(r#","events":["a\\b"]"#)));
-        assert!(!repeats_header_key(&line(r#","events":[{"k\n":"\u0041"}]"#)));
+        assert!(!repeats_header_key(&line(
+            r#","events":[{"k\n":"\u0041"}]"#
+        )));
         assert!(!repeats_header_key(&line(r#","\u0065vents":[]"#)));
     }
 
