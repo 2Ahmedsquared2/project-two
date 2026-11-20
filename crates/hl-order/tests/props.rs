@@ -8,11 +8,7 @@ use proptest::prelude::*;
 
 /// Units are 1e-8; keep values below 1e10 so rounding never overflows.
 fn units() -> impl Strategy<Value = u64> {
-    prop_oneof![
-        0u64..1_000,
-        0u64..100_000_000,
-        0u64..1_000_000_000_000_000,
-    ]
+    prop_oneof![0u64..1_000, 0u64..100_000_000, 0u64..1_000_000_000_000_000,]
 }
 
 fn sig_figs(units: u64) -> u32 {
@@ -22,7 +18,7 @@ fn sig_figs(units: u64) -> u32 {
     let digits = units.ilog10() + 1;
     let mut tz = 0;
     let mut u = units;
-    while u % 10 == 0 {
+    while u.is_multiple_of(10) {
         u /= 10;
         tz += 1;
     }
@@ -97,8 +93,12 @@ proptest! {
 fn integer_prices_with_many_sig_figs_are_valid() {
     let d = Decimal8::parse("123456").expect("parse");
     assert!(d.is_valid_px_perp(0));
-    assert!(!Decimal8::parse("1234.56").expect("parse").is_valid_px_perp(0));
-    assert!(Decimal8::parse("1234.5").expect("parse").is_valid_px_perp(0));
+    assert!(!Decimal8::parse("1234.56")
+        .expect("parse")
+        .is_valid_px_perp(0));
+    assert!(Decimal8::parse("1234.5")
+        .expect("parse")
+        .is_valid_px_perp(0));
     // 6 - szDecimals = 1 decimal for szDecimals 5 (BTC on mainnet).
     assert!(!Decimal8::parse("0.12").expect("parse").is_valid_px_perp(5));
 }
@@ -113,7 +113,17 @@ fn sz_decimals_out_of_range_is_an_error() {
 
 #[test]
 fn parse_rejects_bad_input() {
-    for bad in ["", ".", "-1", "1e5", "0.000000001", "1.2.3", "abc", " 1", "184467440738"] {
+    for bad in [
+        "",
+        ".",
+        "-1",
+        "1e5",
+        "0.000000001",
+        "1.2.3",
+        "abc",
+        " 1",
+        "184467440738",
+    ] {
         assert!(Decimal8::parse(bad).is_err(), "accepted {bad:?}");
     }
     assert_eq!(Decimal8::parse("1.").ok(), None);

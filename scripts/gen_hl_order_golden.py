@@ -135,7 +135,7 @@ def float_to_wire_vectors(rng):
     fixed = ["0", "1", "10", "0.1", "0.00000001", "123.456", "30000", "2501.5", "0.012345",
              "99999.99999999", "1e-8", "1234567.89"]
     for s in fixed:
-        out.append({"input": str(Decimal(s)), "wire": float_to_wire(float(s))})
+        out.append({"input": format(Decimal(s), "f"), "wire": float_to_wire(float(s))})
     for _ in range(300):
         units = rng.randrange(0, 10**15)  # value = units * 1e-8, up to 1e7
         d = Decimal(units).scaleb(-8)

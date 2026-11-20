@@ -33,14 +33,21 @@ fn bench(c: &mut Criterion) {
             )
         });
     });
-    let signed = signer
+    let got = signer
         .sign_l1(Network::Testnet, &action, nonce, None, None)
         .expect("sign");
     let mut body = String::with_capacity(512);
     c.bench_function("request_body", |b| {
         b.iter(|| {
             body.clear();
-            request_body(&mut body, black_box(&action), nonce, &signed.signature, None, None);
+            request_body(
+                &mut body,
+                black_box(&action),
+                nonce,
+                &got.signature,
+                None,
+                None,
+            );
             black_box(body.len())
         });
     });

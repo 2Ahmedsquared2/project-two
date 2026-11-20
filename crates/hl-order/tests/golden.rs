@@ -11,7 +11,10 @@ use serde_json::Value;
 const TEST_KEY_HEX: &str = "0123456789012345678901234567890123456789012345678901234567890123";
 
 fn vectors() -> Value {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../golden/hl-order/vectors.json");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../golden/hl-order/vectors.json"
+    );
     serde_json::from_str(&std::fs::read_to_string(path).expect("read vectors")).expect("json")
 }
 
@@ -97,21 +100,46 @@ fn signing_vectors_match_sdk_byte_for_byte() {
             "{name}: connectionId"
         );
 
-        let signed = signer
-            .sign_l1(Network::Testnet, &action, nonce, vault.as_ref(), expires_after)
+        let got = signer
+            .sign_l1(
+                Network::Testnet,
+                &action,
+                nonce,
+                vault.as_ref(),
+                expires_after,
+            )
             .expect("sign");
-        assert_eq!(signed.connection_id, cid, "{name}: signed connectionId");
-        assert_eq!(signed.signature.r_hex(), case["r"].as_str().expect("r"), "{name}: r");
-        assert_eq!(signed.signature.s_hex(), case["s"].as_str().expect("s"), "{name}: s");
+        assert_eq!(got.connection_id, cid, "{name}: got connectionId");
         assert_eq!(
-            u64::from(signed.signature.v),
+            got.signature.r_hex(),
+            case["r"].as_str().expect("r"),
+            "{name}: r"
+        );
+        assert_eq!(
+            got.signature.s_hex(),
+            case["s"].as_str().expect("s"),
+            "{name}: s"
+        );
+        assert_eq!(
+            u64::from(got.signature.v),
             case["v"].as_u64().expect("v"),
             "{name}: v"
         );
 
         let mut body = String::new();
-        request_body(&mut body, &action, nonce, &signed.signature, vault.as_ref(), expires_after);
-        assert_eq!(body, case["body_json"].as_str().expect("body"), "{name}: body");
+        request_body(
+            &mut body,
+            &action,
+            nonce,
+            &got.signature,
+            vault.as_ref(),
+            expires_after,
+        );
+        assert_eq!(
+            body,
+            case["body_json"].as_str().expect("body"),
+            "{name}: body"
+        );
     }
 }
 
@@ -145,7 +173,11 @@ fn float_to_wire_matches_sdk() {
     for case in v["float_to_wire"].as_array().expect("f2w") {
         let input = case["input"].as_str().expect("input");
         let d = Decimal8::parse(input).expect("parse");
-        assert_eq!(d.to_wire(), case["wire"].as_str().expect("wire"), "input {input}");
+        assert_eq!(
+            d.to_wire(),
+            case["wire"].as_str().expect("wire"),
+            "input {input}"
+        );
     }
 }
 
@@ -157,6 +189,10 @@ fn round_px_perp_matches_sdk_example_rounding() {
         let szd = u8::try_from(case["sz_decimals"].as_u64().expect("szd")).expect("u8");
         let d = Decimal8::parse(input).expect("parse");
         let got = d.round_px_perp(szd).expect("round");
-        assert_eq!(got.to_wire(), case["wire"].as_str().expect("wire"), "{input} szd {szd}");
+        assert_eq!(
+            got.to_wire(),
+            case["wire"].as_str().expect("wire"),
+            "{input} szd {szd}"
+        );
     }
 }

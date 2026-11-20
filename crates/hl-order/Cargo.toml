@@ -11,7 +11,7 @@ authors.workspace = true
 [dependencies]
 # RustCrypto secp256k1: pure Rust, RFC 6979 deterministic nonces, low-s normalised,
 # recoverable signatures. Same family as sha3, no C toolchain needed.
-k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std", "precomputed-tables"] }
 # Keccak-256 (the pre-NIST padding Ethereum uses). Implements io::Write so the
 # msgpack encoder can stream straight into the hasher without a buffer.
 sha3 = "0.10"
