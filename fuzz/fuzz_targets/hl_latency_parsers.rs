@@ -27,14 +27,11 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(node, oracle::parse_node_line(s, 0), "node line {s:?}");
     // The scan's contract: when it declines, nothing is claimed. When it
     // answers and the strict parse accepts, either they agree or the line
-    // repeats a header key (first wins in the scan, last in the parse). A
-    // repeat can be spelled with an escape (`"block_tim\u0065"`), so any
-    // backslash is let through as well.
+    // repeats a header key (first wins in the scan, last in the parse).
     if let (Some((t, n)), Ok(o)) = (scanned, &node) {
         let agree = (o.block_time_ms, o.block_number) == (t, Some(n));
-        let repeated = |key: &str| s.matches(key).count() > 1;
         assert!(
-            agree || repeated("block_time") || repeated("block_number") || s.contains('\\'),
+            agree || project_two_fuzz::repeats_header_key(s),
             "scan {scanned:?} vs strict {o:?} on {s:?}"
         );
     }
