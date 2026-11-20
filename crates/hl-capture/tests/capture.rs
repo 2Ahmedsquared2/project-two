@@ -10,7 +10,10 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use hl_capture::{hourly_key, newest_hourly_file, LineSplitter, NodeTailer, StampedLine, WsFilter};
+use hl_capture::{
+    hourly_key, newest_hourly_file, LineSplitter, NodeTailer, StampedLine, WsFilter,
+    MAX_READS_PER_POLL,
+};
 use hl_latency::{Observation, Source};
 use proptest::prelude::*;
 
@@ -254,6 +257,102 @@ fn waits_for_a_file_to_appear() {
     let f = touch(t.path(), "20261119", "8");
     append(&f, &node_line("2026-11-19T08:00:00.070", 2));
     assert_eq!(tail.poll(&mut clock).unwrap().len(), 1);
+}
+
+/// Enough lines that one file holds more than `extra` reads beyond a poll's
+/// read budget.
+fn many_lines(start: u64, extra: usize) -> (String, u64) {
+    let mut s = String::new();
+    let mut h = start;
+    while s.len() < (MAX_READS_PER_POLL + extra) * 64 * 1024 {
+        s.push_str(&node_line("2026-11-19T08:00:00.070", h));
+        h += 1;
+    }
+    (s, h - start)
+}
+
+#[test]
+fn one_poll_reads_at_most_the_budget_then_reports_backlog() {
+    let t = tempfile::tempdir().unwrap();
+    let mut tail = NodeTailer::new(t.path());
+    let (mut clock, _) = ticking();
+    tail.poll(&mut clock).unwrap();
+    let f = touch(t.path(), "20261119", "8");
+    let (body, n) = many_lines(0, 3);
+    append(&f, &body);
+
+    let mut heights = Vec::new();
+    let before = tail.stats().reads;
+    heights.extend(
+        tail.poll(&mut clock)
+            .unwrap()
+            .iter()
+            .map(|o| o.block_number.unwrap()),
+    );
+    let reads = tail.stats().reads - before;
+    assert!(
+        reads <= MAX_READS_PER_POLL as u64,
+        "{reads} reads in one poll"
+    );
+    assert!(tail.backlogged(), "budget hit: more data is waiting");
+    assert!(
+        (heights.len() as u64) < n,
+        "one poll must not take the whole file"
+    );
+
+    let mut polls = 1;
+    while tail.backlogged() {
+        heights.extend(
+            tail.poll(&mut clock)
+                .unwrap()
+                .iter()
+                .map(|o| o.block_number.unwrap()),
+        );
+        polls += 1;
+        assert!(polls < 100, "backlog never cleared");
+    }
+    assert_eq!(
+        heights,
+        (0..n).collect::<Vec<_>>(),
+        "nothing lost or reordered"
+    );
+    assert!(tail.poll(&mut clock).unwrap().is_empty());
+    assert!(!tail.backlogged());
+}
+
+#[test]
+fn backlog_on_the_old_file_holds_rotation_until_it_is_drained() {
+    let t = tempfile::tempdir().unwrap();
+    let old = touch(t.path(), "20261119", "8");
+    let mut tail = NodeTailer::new(t.path());
+    let (mut clock, _) = ticking();
+    tail.poll(&mut clock).unwrap();
+    let (body, n) = many_lines(0, 2);
+    append(&old, &body);
+    let new = touch(t.path(), "20261119", "9");
+    append(&new, &node_line("2026-11-19T09:00:00.060", n));
+
+    let mut heights: Vec<u64> = tail
+        .poll(&mut clock)
+        .unwrap()
+        .iter()
+        .map(|o| o.block_number.unwrap())
+        .collect();
+    assert_eq!(tail.current_file(), Some(old.as_path()), "old file first");
+    assert_eq!(tail.stats().rotations, 0);
+    let mut polls = 1;
+    while tail.current_file() != Some(new.as_path()) || tail.backlogged() {
+        heights.extend(
+            tail.poll(&mut clock)
+                .unwrap()
+                .iter()
+                .map(|o| o.block_number.unwrap()),
+        );
+        polls += 1;
+        assert!(polls < 100, "never rotated");
+    }
+    assert_eq!(heights, (0..=n).collect::<Vec<_>>());
+    assert_eq!(tail.stats().rotations, 1);
 }
 
 // ---- WS filter --------------------------------------------------------------

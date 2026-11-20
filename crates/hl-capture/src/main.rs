@@ -90,6 +90,10 @@ fn run(args: &Args) -> std::io::Result<()> {
         if !obs.is_empty() {
             out.flush()?;
         }
+        if tail.backlogged() {
+            // More data waits: check the deadline, then read on at once.
+            continue;
+        }
         // Never sleep past the deadline.
         let nap = deadline.map_or(args.poll, |d| {
             args.poll.min(d.saturating_duration_since(Instant::now()))

@@ -91,6 +91,12 @@ struct Current {
 /// Read buffer size: one `read` per poll in the common case.
 const BUF: usize = 64 * 1024;
 
+/// Most `read` calls one [`NodeTailer::poll`] makes (16 x 64 KiB = 1 MiB),
+/// so a busy file cannot hold a caller past its deadline: the caller checks
+/// the time between polls and polls again at once while
+/// [`NodeTailer::backlogged`] is true.
+pub const MAX_READS_PER_POLL: usize = 16;
+
 /// Follows the newest hourly file under a root directory.
 #[derive(Debug)]
 pub struct NodeTailer {
@@ -101,6 +107,7 @@ pub struct NodeTailer {
     buf: Vec<u8>,
     lines: Vec<StampedLine>,
     stats: TailStats,
+    backlogged: bool,
 }
 
 impl NodeTailer {
@@ -124,17 +131,26 @@ impl NodeTailer {
             buf: vec![0; BUF],
             lines: Vec::new(),
             stats: TailStats::default(),
+            backlogged: false,
         }
     }
 
-    /// Reads everything available now and returns the observations it
-    /// completed. `clock` is called once right after each `read` returns
-    /// data, before that data is parsed.
+    /// Reads what is available now, at most [`MAX_READS_PER_POLL`] reads,
+    /// and returns the observations it completed. `clock` is called once
+    /// right after each `read` returns data, before that data is parsed.
+    /// When the budget runs out, [`Self::backlogged`] is true and the rest
+    /// (including any switch to a newer file) waits for the next poll.
     pub fn poll(&mut self, clock: &mut dyn FnMut() -> u64) -> std::io::Result<Vec<Observation>> {
         let first = !self.polled;
         self.polled = true;
         let mut out = Vec::new();
-        self.drain(clock, &mut out)?;
+        let mut budget = MAX_READS_PER_POLL;
+        self.backlogged = false;
+        self.drain(clock, &mut out, &mut budget)?;
+        if self.backlogged {
+            // Finish the current file before looking for a newer one.
+            return Ok(out);
+        }
         if let Some(newest) = newest_hourly_file(&self.root)? {
             let key = hourly_key(&newest);
             let newer = match (&self.current, key) {
@@ -157,7 +173,7 @@ impl NodeTailer {
                     key,
                     file,
                 });
-                self.drain(clock, &mut out)?;
+                self.drain(clock, &mut out, &mut budget)?;
             }
         }
         Ok(out)
@@ -167,11 +183,17 @@ impl NodeTailer {
         &mut self,
         clock: &mut dyn FnMut() -> u64,
         out: &mut Vec<Observation>,
+        budget: &mut usize,
     ) -> std::io::Result<()> {
         let Some(cur) = self.current.as_mut() else {
             return Ok(());
         };
         loop {
+            if *budget == 0 {
+                self.backlogged = true;
+                break;
+            }
+            *budget -= 1;
             let n = cur.file.read(&mut self.buf)?;
             if n == 0 {
                 break;
@@ -198,6 +220,13 @@ impl NodeTailer {
             }
         }
         Ok(())
+    }
+
+    /// True when the last [`Self::poll`] stopped at its read budget with
+    /// data possibly still waiting: poll again without sleeping.
+    #[must_use]
+    pub fn backlogged(&self) -> bool {
+        self.backlogged
     }
 
     /// Counters so far.
