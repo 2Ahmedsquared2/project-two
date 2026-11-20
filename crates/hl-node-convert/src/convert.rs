@@ -156,6 +156,10 @@ pub enum ConvertError {
         /// Why.
         reason: String,
     },
+    /// Several whole check snapshots claim the same height. The dataset permits
+    /// only one book per asset and block, so none may be silently discarded.
+    #[error("duplicate check snapshot at height {0}")]
+    DuplicateCheckHeight(u64),
     /// A soft finding with `strict` set.
     #[error("strict: {0}")]
     Strict(String),
@@ -181,6 +185,16 @@ pub fn convert<D: BufRead, S: BufRead, W: Write>(
     opts: &Options,
     out: W,
 ) -> Result<Stats, ConvertError> {
+    if let Some(seed) = seed {
+        seed.validate()?;
+    }
+    let mut checks_by_height = BTreeMap::new();
+    for check in checks {
+        check.validate()?;
+        if checks_by_height.insert(check.height, check).is_some() {
+            return Err(ConvertError::DuplicateCheckHeight(check.height));
+        }
+    }
     let selected = select_assets(assets, opts.coins.as_ref())?;
     let mut diffs = BlockBatches::<D, BookDiff>::new(diffs);
     let first_diff = next_diff(&mut diffs)?;
@@ -209,10 +223,11 @@ pub fn convert<D: BufRead, S: BufRead, W: Write>(
             .collect(),
         selected,
         known: assets.iter().map(|a| a.name.clone()).collect(),
-        checks: checks.iter().map(|c| (c.height, c)).collect(),
+        checks: checks_by_height,
         statuses: statuses.map(BlockBatches::new),
         status_next: None,
         tracked: HashMap::new(),
+        seen: HashSet::new(),
         seeded: seed.is_some(),
         opts,
         stats: Stats {
@@ -275,6 +290,9 @@ struct Converter<'a, S, W: Write> {
     status_next: Option<Batch<OrderStatus>>,
     /// Resting orders the converter knows: oid to remaining lots.
     tracked: HashMap<u64, u64>,
+    /// Identities represented in this dataset, retained after removal. Only
+    /// never-represented orders may be treated as unseeded prehistory.
+    seen: HashSet<u64>,
     seeded: bool,
     opts: &'a Options,
     stats: Stats,
@@ -294,28 +312,53 @@ impl<S: BufRead, W: Write> Converter<'_, S, W> {
         Ok(())
     }
 
-    /// The status batch of block `height`, dropping earlier ones.
-    fn statuses_for(&mut self, height: u64) -> Result<Option<Batch<OrderStatus>>, ConvertError> {
+    /// Takes the pending status batch or reads the stream, including deferred
+    /// parse/order errors after its last valid batch.
+    fn next_status(&mut self) -> Result<Option<Batch<OrderStatus>>, ConvertError> {
+        if self.status_next.is_some() {
+            return Ok(self.status_next.take());
+        }
         let Some(stream) = self.statuses.as_mut() else {
             return Ok(None);
         };
-        loop {
-            if self.status_next.is_none() {
-                self.status_next =
-                    stream
-                        .next()
-                        .transpose()
-                        .map_err(|error| ConvertError::Node {
-                            stream: "statuses",
-                            error,
-                        })?;
+        stream
+            .next()
+            .transpose()
+            .map_err(|error| ConvertError::Node {
+                stream: "statuses",
+                error,
+            })
+    }
+
+    /// The status batch of block `height`, dropping earlier ones.
+    fn statuses_for(&mut self, height: u64) -> Result<Option<Batch<OrderStatus>>, ConvertError> {
+        while let Some(batch) = self.next_status()? {
+            if batch.block_number < height {
+                continue;
             }
-            match &self.status_next {
-                Some(b) if b.block_number < height => self.status_next = None,
-                Some(b) if b.block_number == height => return Ok(self.status_next.take()),
-                _ => return Ok(None),
+            if batch.block_number == height {
+                return Ok(Some(batch));
             }
+            self.status_next = Some(batch);
+            break;
         }
+        Ok(None)
+    }
+
+    /// Writes only heights absent from both streams, under the configured
+    /// gap policy. The caller holds the next batch that actually exists.
+    fn fill_gaps_until(&mut self, height: u64) -> Result<(), ConvertError> {
+        while self.next_height < height {
+            if !self.opts.allow_gaps {
+                return Err(ConvertError::Gap {
+                    expected: self.next_height,
+                    found: height,
+                });
+            }
+            self.stats.gap_blocks += 1;
+            self.write_block(None, Vec::new())?;
+        }
+        Ok(())
     }
 
     fn write_block(&mut self, time_ms: Option<u64>, ops: Vec<AssetOp>) -> Result<(), ConvertError> {
@@ -364,6 +407,7 @@ impl<S: BufRead, W: Write> Converter<'_, S, W> {
                         }),
                     });
                     self.tracked.insert(o.oid, sz);
+                    self.seen.insert(o.oid);
                     self.stats.seed_orders += 1;
                 }
             }
@@ -410,7 +454,7 @@ impl<S: BufRead, W: Write> Converter<'_, S, W> {
     }
 
     fn untracked(&mut self, oid: u64) -> bool {
-        if self.seeded || self.tracked.contains_key(&oid) {
+        if self.seeded || self.seen.contains(&oid) {
             return false;
         }
         self.stats.untracked_diffs += 1;
@@ -539,6 +583,7 @@ impl<S: BufRead, W: Write> Converter<'_, S, W> {
             sz: Lots(sz),
         };
         self.tracked.insert(oid, sz);
+        self.seen.insert(oid);
         Ok(Some(if let Some(before) = insert_before {
             self.stats.inserts_before += 1;
             BookOp::InsertBefore {
@@ -552,6 +597,16 @@ impl<S: BufRead, W: Write> Converter<'_, S, W> {
     }
 
     fn finish(mut self) -> Result<Stats, ConvertError> {
+        // Diffs do not bound the capture: statuses may continue after their EOF,
+        // including a pending future batch or a deferred malformed suffix.
+        while let Some(status) = self.next_status()? {
+            if status.block_number < self.next_height {
+                continue;
+            }
+            self.fill_gaps_until(status.block_number)?;
+            self.stats.status_only_blocks += 1;
+            self.write_block(Some(status.block_time_ms), Vec::new())?;
+        }
         let left: Vec<u64> = self.checks.keys().copied().collect();
         for h in left {
             self.stats.checks_out_of_range += 1;

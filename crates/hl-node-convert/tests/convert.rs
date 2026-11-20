@@ -484,6 +484,328 @@ fn nothing_to_convert_is_an_error() {
     assert!(matches!(res, Err(ConvertError::Empty)), "{res:?}");
 }
 
+// ---- safety regressions: complete streams, check identity, order history -----
+
+#[test]
+fn safety_status_tail_keeps_zero_op_blocks_times_and_checkpoints() {
+    let statuses = batch(5, &[]) + &batch(6, &[]) + &batch(7, &[]);
+    let check = L4Snapshot::from_json(r#"[7,[["BTC",[[],[]]]]]"#).unwrap_or_else(|e| panic!("{e}"));
+    let (res, out) = run(
+        &batch(5, &[]),
+        Some(&statuses),
+        None,
+        &[check],
+        &Options {
+            allow_gaps: false,
+            strict: true,
+            ..Options::default()
+        },
+    );
+    let stats = res.unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        (stats.first_height, stats.last_height, stats.blocks),
+        (5, 7, 3)
+    );
+    assert_eq!(
+        (
+            stats.status_only_blocks,
+            stats.gap_blocks,
+            stats.check_books
+        ),
+        (2, 0, 1)
+    );
+    let steps = parse(&out).1;
+    assert_eq!(
+        steps
+            .iter()
+            .map(|s| (s.block.height, s.block.ops.len()))
+            .collect::<Vec<_>>(),
+        vec![(5, 0), (6, 0), (7, 0)]
+    );
+    assert!(steps
+        .iter()
+        .all(|s| s.block.time_ms == steps[0].block.time_ms));
+    assert!(steps[2].block.time_ms.is_some());
+    assert_eq!(
+        book_check(&out)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .l4_books_compared,
+        1
+    );
+}
+
+#[test]
+fn safety_status_tail_gap_obeys_both_gap_policies() {
+    let statuses = batch(5, &[]) + &batch(8, &[]);
+    let (res, out) = run(
+        &batch(5, &[]),
+        Some(&statuses),
+        None,
+        &[],
+        &Options::default(),
+    );
+    let stats = res.unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        (
+            stats.last_height,
+            stats.gap_blocks,
+            stats.status_only_blocks
+        ),
+        (8, 2, 1)
+    );
+    let steps = parse(&out).1;
+    assert_eq!(
+        steps.iter().map(|s| s.block.height).collect::<Vec<_>>(),
+        vec![5, 6, 7, 8]
+    );
+    assert!(steps[1].block.time_ms.is_none());
+    assert!(steps[2].block.time_ms.is_none());
+    assert!(steps[3].block.time_ms.is_some());
+    book_check(&out).unwrap_or_else(|e| panic!("{e}"));
+    let (res, _) = run(
+        &batch(5, &[]),
+        Some(&statuses),
+        None,
+        &[],
+        &Options {
+            allow_gaps: false,
+            ..Options::default()
+        },
+    );
+    assert!(
+        matches!(
+            res,
+            Err(ConvertError::Gap {
+                expected: 6,
+                found: 8
+            })
+        ),
+        "{res:?}"
+    );
+}
+
+#[test]
+fn safety_seed_with_only_statuses_keeps_tail() {
+    let seed = L4Snapshot::from_json(r#"[5,[["BTC",[[],[]]]]]"#).unwrap_or_else(|e| panic!("{e}"));
+    let statuses = batch(4, &[]) + &batch(5, &[]) + &batch(6, &[]);
+    let (res, out) = run(
+        "",
+        Some(&statuses),
+        Some(&seed),
+        &[],
+        &Options {
+            allow_gaps: false,
+            ..Options::default()
+        },
+    );
+    let stats = res.unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        (
+            stats.first_height,
+            stats.last_height,
+            stats.blocks,
+            stats.status_only_blocks
+        ),
+        (5, 6, 2, 1)
+    );
+    assert_eq!(ops(&out), vec![(5, vec![]), (6, vec![])]);
+    book_check(&out).unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
+fn safety_status_suffix_parse_and_order_errors_are_not_lost() {
+    for statuses in [
+        batch(5, &[]) + "garbage\n",
+        batch(5, &[]) + &batch(6, &[]) + "garbage\n",
+        batch(5, &[]) + &batch(7, &[]) + &batch(6, &[]),
+    ] {
+        let (res, _) = run(
+            &batch(5, &[]),
+            Some(&statuses),
+            None,
+            &[],
+            &Options::default(),
+        );
+        assert!(
+            matches!(
+                res,
+                Err(ConvertError::Node {
+                    stream: "statuses",
+                    ..
+                })
+            ),
+            "{res:?}"
+        );
+    }
+}
+
+#[test]
+fn safety_seed_only_still_validates_pre_seed_status_suffix() {
+    let seed = L4Snapshot::from_json(r#"[5,[["BTC",[[],[]]]]]"#).unwrap_or_else(|e| panic!("{e}"));
+    let statuses = batch(3, &[]) + "garbage\n";
+    let (res, _) = run("", Some(&statuses), Some(&seed), &[], &Options::default());
+    assert!(
+        matches!(
+            res,
+            Err(ConvertError::Node {
+                stream: "statuses",
+                ..
+            })
+        ),
+        "{res:?}"
+    );
+}
+
+#[test]
+fn safety_unseeded_range_starts_at_first_diff_not_earlier_statuses() {
+    let statuses = batch(2, &[]) + &batch(5, &[]) + &batch(6, &[]);
+    let (res, out) = run(
+        &batch(5, &[]),
+        Some(&statuses),
+        None,
+        &[],
+        &Options {
+            allow_gaps: false,
+            ..Options::default()
+        },
+    );
+    let stats = res.unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        (
+            stats.first_height,
+            stats.last_height,
+            stats.status_only_blocks
+        ),
+        (5, 6, 1)
+    );
+    assert_eq!(ops(&out), vec![(5, vec![]), (6, vec![])]);
+}
+
+#[test]
+fn safety_duplicate_check_heights_fail_instead_of_masking_evidence() {
+    let empty = L4Snapshot::from_json(r#"[5,[["BTC",[[],[]]]]]"#).unwrap_or_else(|e| panic!("{e}"));
+    let nonempty = L4Snapshot::from_json(
+        r#"[5,[["BTC",[[["0xab",{"side":"B","limitPx":"100.0","sz":"1.0","oid":1}]],[]]]]]"#,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let (control, out) = run(
+        &batch(5, &[]),
+        None,
+        None,
+        std::slice::from_ref(&nonempty),
+        &Options::default(),
+    );
+    control.unwrap_or_else(|e| panic!("{e}"));
+    assert!(matches!(book_check(&out), Err(CheckError::Divergence(_))));
+    for checks in [
+        vec![nonempty.clone(), empty.clone()],
+        vec![empty.clone(), nonempty],
+        vec![empty.clone(), empty],
+    ] {
+        let (res, out) = run(&batch(5, &[]), None, None, &checks, &Options::default());
+        assert!(
+            res.is_err(),
+            "duplicate height must not discard a snapshot: {res:?}"
+        );
+        assert!(
+            out.is_empty(),
+            "duplicate identity must be checked before output"
+        );
+    }
+}
+
+#[test]
+fn safety_duplicate_height_disjoint_markets_are_explicitly_rejected_as_whole_snapshots() {
+    // Each --check is a whole snapshot: its absent selected markets are empty.
+    // The format cannot emit multiple books for one (height, asset).
+    let btc = L4Snapshot::from_json(r#"[5,[["BTC",[[],[]]]]]"#).unwrap_or_else(|e| panic!("{e}"));
+    let eth = L4Snapshot::from_json(r#"[5,[["ETH",[[],[]]]]]"#).unwrap_or_else(|e| panic!("{e}"));
+    let (res, out) = run(&batch(5, &[]), None, None, &[btc, eth], &Options::default());
+    assert!(res.is_err(), "{res:?}");
+    assert_eq!(out, Vec::<u8>::new());
+}
+
+#[test]
+fn safety_whole_check_still_emits_absent_selected_markets_as_empty() {
+    let assets = vec![
+        btc_assets().remove(0),
+        AssetMeta::new(1, "ETH", 4, false).unwrap_or_else(|e| panic!("{e}")),
+    ];
+    let checks =
+        [L4Snapshot::from_json(r#"[5,[["BTC",[[],[]]]]]"#).unwrap_or_else(|e| panic!("{e}"))];
+    let mut out = Vec::new();
+    let stats = convert(
+        &assets,
+        batch(5, &[]).as_bytes(),
+        None::<&[u8]>,
+        None,
+        &checks,
+        &Options::default(),
+        &mut out,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(stats.check_books, 2);
+    assert_eq!(
+        book_check(&out)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .l4_books_compared,
+        2
+    );
+}
+
+fn removed_order_must_stay_invalid(last: String, zero_size_removal: bool) {
+    let removal = if zero_size_removal {
+        ev_update(1, "100.0", "1.0", "0.0")
+    } else {
+        ev_remove(1, "100.0")
+    };
+    let diffs =
+        batch(5, &[ev_new(1, Some("Bid"), "100.0", "1.0", None), removal]) + &batch(6, &[last]);
+    let (res, out) = run(
+        &diffs,
+        None,
+        None,
+        &[],
+        &Options {
+            strict: true,
+            ..Options::default()
+        },
+    );
+    match res {
+        Err(_) => (),
+        Ok(stats) => {
+            assert_eq!(
+                stats.untracked_diffs, 0,
+                "represented orders are not prehistory"
+            );
+            assert!(
+                matches!(book_check(&out), Err(CheckError::Apply { height: 6, .. })),
+                "removed-order references must remain invalid"
+            );
+        }
+    }
+}
+
+#[test]
+fn safety_repeated_remove_is_not_soft_prehistory() {
+    removed_order_must_stay_invalid(ev_remove(1, "100.0"), false);
+}
+
+#[test]
+fn safety_update_after_remove_is_not_soft_prehistory() {
+    removed_order_must_stay_invalid(ev_update(1, "100.0", "1.0", "0.5"), false);
+}
+
+#[test]
+fn safety_anchor_after_remove_is_not_soft_prehistory() {
+    removed_order_must_stay_invalid(ev_new(2, Some("Bid"), "100.0", "1.0", Some(1)), false);
+}
+
+#[test]
+fn safety_zero_size_cancel_keeps_identity_history() {
+    removed_order_must_stay_invalid(ev_remove(1, "100.0"), true);
+}
+
 // ---- property: a model book rendered as node output converts to a dataset ----
 // ---- that book-check replays cleanly against the model's own snapshots.   ----
 

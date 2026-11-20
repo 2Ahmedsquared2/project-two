@@ -10,7 +10,7 @@
 //! "L4 snapshots"). The book is the state after block `height` (INFERENCE from
 //! `order_book_server`, which applies only batches with a higher block number).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hl_dataset::{AssetMeta, L4Book, L4Level, L4Order};
 use serde::Deserialize;
@@ -20,6 +20,9 @@ use crate::node::NodeSide;
 /// One resting order of a snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotOrder {
+    /// Supplied market name, if present. Omission is accepted for compatibility;
+    /// an explicit name must exactly match the containing book's coin.
+    pub coin: Option<String>,
     /// Owner address.
     pub user: String,
     /// Side the order claims.
@@ -60,6 +63,19 @@ pub enum SnapshotError {
     /// Not the `[height, [[coin, [bids, asks]]]]` shape with users.
     #[error("bad l4Snapshots json (need includeUsers and includeHeightInOutput): {0}")]
     Json(String),
+    /// More than one outer book record names the same market.
+    #[error("duplicate l4Snapshots coin {0:?}")]
+    DuplicateCoin(String),
+    /// An order explicitly names a market other than its containing book.
+    #[error("{coin} oid {oid}: order coin {order_coin:?} differs from containing book")]
+    CoinMismatch {
+        /// Containing book's coin.
+        coin: String,
+        /// Order id.
+        oid: u64,
+        /// The order's supplied coin.
+        order_coin: String,
+    },
     /// A price or size that does not convert exactly.
     #[error("{coin} oid {oid}: {what} {value:?} does not convert: {reason}")]
     Decimal {
@@ -91,6 +107,8 @@ pub enum SnapshotError {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawOrder {
+    #[serde(default)]
+    coin: Option<String>,
     side: NodeSide,
     limit_px: String,
     sz: String,
@@ -109,6 +127,7 @@ impl L4Snapshot {
         let conv = |list: Vec<(String, RawOrder)>| -> Vec<SnapshotOrder> {
             list.into_iter()
                 .map(|(user, o)| SnapshotOrder {
+                    coin: o.coin,
                     user,
                     side: o.side,
                     limit_px: o.limit_px,
@@ -126,7 +145,27 @@ impl L4Snapshot {
                 asks: conv(asks),
             })
             .collect();
-        Ok(Self { height, books })
+        let snapshot = Self { height, books };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Checks identities, including trigger orders and unselected markets.
+    ///
+    /// Public fields allow manual construction, so consumers must call this
+    /// before selecting books or filtering orders. Market names follow the
+    /// existing exact-name lookup; absence of an inner coin is compatible.
+    pub fn validate(&self) -> Result<(), SnapshotError> {
+        let mut seen = BTreeSet::new();
+        for book in &self.books {
+            if !seen.insert(&book.coin) {
+                return Err(SnapshotError::DuplicateCoin(book.coin.clone()));
+            }
+            for order in book.bids.iter().chain(&book.asks) {
+                validate_order_coin(&book.coin, order)?;
+            }
+        }
+        Ok(())
     }
 
     /// The book of `coin`, if the snapshot lists it.
@@ -136,6 +175,19 @@ impl L4Snapshot {
     }
 }
 
+fn validate_order_coin(coin: &str, order: &SnapshotOrder) -> Result<(), SnapshotError> {
+    if let Some(order_coin) = &order.coin {
+        if order_coin != coin {
+            return Err(SnapshotError::CoinMismatch {
+                coin: coin.to_owned(),
+                oid: order.oid,
+                order_coin: order_coin.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Price ticks and size lots of one snapshot order, checked against its list.
 pub(crate) fn order_units(
     coin: &str,
@@ -143,6 +195,7 @@ pub(crate) fn order_units(
     listed: NodeSide,
     asset: &AssetMeta,
 ) -> Result<(u64, u64), SnapshotError> {
+    validate_order_coin(coin, o)?;
     if o.side != listed {
         return Err(SnapshotError::SideMismatch {
             coin: coin.to_owned(),
@@ -187,7 +240,11 @@ pub fn l4_book(
     };
     let side = |list: &[SnapshotOrder], listed: NodeSide| -> Result<Vec<L4Level>, SnapshotError> {
         let mut levels: BTreeMap<u64, L4Level> = BTreeMap::new();
-        for o in list.iter().filter(|o| !o.is_trigger) {
+        for o in list {
+            validate_order_coin(&book.coin, o)?;
+            if o.is_trigger {
+                continue;
+            }
             let (px, sz) = order_units(&book.coin, o, listed, asset)?;
             levels
                 .entry(px)

@@ -197,6 +197,13 @@ error. `meta.json` is `{"meta": <meta>, "spotMeta": <spotMeta>}` (the local
 info server serves both). The stats print as JSON. Exit codes: 0 converted,
 1 a `--strict` finding, 2 usage or conversion error.
 
+Output must not alias any input (metadata, diffs, statuses, seed or check),
+including through a symlink or hardlink. Conversion writes a sibling temporary
+file, flushes and syncs it, then atomically replaces the destination on success.
+An unrelated existing output may still be replaced; conversion errors preserve
+it and remove the temporary file. This is atomic publication, not a guarantee
+of directory-entry durability across power loss.
+
 ### Node schemas (primary sources, read only, nothing copied)
 
 Sources: `hyperliquid-dex/node` README at commit `405cc08` (flags section);
@@ -240,13 +247,17 @@ Rules:
 2. **Several lines of one block** (streaming mode writes events as processed)
    are merged in file order. A block number that goes back is an error.
 3. **Missing heights.** A height in the status stream but not the diff stream
-   is an empty block with the status time. A height in neither is an empty
-   block counted as `gap_blocks`; `--no-gaps` makes it an error.
+   is an empty block with the status time, including after the final diff.
+   Both streams are consumed to EOF; malformed status suffixes are errors.
+   A height in neither is an empty block counted as `gap_blocks`;
+   `--no-gaps` makes it an error, including gaps before trailing status blocks.
 4. **Seed.** With `--seed`, every diff is emitted as written, and an op the
    reference book cannot apply is reported by `book-check` at its block.
    Without a seed the book starts empty at the first diff block, and diffs
    on orders the converter never saw inserted (resting before the data
-   started) are skipped and counted as `untracked_diffs`.
+   started) are skipped and counted as `untracked_diffs`. An order represented
+   in this window remains known after cancellation: later invalid removes,
+   updates or insert-before references are never reclassified as prehistory.
 5. **Soft findings**, counted with up to 20 examples, and errors under
    `--strict`: diffs on coins not in `meta.json` (builder perps); an `update`
    whose `origSz` differs from the size the converter tracked; a check
@@ -254,6 +265,12 @@ Rules:
    are counted as `filtered_diffs`.
 6. Prices and sizes convert exactly with the header's ticks and lots;
    a string that does not convert stops conversion.
+7. Each check file is a whole post-block snapshot: absent selected markets
+   mean empty books. Duplicate check heights are rejected, never overwritten.
+   Within a snapshot, duplicate market records are rejected. If an order
+   supplies `coin`, it must exactly match its enclosing market (also for
+   triggers); omitted inner `coin` remains supported. No market-name alias
+   resolution is inferred.
 
 ### Open schema questions (not expert-checked)
 

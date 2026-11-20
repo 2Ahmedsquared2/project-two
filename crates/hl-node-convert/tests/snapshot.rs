@@ -2,6 +2,7 @@
 //! coin into a recorded `l4_book`.
 
 use hl_dataset::{AssetMeta, L4Level, L4Order};
+use hl_node_convert::convert::{convert, ConvertError, Options};
 use hl_node_convert::node::NodeSide;
 use hl_node_convert::snapshot::{l4_book, L4Snapshot, SnapshotError};
 
@@ -114,6 +115,110 @@ fn l4_book_groups_levels_best_first_and_keeps_queue_order() {
             },
         ]
     );
+}
+
+#[test]
+fn snapshot_rejects_duplicate_outer_markets_even_empty_or_identical() {
+    let bid = order("0xaa", "B", "100.0", "0.5", 1, false);
+    for (first, second) in [
+        (String::new(), String::new()),
+        (bid.clone(), bid.clone()),
+        (String::new(), bid.clone()),
+        (bid, String::new()),
+    ] {
+        let text = format!(r#"[1003,[["BTC",[[{first}],[]]],["BTC",[[{second}],[]]]]]"#);
+        assert!(
+            L4Snapshot::from_json(&text).is_err(),
+            "duplicate BTC records accepted: {text}"
+        );
+    }
+}
+
+#[test]
+fn snapshot_preserves_distinct_markets_at_one_height() {
+    let bid = order("0xaa", "B", "100.0", "0.5", 1, false);
+    let eth = bid.replace("BTC", "ETH");
+    let text = format!(r#"[1003,[["BTC",[[{bid}],[]]],["ETH",[[{eth}],[]]]]]"#);
+    let parsed = L4Snapshot::from_json(&text).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(parsed.height, 1003);
+    assert_eq!(parsed.books.len(), 2);
+    assert!(parsed.book("BTC").is_some());
+    assert!(parsed.book("ETH").is_some());
+}
+
+#[test]
+fn snapshot_rejects_inner_market_mismatches_including_triggers() {
+    for (side, trigger) in [("B", false), ("A", false), ("B", true), ("A", true)] {
+        let wrong = order("0xaa", side, "100.0", "0.5", 1, trigger).replace("BTC", "ETH");
+        let [bids, asks] = if side == "B" {
+            [wrong, String::new()]
+        } else {
+            [String::new(), wrong]
+        };
+        let text = format!(r#"[1003,[["BTC",[[{bids}],[{asks}]]]]]"#);
+        assert!(
+            L4Snapshot::from_json(&text).is_err(),
+            "inner ETH accepted in BTC: {text}"
+        );
+    }
+}
+
+#[test]
+fn omitted_inner_market_and_existing_side_aliases_remain_compatible() {
+    let bid = order("0xaa", "Bid", "100.0", "0.5", 1, false).replace(r#""coin":"BTC","#, "");
+    let ask = order("0xbb", "Ask", "101.0", "0.1", 2, false).replace(r#""coin":"BTC","#, "");
+    let parsed = snap(&[bid], &[ask]);
+    let book = l4_book(parsed.book("BTC"), &btc(), 1003).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(book.bids[0].orders[0].oid, 1);
+    assert_eq!(book.asks[0].orders[0].oid, 2);
+}
+
+#[test]
+fn manually_built_duplicate_snapshot_is_rejected_at_conversion_boundary() {
+    let mut invalid = snap(&[], &[]);
+    invalid.books.push(invalid.books[0].clone());
+    let valid = snap(&[], &[]);
+    for (seed, checks) in [(&invalid, vec![]), (&valid, vec![invalid.clone()])] {
+        let mut out = Vec::new();
+        let result = convert(
+            &[btc()],
+            &b""[..],
+            None::<&[u8]>,
+            Some(seed),
+            &checks,
+            &Options::default(),
+            &mut out,
+        );
+        assert!(
+            matches!(result, Err(ConvertError::Snapshot(_))),
+            "{result:?}"
+        );
+        assert!(out.is_empty(), "invalid snapshot wrote partial output");
+    }
+}
+
+#[test]
+fn manually_changed_inner_market_is_rejected_before_trigger_filtering() {
+    let mut invalid = snap(&[order("0xaa", "B", "100.0", "0.5", 1, true)], &[]);
+    // Retain the parsed BTC order but relabel its public container as ETH.
+    invalid.books[0].coin = "ETH".into();
+    invalid.books.pop();
+    let eth = AssetMeta::new(1, "ETH", 4, false).unwrap_or_else(|e| panic!("{e}"));
+    let mut out = Vec::new();
+    let result = convert(
+        &[eth],
+        &b""[..],
+        None::<&[u8]>,
+        Some(&invalid),
+        &[],
+        &Options::default(),
+        &mut out,
+    );
+    assert!(
+        matches!(result, Err(ConvertError::Snapshot(_))),
+        "{result:?}"
+    );
+    assert!(out.is_empty(), "invalid snapshot wrote partial output");
 }
 
 #[test]

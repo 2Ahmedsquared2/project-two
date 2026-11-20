@@ -15,6 +15,8 @@ hl-latency = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+same-file = "1"
+tempfile = "3"
 
 [dev-dependencies]
 book-check = { workspace = true }
