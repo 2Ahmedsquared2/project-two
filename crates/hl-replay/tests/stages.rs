@@ -63,7 +63,10 @@ fn the_stub_book_and_decision_do_deterministic_work() {
     let (mut a, mut b) = (StubBook::default(), StubBook::default());
     let top = a.apply(&obs);
     assert_eq!(top, b.apply(&obs));
-    assert!(top.bid_ticks > 0 && top.bid_ticks < top.ask_ticks, "{top:?}");
+    assert!(
+        top.bid_ticks > 0 && top.bid_ticks < top.ask_ticks,
+        "{top:?}"
+    );
     assert_eq!(top.seq, 7);
     let order = StubDecision::default().decide(&top).unwrap();
     assert!(order.px_ticks > 0 && order.sz_lots > 0);
@@ -90,7 +93,11 @@ fn the_prototype_signature_recovers_to_the_key_that_signed() {
     let mut s = PrototypeSigner::new(&TEST_KEY).unwrap();
     let mut out = Vec::new();
     s.sign(&intent(1_753_606_210_051), &mut out).unwrap();
-    assert_eq!(out.last(), Some(&b'\n'), "one newline-terminated body per order");
+    assert_eq!(
+        out.last(),
+        Some(&b'\n'),
+        "one newline-terminated body per order"
+    );
     let body: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(body["nonce"], 1_753_606_210_051_u64);
     assert_eq!(body["action"]["type"], "order");
@@ -98,7 +105,12 @@ fn the_prototype_signature_recovers_to_the_key_that_signed() {
     assert_eq!(body["action"]["orders"][0]["s"], "0.001");
     assert_eq!(body["action"]["orders"][0]["b"], true);
     let hex = |k: &str| {
-        let s = body["signature"][k].as_str().unwrap().strip_prefix("0x").unwrap().to_owned();
+        let s = body["signature"][k]
+            .as_str()
+            .unwrap()
+            .strip_prefix("0x")
+            .unwrap()
+            .to_owned();
         assert_eq!(s.len(), 64);
         (0..32)
             .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
@@ -124,10 +136,22 @@ fn the_digest_covers_every_order_field() {
     assert_eq!(base, s.digest(&intent(5)));
     assert_ne!(base, s.digest(&intent(6)));
     for other in [
-        OrderIntent { asset: 1, ..intent(5) },
-        OrderIntent { is_buy: false, ..intent(5) },
-        OrderIntent { px_ticks: 671_236, ..intent(5) },
-        OrderIntent { sz_lots: 101, ..intent(5) },
+        OrderIntent {
+            asset: 1,
+            ..intent(5)
+        },
+        OrderIntent {
+            is_buy: false,
+            ..intent(5)
+        },
+        OrderIntent {
+            px_ticks: 671_236,
+            ..intent(5)
+        },
+        OrderIntent {
+            sz_lots: 101,
+            ..intent(5)
+        },
     ] {
         assert_ne!(base, s.digest(&other), "{other:?}");
     }
@@ -140,7 +164,7 @@ fn signing_appends_and_reuses_the_callers_buffer() {
     s.sign(&intent(1), &mut out).unwrap();
     let first = out.len();
     s.sign(&intent(2), &mut out).unwrap();
-    assert_eq!(out.iter().filter(|b| **b == b'\n').count(), 2);
+    assert_eq!(String::from_utf8_lossy(&out).lines().count(), 2);
     assert!(out.len() >= 2 * first - 2);
 }
 
@@ -156,15 +180,18 @@ fn the_pipeline_turns_a_line_into_one_signed_order_and_stamps_t1() {
     let mut p = active_pipeline();
     let mut out = Vec::new();
     let t0 = clock.now_ns();
-    let r = p.on_line(line(42).as_bytes(), t0, &clock, &mut out).unwrap();
+    let r = p
+        .on_line(line(42).as_bytes(), t0, &clock, &mut out)
+        .unwrap();
     assert!(r.order);
     assert!(r.t1_ns >= t0);
     assert!(clock.now_ns() >= r.t1_ns);
     let body: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert!(body["signature"]["r"].is_string());
     // The buffer is cleared per line: one order, not an ever-growing batch.
-    p.on_line(line(43).as_bytes(), t0, &clock, &mut out).unwrap();
-    assert_eq!(out.iter().filter(|b| **b == b'\n').count(), 1);
+    p.on_line(line(43).as_bytes(), t0, &clock, &mut out)
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out).lines().count(), 1);
 }
 
 #[test]
@@ -172,7 +199,9 @@ fn bad_input_is_an_error_not_a_skipped_sample() {
     let clock = Clock::new();
     let mut p = active_pipeline();
     let mut out = Vec::new();
-    assert!(p.on_line(b"{\"block_number\":1}", 0, &clock, &mut out).is_err());
+    assert!(p
+        .on_line(b"{\"block_number\":1}", 0, &clock, &mut out)
+        .is_err());
     assert!(p.on_line(&[0xff, 0xfe, b'{'], 0, &clock, &mut out).is_err());
 }
 
@@ -187,16 +216,29 @@ fn any_stage_can_be_swapped_by_type() {
         const LABEL: StageLabel = StageLabel::Stub;
     }
     impl Signer for FixedSigner {
-        fn sign(&mut self, i: &OrderIntent, out: &mut Vec<u8>) -> Result<(), hl_replay::ReplayError> {
+        fn sign(
+            &mut self,
+            i: &OrderIntent,
+            out: &mut Vec<u8>,
+        ) -> Result<(), hl_replay::ReplayError> {
             out.extend_from_slice(&i.nonce.to_be_bytes());
             out.push(b'\n');
             Ok(())
         }
     }
     let clock = Clock::new();
-    let mut p = Pipeline::new(NodeLineParser, StubBook::default(), StubDecision::default(), FixedSigner);
+    let mut p = Pipeline::new(
+        NodeLineParser,
+        StubBook::default(),
+        StubDecision::default(),
+        FixedSigner,
+    );
     let mut out = Vec::new();
-    assert!(p.on_line(line(1).as_bytes(), 0, &clock, &mut out).unwrap().order);
+    assert!(
+        p.on_line(line(1).as_bytes(), 0, &clock, &mut out)
+            .unwrap()
+            .order
+    );
     assert_eq!(out.len(), 9);
 }
 

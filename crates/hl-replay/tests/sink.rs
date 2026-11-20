@@ -24,7 +24,10 @@ fn only_loopback_addresses_are_accepted() {
         "api.hyperliquid.xyz:443",
         "",
     ] {
-        assert!(bad.parse::<LoopbackAddr>().is_err(), "{bad} must be refused");
+        assert!(
+            bad.parse::<LoopbackAddr>().is_err(),
+            "{bad} must be refused"
+        );
     }
     let public: SocketAddr = "1.1.1.1:443".parse().unwrap();
     let err = LoopbackAddr::new(public).unwrap_err().to_string();
@@ -42,7 +45,13 @@ fn the_sink_counts_bytes_and_newline_terminated_orders() {
     assert!(s.peer_addr().unwrap().ip().is_loopback());
     s.write_all(b"one\ntwo\nthree\n").unwrap();
     drop(s);
-    assert_eq!(sink.finish().unwrap(), SinkStats { bytes: 14, orders: 3 });
+    assert_eq!(
+        sink.finish().unwrap(),
+        SinkStats {
+            bytes: 14,
+            orders: 3
+        }
+    );
 }
 
 #[test]
@@ -79,7 +88,13 @@ fn the_sources_name_no_exchange_host_or_endpoint() {
             }
             files += 1;
             let text = std::fs::read_to_string(&p).unwrap().to_lowercase();
-            for banned in ["hyperliquid.xyz", "/exchange", "hyperliquid-testnet", "wss://", "https://api."] {
+            for banned in [
+                "hyperliquid.xyz",
+                "/exchange",
+                "hyperliquid-testnet",
+                "wss://",
+                "https://api.",
+            ] {
                 assert!(!text.contains(banned), "{} names {banned}", p.display());
             }
         }

@@ -35,19 +35,28 @@ fn check(arm: Arm) {
     match run_round(arm, &c).unwrap() {
         RoundOutcome::Ran(r) => {
             assert_eq!(r.fed, 300, "{arm:?}");
-            assert_eq!(r.sink.orders, 300, "{arm:?}: every line becomes one order at the sink");
+            assert_eq!(
+                r.sink.orders, 300,
+                "{arm:?}: every line becomes one order at the sink"
+            );
             assert!(r.sink.bytes > 300 * 200, "{arm:?}: {}", r.sink.bytes);
             assert_eq!(r.hists.e2e.count(), 250, "{arm:?}: warmup excluded");
             assert_eq!(r.hists.parse.count(), 250, "{arm:?}");
             assert_eq!(r.hists.detect.count(), 250, "{arm:?}");
             let (p, e) = (r.hists.parse.summary(), r.hists.e2e.summary());
-            assert!(p.p50 > 0 && p.p50 <= e.p50, "{arm:?}: t1-t0 {p:?} within t2-t0 {e:?}");
-            assert!(e.p50 <= e.p99 && e.p99 <= e.p999 && e.p999 <= e.max, "{arm:?}: {e:?}");
+            assert!(
+                p.p50 > 0 && p.p50 <= e.p50,
+                "{arm:?}: t1-t0 {p:?} within t2-t0 {e:?}"
+            );
+            assert!(
+                e.p50 <= e.p99 && e.p99 <= e.p999 && e.p999 <= e.max,
+                "{arm:?}: {e:?}"
+            );
             assert_eq!(r.hot_pinned, None, "{arm:?}: no pinning was requested");
         }
         RoundOutcome::Unavailable(why) => {
             assert!(arm.is_io_uring(), "{arm:?} may not be unavailable: {why}");
-            assert!(!why.is_empty());
+            assert_ne!(why, "");
             eprintln!("{}: unavailable: {why}", arm.name());
         }
     }
@@ -136,7 +145,9 @@ fn recorded_lines_replay_like_generated_ones() {
     std::fs::write(&path, &text).unwrap();
     let lines = load_lines(&path).unwrap();
     assert_eq!(lines.len(), 10);
-    assert!(lines.iter().all(|l| l.ends_with('\n') && !l.trim().is_empty()));
+    assert!(lines
+        .iter()
+        .all(|l| l.ends_with('\n') && !l.trim().is_empty()));
     let mut c = cfg("recorded-run", 25, 5); // 30 lines from a 10-line file: it cycles
     c.lines = Arc::new(lines);
     let RoundOutcome::Ran(r) = run_round(Arm::BusyPoll, &c).unwrap() else {

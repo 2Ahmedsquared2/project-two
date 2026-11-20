@@ -88,7 +88,7 @@ fn hdr_v2_round_trips() {
     let h = one_to_thousand();
     let mut bytes = Vec::new();
     h.write_v2(&mut bytes).unwrap();
-    assert!(!bytes.is_empty());
+    assert!(bytes.len() > 16, "{}", bytes.len());
     let back = LatencyHist::read_v2(&mut bytes.as_slice()).unwrap();
     assert_eq!(back.summary(), h.summary());
 }

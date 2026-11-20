@@ -12,8 +12,8 @@ use std::net::TcpStream;
 use hl_alloc_gate::{assert_no_alloc_after_warmup, count_ticks};
 use hl_replay::{
     generated_lines, loopback_pair, ActiveSigner, Book, BusyTick, Clock, Core, Decision, Handle,
-    LatencyHist, LineBuf, NodeLineParser, Observation, OrderIntent, Parser, Pipeline, Polled,
-    ReplayError, Signer, Sink, Stage, StageLabel, StubBook, StubDecision, LoopbackAddr,
+    LatencyHist, LineBuf, LoopbackAddr, NodeLineParser, Observation, OrderIntent, Parser, Pipeline,
+    Polled, ReplayError, Signer, Sink, Stage, StageLabel, StubBook, StubDecision,
 };
 
 const WARMUP: u64 = 64;
@@ -66,18 +66,23 @@ fn gate_decision() {
 fn gate_signer() {
     let mut s = ActiveSigner::throwaway();
     let mut out = Vec::new();
-    assert_no_alloc_after_warmup("signer: prototype keccak + libsecp256k1", WARMUP, TICKS, |i| {
-        out.clear();
-        let intent = OrderIntent {
-            asset: 0,
-            is_buy: i % 2 == 0,
-            px_ticks: 670_000 + i % 5000,
-            sz_lots: 100 + i % 7,
-            nonce: 1_753_606_210_051 + i,
-        };
-        s.sign(&intent, &mut out).unwrap();
-        black_box(&out);
-    });
+    assert_no_alloc_after_warmup(
+        "signer: prototype keccak + libsecp256k1",
+        WARMUP,
+        TICKS,
+        |i| {
+            out.clear();
+            let intent = OrderIntent {
+                asset: 0,
+                is_buy: i % 2 == 0,
+                px_ticks: 670_000 + i % 5000,
+                sz_lots: 100 + i % 7,
+                nonce: 1_753_606_210_051 + i,
+            };
+            s.sign(&intent, &mut out).unwrap();
+            black_box(&out);
+        },
+    );
 }
 
 #[test]
@@ -155,7 +160,12 @@ fn rig<H: Handle>(handler: H) -> Rig<H> {
     source.set_nonblocking(true).unwrap();
     let core = Core::new(handler, Clock::new(), WARMUP, 1 << 16);
     let tick = BusyTick::new(source, sink.connect().unwrap(), core);
-    Rig { feed, tick, sink, lines: lines() }
+    Rig {
+        feed,
+        tick,
+        sink,
+        lines: lines(),
+    }
 }
 
 impl<H: Handle> Rig<H> {
@@ -163,7 +173,9 @@ impl<H: Handle> Rig<H> {
     /// it (t0), it is parsed (t1), booked, decided, signed, written to the
     /// sink socket (t2) and both latencies are recorded.
     fn tick(&mut self, i: u64) {
-        self.feed.write_all(pick(&self.lines, i).as_bytes()).unwrap();
+        self.feed
+            .write_all(pick(&self.lines, i).as_bytes())
+            .unwrap();
         loop {
             match self.tick.poll().unwrap() {
                 Polled::Lines(n) => {
@@ -176,10 +188,16 @@ impl<H: Handle> Rig<H> {
         }
     }
     fn finish(self) -> (u64, u64, u64) {
-        let Rig { feed, tick, sink, .. } = self;
+        let Rig {
+            feed, tick, sink, ..
+        } = self;
         drop(feed);
         let hists = tick.into_core().into_hists();
-        (hists.e2e.count(), hists.parse.count(), sink.finish().unwrap().orders)
+        (
+            hists.e2e.count(),
+            hists.parse.count(),
+            sink.finish().unwrap().orders,
+        )
     }
 }
 
@@ -231,7 +249,10 @@ fn whole_tick_allocations_are_exactly_the_parsers() {
         whole.total.count / TICKS,
         whole.total.bytes / TICKS,
     );
-    assert_eq!(whole.total, parser.total, "the parser is the only allocating stage");
+    assert_eq!(
+        whole.total, parser.total,
+        "the parser is the only allocating stage"
+    );
     assert_eq!(whole.allocating_ticks, parser.allocating_ticks);
     assert_eq!(r.finish(), (TICKS, TICKS, WARMUP + TICKS));
 }
