@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 301febcf6a64ac4bd4eb288b5b2a3a95a9e22262b9d3cae13be6ef0974bf728e # shrinks to s = "{\"local_time\":\"1970-01-01T00:00:00\",\"block_time\":\"1970-01-01T00:00:00\",\"block_number\":0,\"events\":[]}", cut = Index(16072410678083569725), tail = "", junk = []
