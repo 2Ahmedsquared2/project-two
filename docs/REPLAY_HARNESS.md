@@ -94,14 +94,15 @@ The report prints this table from the stage types themselves:
 | Stage | Label | Today |
 |---|---|---|
 | reader | real | `LineBuf`: fixed buffer, `read` straight into it |
-| parser | real, mode `strict` | `hl_latency::parse_node_line` (builds a `serde_json::Value` tree) |
+| parser | real, mode `header scan` | `hl_latency::scan_node_header` (block time and height from the fixed prefix), falling back to the strict `parse_node_line` for a line it cannot scan |
 | book | stub | fixed 16-level arrays; prices derived from the block number, not from the line |
 | decision | stub | one ALO order per update |
 | signer | prototype | msgpack + 3x keccak-256 + libsecp256k1 + JSON body; placeholder domain, **not checked against SDK vectors** |
 | send | prototype | plain TCP write to loopback: no TLS, no WebSocket framing, no NIC |
 
-So `t2-t0` today is an upper bound on parsing plus a plausible signing cost.
-It is not tick-to-trade. Every row is tagged `parser=strict` or
+So `t2-t0` today is a header scan plus a plausible signing cost. It is not
+tick-to-trade, and it is not comparable with runs made before the header
+scan (the report's `parser:` line says which parser a run used). Every row is tagged `parser=strict` or
 `parser=header scan` so a header scan's cost is never read as a full parse.
 A header-scan parser is for stamping and routing only: a decision stage that
 reads prices or sizes must take them from a strict parse.
@@ -109,18 +110,21 @@ reads prices or sizes must take them from a strict parse.
 ### Complete lines only, and the strict validator
 
 A header scan can return a result for a line cut right after a nested `}`,
-where the strict parse fails. So a parser here is only ever handed a line the
-reader has seen the newline of: `LineBuf::next_line` is the only source of
-lines, and `tests/complete_lines.rs` writes half a line to a tailed file,
-checks that nothing is parsed, finishes the line and checks that exactly one
-parse happens. `Pipeline::on_line` carries a `debug_assert` and a `TODO(PR #7)`
-to take `hl_latency::CompleteLine` once that type exists.
+where the strict parse fails. So parsers take `hl_latency::CompleteLine`, and
+the harness makes one in exactly one place: `LineBuf::next_complete_line`,
+after it has found the line's newline. `tests/complete_lines.rs` writes half a
+line to a tailed file, checks that nothing is parsed, finishes the line and
+checks that exactly one parse happens.
 
-When the active parser's mode is `header scan`, every 16th line is re-parsed
-by the strict parser after its `t2` (off the timed path). A line the scan
-accepted and strict refuses is counted, printed per arm as
-`scan-vs-strict: validated=N mismatches=M`, and any mismatch fails the run.
-With today's strict parser the report says `not applicable`.
+Every 16th line is re-parsed by the strict parser after its `t2` (off the
+timed path). The report prints, per arm,
+`scan-vs-strict: validated=N mismatches=M fallbacks=F`. A mismatch (scan
+accepted, strict refused) fails the run. A fallback is a line the scan could
+not read and the strict parser timed instead: if `fallbacks` is not 0 on real
+node lines, that arm's numbers are partly the strict parser's.
+
+To time the strict parse on every line, change `ActiveParser` to
+`NodeLineParser`.
 
 ### Not measured yet
 
@@ -134,14 +138,13 @@ Stages are type parameters of `Pipeline` (static dispatch). The active ones
 are four aliases in `crates/hl-replay/src/stage.rs`:
 
 ```rust
-pub type ActiveParser = NodeLineParser;
+pub type ActiveParser = HeaderScanParser;
 pub type ActiveBook = StubBook;
 pub type ActiveDecision = StubDecision;
 pub type ActiveSigner = PrototypeSigner; // <- the one line to change
 ```
 
-The zero-allocation `parse_node_line` keeps its signature, so it needs no
-change here at all. For the real signer: implement `Stage` (with
+For the real signer: implement `Stage` (with
 `LABEL = StageLabel::Real` once it passes the SDK vectors) and `Signer` for
 it, give it a `throwaway()` constructor, and change the alias. The report's
 `signer=` label follows from the type.
@@ -157,13 +160,13 @@ both latencies recorded) run under `hl_alloc_gate::assert_no_alloc_after_warmup`
 | Gate | Allocations per tick after warmup |
 |---|---|
 | reader, book, decision, signer, send, clock + histogram record | 0 (gated) |
-| parser, `hl_latency::parse_node_line`, 20-event 3,174-byte line | 331 (42,462 bytes): the gate panics, and the test asserts that it does |
-| whole tick with a non-allocating test parser | 0 (gated) |
-| whole tick with the real parser | 331 (42,462 bytes), exactly the parser's: the gate panics, and the test asserts that it does |
+| parser: header scan, and strict `parse_node_line`, 20-event 3,174-byte line | 0 (gated) |
+| whole tick, the pipeline the harness runs | 0 (gated) |
+| whole tick with the strict validator on every line | 0 (gated) |
 
-When the zero-allocation parser lands, the two `#[should_panic]` tests start
-failing. That is the signal: delete the two attributes and both gates are
-live.
+Before the zero-allocation parser (PR #7) the strict parser made 331
+allocations (42,462 bytes) per line and the parser and whole-tick gates were
+`#[should_panic]` tests; both are live gates now.
 
 ## Safety
 

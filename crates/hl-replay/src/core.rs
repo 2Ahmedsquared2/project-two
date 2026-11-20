@@ -114,8 +114,7 @@ impl<H: Handle> Core<H> {
     /// the latencies recorded, so it is off the timed path. A line the
     /// pipeline's parser accepted and the strict parse refuses is counted in
     /// [`Hists::scan_strict_mismatches`]. For header-scan parsers, which can
-    /// accept a line whose body is broken. It allocates (the strict parser
-    /// does), so the allocation gates run without it.
+    /// accept a line whose body is broken.
     #[must_use]
     pub fn with_strict_validation(mut self, every: u64) -> Self {
         self.validate_every = every;
@@ -253,7 +252,8 @@ impl<H: Handle> Core<H> {
     }
 
     /// Consumes the core, keeping the histograms.
-    pub fn into_hists(self) -> Hists {
+    pub fn into_hists(mut self) -> Hists {
+        self.hists.scan_fallbacks = self.handler.scan_fallbacks();
         self.hists
     }
 

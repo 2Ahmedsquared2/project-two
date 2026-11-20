@@ -133,9 +133,8 @@ pub trait Signer: Stage {
     fn sign(&mut self, intent: &OrderIntent, out: &mut Vec<u8>) -> Result<(), ReplayError>;
 }
 
-/// The real parser: [`hl_latency::parse_node_line`], unchanged. Today it
-/// builds a `serde_json::Value` tree and so allocates on every line; its
-/// zero-allocation replacement keeps the signature and drops in here.
+/// The strict parser: [`hl_latency::parse_node_line`], which validates the
+/// whole line. It does not allocate, but its cost grows with the line.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NodeLineParser;
 
@@ -152,22 +151,47 @@ impl Parser for NodeLineParser {
     }
 }
 
-/// Stub.
+/// The fast parser: [`hl_latency::scan_node_header`] reads the block time
+/// and height from the line's fixed prefix, at a cost that does not grow with
+/// the line. A line it cannot scan goes to the strict
+/// [`hl_latency::parse_node_line`] instead and is counted in
+/// [`Parser::fallbacks`].
+///
+/// For stamping and routing only: a stage that reads prices or sizes must
+/// take them from the strict parse. The harness re-parses sampled lines
+/// strictly after `t2` and fails the run if the scan accepted a line the
+/// strict parser refuses.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct HeaderScanParser;
+pub struct HeaderScanParser {
+    fallbacks: u64,
+}
 
 impl Stage for HeaderScanParser {
-    const NAME: &'static str = "stub";
-    const LABEL: StageLabel = StageLabel::Stub;
+    const NAME: &'static str =
+        "hl_latency::scan_node_header, falling back to strict parse_node_line";
+    const LABEL: StageLabel = StageLabel::Real;
 }
 
 impl Parser for HeaderScanParser {
-    fn parse(
-        &mut self,
-        _line: CompleteLine<'_>,
-        _recv_ns: u64,
-    ) -> Result<Observation, ReplayError> {
-        Err(ReplayError::Config("stub".to_owned()))
+    const MODE: ParserMode = ParserMode::HeaderScan;
+
+    #[inline]
+    fn parse(&mut self, line: CompleteLine<'_>, recv_ns: u64) -> Result<Observation, ReplayError> {
+        if let Some((block_time_ms, block_number)) = hl_latency::scan_node_header(line) {
+            return Ok(Observation {
+                source: hl_latency::Source::Node,
+                block_time_ms,
+                block_number: Some(block_number),
+                recv_ns,
+            });
+        }
+        self.fallbacks += 1;
+        let line = std::str::from_utf8(line.as_bytes()).map_err(|_| ReplayError::NotUtf8)?;
+        Ok(hl_latency::parse_node_line(line, recv_ns)?)
+    }
+
+    fn fallbacks(&self) -> u64 {
+        self.fallbacks
     }
 }
 
@@ -256,8 +280,9 @@ impl Decision for StubDecision {
     }
 }
 
-/// The parser the harness runs.
-pub type ActiveParser = NodeLineParser;
+/// The parser the harness runs. Point it at [`NodeLineParser`] to time the
+/// strict parse on every line instead.
+pub type ActiveParser = HeaderScanParser;
 /// The book the harness runs.
 pub type ActiveBook = StubBook;
 /// The decision stage the harness runs.
@@ -388,5 +413,9 @@ impl<P: Parser, B: Book, D: Decision, S: Signer> Handle for Pipeline<P, B, D, S>
             None => false,
         };
         Ok(LineOutcome { t1_ns, order })
+    }
+
+    fn scan_fallbacks(&self) -> u64 {
+        self.parser.fallbacks()
     }
 }

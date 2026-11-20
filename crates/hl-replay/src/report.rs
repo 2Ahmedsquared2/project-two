@@ -109,10 +109,9 @@ pub fn render_report(meta: &RunMeta, arms: &[ArmReport]) -> String {
     }
     let parser = stage_table()[1];
     let _ = writeln!(s, "parser: {} ({})", parser.name, active_parser_mode());
-    // TODO(PR #7): say `CompleteLine` here once `Pipeline::on_line` takes it.
     let _ = writeln!(
         s,
-        "complete lines: by construction and debug_assert; CompleteLine type not used"
+        "complete lines: enforced by type (hl_latency::CompleteLine, made only where the reader has seen the newline)"
     );
     let _ = writeln!(s, "input: {}", meta.input);
     let _ = writeln!(
@@ -160,7 +159,7 @@ pub fn render_report(meta: &RunMeta, arms: &[ArmReport]) -> String {
         ParserMode::HeaderScan => {
             let _ = writeln!(
                 s,
-                "scan-vs-strict: sampled lines are re-parsed strictly after t2; any mismatch fails the run"
+                "scan-vs-strict: every 16th line is re-parsed strictly after t2; any mismatch fails the run; fallbacks = lines the scan could not read, timed with the strict parser"
             );
         }
     }
@@ -205,10 +204,11 @@ fn render_rows(s: &mut String, arms: &[ArmReport]) {
         if active_parser_mode() == ParserMode::HeaderScan {
             let _ = writeln!(
                 s,
-                "{:<21} scan-vs-strict: validated={} mismatches={}",
+                "{:<21} scan-vs-strict: validated={} mismatches={} fallbacks={}",
                 a.arm.name(),
                 a.hists.validated,
-                a.hists.scan_strict_mismatches
+                a.hists.scan_strict_mismatches,
+                a.hists.scan_fallbacks
             );
         }
     }

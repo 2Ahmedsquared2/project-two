@@ -138,10 +138,10 @@ impl Stage for ScanParser {
 }
 impl Parser for ScanParser {
     fn parse(&mut self, line: CompleteLine<'_>, recv_ns: u64) -> Result<Observation, ReplayError> {
-        let line = std::str::from_utf8(line.as_bytes()).unwrap();
         fn after<'a>(line: &'a str, key: &str) -> &'a str {
             &line[line.find(key).unwrap() + key.len()..]
         }
+        let line = std::str::from_utf8(line.as_bytes()).unwrap();
         let bt = &after(line, "\"block_time\":\"")[..23];
         let bn = after(line, "\"block_number\":");
         let bn = &bn[..bn.find(|c: char| !c.is_ascii_digit()).unwrap()];
