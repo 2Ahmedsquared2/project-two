@@ -201,7 +201,7 @@ fn header_scan_reads_the_hl_node_prefix() {
     );
     let no_events = r#"{"local_time":"x","block_time":"1970-01-01T00:00:00","block_number":0}"#;
     assert_eq!(scan_node_header(no_events.as_bytes()), Some((0, 0)));
-    let max = r#"{"local_time":"","block_time":"1970-01-01T00:00:01","block_number":18446744073709551615,"#;
+    let max = r#"{"local_time":"","block_time":"1970-01-01T00:00:01","block_number":18446744073709551615,"events":[]}"#;
     assert_eq!(scan_node_header(max.as_bytes()), Some((1000, u64::MAX)));
 }
 
@@ -247,25 +247,139 @@ fn header_scan_declines_anything_else() {
     assert_eq!(scan_node_header(b"{\"local_time\":\"\xff\xfe"), None);
 }
 
-/// The documented contract: the scan trusts the first occurrence of each key
-/// and never looks at the tail. These two lines are where it and the strict
-/// parser differ.
+/// A complete line ends with `}`; JSON whitespace (the newline the reader
+/// saw, a `\r` before it) may follow.
 #[test]
-fn header_scan_trusts_the_prefix_and_ignores_the_tail() {
+fn header_scan_accepts_trailing_whitespace_after_the_closing_brace() {
+    let line = format!(r#"{{"local_time":"x","block_time":"{TS}","block_number":5,"events":[]}}"#);
+    for tail in ["", "\n", "\r\n", " \t\r\n"] {
+        let l = format!("{line}{tail}");
+        assert_eq!(
+            scan_node_header(l.as_bytes()),
+            Some((1_753_606_210_051, 5)),
+            "line {l:?}"
+        );
+    }
+}
+
+/// The end-of-line check: a line whose last non-whitespace byte is not `}`
+/// is not complete, so the scan declines it and the strict parser reports
+/// the error.
+#[test]
+fn header_scan_declines_a_truncated_line() {
     let head = format!(r#"{{"local_time":"x","block_time":"{TS}","block_number":5"#);
-    let dup = format!(r#"{head},"block_number":6}}"#);
+    let full = format!(
+        r#"{head},"events":[{{"time":"{TS}","hash":"0xab","inner":{{"coin":"BTC"}}}},[1,2]]}}"#
+    );
     assert_eq!(
-        scan_node_header(dup.as_bytes()),
+        scan_node_header(full.as_bytes()),
         Some((1_753_606_210_051, 5))
     );
-    assert_eq!(parse_node_line(&dup, 0).unwrap().block_number, Some(6));
-    let cut = format!(r#"{head},"events":[{{"#);
+    let cuts = [
+        format!("{head},"),
+        format!(r#"{head},"events":"#),
+        format!(r#"{head},"events":["#),
+        format!(r#"{head},"events":[{{"#),
+        format!(r#"{head},"events":[{{"time":"{TS}"#),
+        format!(
+            r#"{head},"events":[{{"time":"{TS}","hash":"0xab","inner":{{"coin":"BTC"}}}},[1,2]"#
+        ),
+        format!(
+            r#"{head},"events":[{{"time":"{TS}","hash":"0xab","inner":{{"coin":"BTC"}}}},[1,2]]"#
+        ),
+        format!("{head},\"events\":[\n"),
+        // Bytes after the closing brace that are not JSON whitespace.
+        format!("{full}x"),
+        format!("{full}\0"),
+        format!("{full}\n{{"),
+    ];
+    for cut in &cuts {
+        assert_eq!(scan_node_header(cut.as_bytes()), None, "accepted {cut:?}");
+        assert!(
+            matches!(parse_node_line(cut, 0), Err(ParseError::Malformed(_))),
+            "strict accepted {cut:?}"
+        );
+    }
+}
+
+/// What the end-of-line check does not catch: a cut that lands just after a
+/// nested `}` still ends with `}`. The scan answers from the prefix; the
+/// strict parser rejects the line. Callers pass complete lines only (after
+/// the newline is seen), so this takes a writer that stops mid-line.
+#[test]
+fn header_scan_answers_for_a_line_cut_right_after_a_nested_closing_brace() {
+    let cut = format!(
+        r#"{{"local_time":"x","block_time":"{TS}","block_number":5,"events":[{{"inner":{{"coin":"BTC"}}"#
+    );
     assert_eq!(
         scan_node_header(cut.as_bytes()),
         Some((1_753_606_210_051, 5))
     );
     assert!(matches!(
         parse_node_line(&cut, 0),
+        Err(ParseError::Malformed(_))
+    ));
+}
+
+/// The tail between the header and the closing brace is not read: a line
+/// that is corrupt after `block_number` but still ends with `}` gives the
+/// header, where the strict parser gives an error.
+#[test]
+fn header_scan_answers_for_a_line_corrupt_after_block_number() {
+    let head = format!(r#"{{"local_time":"x","block_time":"{TS}","block_number":5"#);
+    let corrupt = [
+        format!(r#"{head},"events":[{{"time":!!,}}]}}"#),
+        format!(r#"{head},"events":[1,,2]}}"#),
+        format!(r#"{head},"events":[}}"#),
+        format!(r#"{head},garbage}}"#),
+        format!("{head},\"events\":[\"\u{1}\"]}}"),
+        format!(r#"{head}}}}}"#),
+    ];
+    for line in &corrupt {
+        assert_eq!(
+            scan_node_header(line.as_bytes()),
+            Some((1_753_606_210_051, 5)),
+            "line {line:?}"
+        );
+        assert!(
+            matches!(parse_node_line(line, 0), Err(ParseError::Malformed(_))),
+            "strict accepted {line:?}"
+        );
+    }
+}
+
+/// The first occurrence of each key is trusted: with a later duplicate
+/// `block_time` or `block_number` the scan gives the first value and the
+/// strict parser the last.
+#[test]
+fn header_scan_takes_the_first_of_duplicate_keys() {
+    let head = format!(r#"{{"local_time":"x","block_time":"{TS}","block_number":5"#);
+    let first = Some((1_753_606_210_051, 5));
+
+    let dup_number = format!(r#"{head},"block_number":6}}"#);
+    assert_eq!(scan_node_header(dup_number.as_bytes()), first);
+    let strict = parse_node_line(&dup_number, 0).unwrap();
+    assert_eq!(
+        (strict.block_time_ms, strict.block_number),
+        (1_753_606_210_051, Some(6))
+    );
+
+    let dup_time = format!(r#"{head},"block_time":"1970-01-01T00:00:01"}}"#);
+    assert_eq!(scan_node_header(dup_time.as_bytes()), first);
+    let strict = parse_node_line(&dup_time, 0).unwrap();
+    assert_eq!((strict.block_time_ms, strict.block_number), (1000, Some(5)));
+
+    let dup_both =
+        format!(r#"{head},"events":[],"block_number":6,"block_time":"1970-01-01T00:00:01"}}"#);
+    assert_eq!(scan_node_header(dup_both.as_bytes()), first);
+    let strict = parse_node_line(&dup_both, 0).unwrap();
+    assert_eq!((strict.block_time_ms, strict.block_number), (1000, Some(6)));
+
+    // A later duplicate the strict parser rejects outright.
+    let dup_bad = format!(r#"{head},"block_number":"six"}}"#);
+    assert_eq!(scan_node_header(dup_bad.as_bytes()), first);
+    assert!(matches!(
+        parse_node_line(&dup_bad, 0),
         Err(ParseError::Malformed(_))
     ));
 }
@@ -591,5 +705,32 @@ proptest! {
         let mut v = line[..cut.index(line.len() + 1)].to_vec();
         v.extend_from_slice(&b);
         let _ = scan_node_header(&v);
+    }
+
+    /// Whatever the bytes, a `Some` means the line's last non-whitespace
+    /// byte is `}`; and cutting an hl-node line anywhere else gives `None`.
+    #[test]
+    fn scan_some_implies_the_line_ends_with_a_closing_brace(
+        s in hl_node_line(),
+        cut in any::<Index>(),
+        tail in "[ \\t\\r\\n]{0,3}",
+        junk in proptest::collection::vec(any::<u8>(), 0..8),
+    ) {
+        let mut v = s.as_bytes()[..cut.index(s.len() + 1)].to_vec();
+        v.extend_from_slice(tail.as_bytes());
+        let mut w = v.clone();
+        w.extend_from_slice(&junk);
+        for line in [&v, &w] {
+            let trimmed_end = line
+                .iter()
+                .rposition(|c| !matches!(c, b' ' | b'\t' | b'\r' | b'\n'));
+            let closed = trimmed_end.is_some_and(|i| line[i] == b'}');
+            if scan_node_header(line).is_some() {
+                prop_assert!(closed, "answered for {:?}", String::from_utf8_lossy(line));
+            }
+        }
+        let mut whole = s.clone().into_bytes();
+        whole.extend_from_slice(tail.as_bytes());
+        prop_assert!(scan_node_header(&whole).is_some());
     }
 }
