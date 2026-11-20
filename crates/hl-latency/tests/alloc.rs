@@ -27,7 +27,7 @@ fn small_lines() -> Vec<String> {
     inputs(64, |i| support::node_line(676_607_012 + i, 2))
 }
 
-/// Hundreds of events per line, about 180 KB each.
+/// Hundreds of events per line, over 100 KB each (asserted below).
 fn busy_lines() -> Vec<String> {
     inputs(4, |i| support::node_line(676_607_012 + i, 600))
 }

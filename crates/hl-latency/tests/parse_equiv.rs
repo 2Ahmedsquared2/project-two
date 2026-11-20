@@ -514,8 +514,17 @@ fn ws_frame() -> impl Strategy<Value = String> {
 
 // ---- properties -----------------------------------------------------------------
 
+/// 1024 cases per property by default; `PROPTEST_CASES` overrides it for a
+/// longer soak.
+fn cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024)
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(1024))]
+    #![proptest_config(ProptestConfig::with_cases(cases()))]
 
     #[test]
     fn arbitrary_strings_match_the_oracle(s in "\\PC{0,200}") {

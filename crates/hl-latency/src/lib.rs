@@ -20,8 +20,10 @@
 
 use std::collections::BTreeMap;
 
+use serde::de::DeserializeSeed as _;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+
+mod strict;
 
 /// Where an arrival was observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -66,8 +68,11 @@ pub enum ParseError {
 /// turns `block_time` into milliseconds with `and_utc().timestamp_millis()`).
 /// Years before 1970 are rejected: no block is that old.
 pub fn parse_naive_utc_ms(s: &str) -> Result<u64, ParseError> {
-    let bad = || ParseError::BadTimestamp(s.to_owned());
-    let b = s.as_bytes();
+    naive_utc_ms(s.as_bytes()).ok_or_else(|| ParseError::BadTimestamp(s.to_owned()))
+}
+
+/// [`parse_naive_utc_ms`] on bytes, `None` for anything it rejects.
+fn naive_utc_ms(b: &[u8]) -> Option<u64> {
     if b.len() < 19
         || b[4] != b'-'
         || b[7] != b'-'
@@ -75,7 +80,7 @@ pub fn parse_naive_utc_ms(s: &str) -> Result<u64, ParseError> {
         || b[13] != b':'
         || b[16] != b':'
     {
-        return Err(bad());
+        return None;
     }
     let num = |r: std::ops::Range<usize>| -> Option<u64> {
         let part = &b[r];
@@ -88,16 +93,8 @@ pub fn parse_naive_utc_ms(s: &str) -> Result<u64, ParseError> {
             None
         }
     };
-    let (Some(year), Some(month), Some(day), Some(hour), Some(min), Some(sec)) = (
-        num(0..4),
-        num(5..7),
-        num(8..10),
-        num(11..13),
-        num(14..16),
-        num(17..19),
-    ) else {
-        return Err(bad());
-    };
+    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hour, min, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
     let millis = match &b[19..] {
         [] => 0,
         [b'.', frac @ ..]
@@ -109,7 +106,7 @@ pub fn parse_naive_utc_ms(s: &str) -> Result<u64, ParseError> {
                 .take(3)
                 .fold(0, |acc, &c| acc * 10 + u64::from(c - b'0'))
         }
-        _ => return Err(bad()),
+        _ => return None,
     };
     if year < 1970
         || !(1..=12).contains(&month)
@@ -119,10 +116,10 @@ pub fn parse_naive_utc_ms(s: &str) -> Result<u64, ParseError> {
         || min > 59
         || sec > 59
     {
-        return Err(bad());
+        return None;
     }
     let days = days_from_civil(year, month, day);
-    Ok(((days * 24 + hour) * 60 + min) * 60_000 + sec * 1000 + millis)
+    Some(((days * 24 + hour) * 60 + min) * 60_000 + sec * 1000 + millis)
 }
 
 fn is_leap(y: u64) -> bool {
@@ -158,81 +155,175 @@ fn malformed(why: &str) -> ParseError {
 /// `{local_time, block_time, block_number, events}` written with
 /// `--batch-by-block` or `--stream-with-block-info` (source: `hyperliquid-dex/node`
 /// README, "Reading L1 Data"). Only `block_time` and `block_number` are read.
+///
+/// This is the strict parse: the whole line is validated as JSON, a repeated
+/// key takes its last value, and the result (errors and their text included)
+/// is what parsing into a `serde_json::Value` and looking the two fields up
+/// gives. It builds no tree and does not allocate on the success path, unless
+/// the line contains backslash-escaped strings (`serde_json` unescapes those
+/// into a buffer it owns; hl-node writes none). Its cost still grows with the
+/// line; when only the header is needed, try [`scan_node_header`] first.
 pub fn parse_node_line(line: &str, recv_ns: u64) -> Result<Observation, ParseError> {
-    let v: Value = serde_json::from_str(line).map_err(|e| malformed(&e.to_string()))?;
-    let block_time = v
-        .get("block_time")
-        .and_then(Value::as_str)
+    let mut de = serde_json::Deserializer::from_str(line);
+    let fields = strict::NodeLine
+        .deserialize(&mut de)
+        .and_then(|fields| de.end().map(|()| fields))
+        .map_err(|e| malformed(&e.to_string()))?;
+    let block_time = fields
+        .block_time
         .ok_or_else(|| malformed("block_time missing or not a string"))?;
-    let block_number = v
-        .get("block_number")
-        .and_then(Value::as_u64)
+    let block_number = fields
+        .block_number
         .ok_or_else(|| malformed("block_number missing or not a u64"))?;
     Ok(Observation {
         source: Source::Node,
-        block_time_ms: parse_naive_utc_ms(block_time)?,
+        block_time_ms: block_time?,
         block_number: Some(block_number),
         recv_ns,
     })
+}
+
+/// Reads `(block_time_ms, block_number)` from the start of a node line
+/// without parsing the rest: the fast path for the node feed, constant cost
+/// however many events the line carries, no allocation.
+///
+/// It answers only for the exact prefix hl-node writes, byte for byte, with
+/// no whitespace:
+///
+/// ```text
+/// {"local_time":"<no escapes>","block_time":"<timestamp>","block_number":<digits>
+/// ```
+///
+/// followed by `,` or `}`. The timestamp must be one [`parse_naive_utc_ms`]
+/// accepts and the digits a `u64` without a leading zero. For anything else
+/// it returns `None`, and the caller falls back to [`parse_node_line`], which
+/// either parses the line or says what is wrong with it.
+///
+/// # Contract
+///
+/// A `Some` is a statement about the prefix only:
+///
+/// - The tail is not read. A line cut short or corrupted after
+///   `block_number` still gives `Some`, where [`parse_node_line`] gives an
+///   error.
+/// - The first occurrence of each key is trusted. If a later duplicate
+///   `block_time` or `block_number` follows, [`parse_node_line`] reports the
+///   last one and this function the first.
+/// - `local_time` is skipped, not validated.
+///
+/// For a line that is a valid JSON object with unique keys, `Some((t, n))`
+/// means [`parse_node_line`] returns `Ok` with the same block time and
+/// height (property-tested in `tests/parse_equiv.rs`).
+///
+/// ```
+/// let line = br#"{"local_time":"2025-07-27T08:50:10.334741319","block_time":"2025-07-27T08:50:10.051000","block_number":676607012,"events":[]}"#;
+/// assert_eq!(
+///     hl_latency::scan_node_header(line),
+///     Some((1_753_606_210_051, 676_607_012))
+/// );
+/// assert_eq!(hl_latency::scan_node_header(br#"{"block_number":1}"#), None);
+/// ```
+#[must_use]
+pub fn scan_node_header(line: &[u8]) -> Option<(u64, u64)> {
+    /// Splits at the closing quote of a string with no escapes.
+    fn plain_string(b: &[u8]) -> Option<(&[u8], &[u8])> {
+        let end = b.iter().position(|&c| c == b'"' || c == b'\\')?;
+        if b[end] == b'\\' {
+            return None;
+        }
+        Some((&b[..end], &b[end + 1..]))
+    }
+    let rest = line.strip_prefix(br#"{"local_time":""#)?;
+    let (_local_time, rest) = plain_string(rest)?;
+    let rest = rest.strip_prefix(br#","block_time":""#)?;
+    let (block_time, rest) = plain_string(rest)?;
+    let block_time_ms = naive_utc_ms(block_time)?;
+    let rest = rest.strip_prefix(br#","block_number":"#)?;
+    let len = rest.iter().take_while(|c| c.is_ascii_digit()).count();
+    let (digits, rest) = rest.split_at(len);
+    // The terminator proves the number was not cut short and is an integer
+    // (not followed by `.`, `e` or more digits).
+    if !matches!(rest.first(), Some(b',' | b'}')) {
+        return None;
+    }
+    if digits.is_empty() || (digits.len() > 1 && digits[0] == b'0') {
+        return None;
+    }
+    let block_number = digits.iter().try_fold(0u64, |acc, &c| {
+        acc.checked_mul(10)?.checked_add(u64::from(c - b'0'))
+    })?;
+    Some((block_time_ms, block_number))
 }
 
 /// Parses one public `WebSocket` message into the block times it proves the
 /// sender had seen: `l2Book` gives one (`data.time`), `trades` one per
 /// distinct `time` in message order. Other channels (subscription acks,
 /// pongs) give none.
+///
+/// Allocates the returned `Vec`; on a hot path use
+/// [`parse_ws_message_into`] with a reused buffer.
 pub fn parse_ws_message(msg: &str, recv_ns: u64) -> Result<Vec<Observation>, ParseError> {
-    let v: Value = serde_json::from_str(msg).map_err(|e| malformed(&e.to_string()))?;
-    let obs = |t| Observation {
-        source: Source::PublicWs,
-        block_time_ms: t,
-        block_number: None,
-        recv_ns,
-    };
-    let time_of = |d: &Value| {
-        d.get("time")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| malformed("time missing or not a u64"))
-    };
-    match v.get("channel").and_then(Value::as_str) {
-        Some("l2Book") => {
-            let data = v
-                .get("data")
-                .ok_or_else(|| malformed("l2Book without data"))?;
-            Ok(vec![obs(time_of(data)?)])
-        }
-        Some("trades") => {
-            let data = v
-                .get("data")
-                .and_then(Value::as_array)
-                .ok_or_else(|| malformed("trades data is not an array"))?;
-            let mut out: Vec<Observation> = Vec::new();
-            for trade in data {
-                let t = time_of(trade)?;
-                if !out.iter().any(|o| o.block_time_ms == t) {
-                    out.push(obs(t));
-                }
-            }
-            Ok(out)
-        }
-        _ => Ok(Vec::new()),
-    }
+    let mut out = Vec::new();
+    parse_ws_message_into(msg, recv_ns, &mut out)?;
+    Ok(out)
 }
 
-/// Stub: see the failing tests in `tests/parse_equiv.rs` and `tests/alloc.rs`.
+/// [`parse_ws_message`] into a buffer the caller keeps: `out` is cleared,
+/// then filled with the message's observations. On an error `out` is left
+/// empty.
+///
+/// Once `out` has grown to the largest message seen, the success path does
+/// not allocate (unless the frame contains backslash-escaped strings, see
+/// [`parse_node_line`]). The whole frame is validated as JSON; `channel` and
+/// `data` may come in either order, and a repeated key takes its last value.
 pub fn parse_ws_message_into(
     msg: &str,
     recv_ns: u64,
     out: &mut Vec<Observation>,
 ) -> Result<(), ParseError> {
+    use strict::{Channel, Data};
     out.clear();
-    out.extend(parse_ws_message(msg, recv_ns)?);
-    Ok(())
-}
-
-/// Stub: see the failing tests in `tests/parse_equiv.rs` and `tests/alloc.rs`.
-#[must_use]
-pub fn scan_node_header(_line: &[u8]) -> Option<(u64, u64)> {
-    None
+    let result = (|| {
+        let mut de = serde_json::Deserializer::from_str(msg);
+        let (channel, data) = strict::WsFrame {
+            out: &mut *out,
+            recv_ns,
+        }
+        .deserialize(&mut de)
+        .and_then(|frame| de.end().map(|()| frame))
+        .map_err(|e| malformed(&e.to_string()))?;
+        let no_time = || malformed("time missing or not a u64");
+        match channel {
+            Channel::L2Book => match data {
+                None => Err(malformed("l2Book without data")),
+                Some(Data::Object(Some(time))) => {
+                    out.clear();
+                    out.push(Observation {
+                        source: Source::PublicWs,
+                        block_time_ms: time,
+                        block_number: None,
+                        recv_ns,
+                    });
+                    Ok(())
+                }
+                Some(_) => Err(no_time()),
+            },
+            Channel::Trades => match data {
+                // The distinct trade times are already in `out`.
+                Some(Data::Array { all_timed: true }) => Ok(()),
+                Some(Data::Array { all_timed: false }) => Err(no_time()),
+                _ => Err(malformed("trades data is not an array")),
+            },
+            Channel::Other => {
+                out.clear();
+                Ok(())
+            }
+        }
+    })();
+    if result.is_err() {
+        out.clear();
+    }
+    result
 }
 
 /// One block seen by both sources.
