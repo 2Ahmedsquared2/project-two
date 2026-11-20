@@ -331,9 +331,9 @@ fn header_scan_answers_for_a_line_corrupt_after_block_number() {
         format!(r#"{head},"events":[{{"time":!!,}}]}}"#),
         format!(r#"{head},"events":[1,,2]}}"#),
         format!(r#"{head},"events":[}}"#),
-        format!(r#"{head},garbage}}"#),
+        format!("{head},garbage}}"),
         format!("{head},\"events\":[\"\u{1}\"]}}"),
-        format!(r#"{head}}}}}"#),
+        format!("{head}}}}}"),
     ];
     for line in &corrupt {
         assert_eq!(

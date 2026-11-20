@@ -14,6 +14,14 @@
 //! a unique key in practice; a key the node reports with two heights is
 //! counted as ambiguous and excluded, never paired.
 //!
+//! Parsing on the tick path does not allocate, with one known exception: the
+//! strict parsers ([`parse_node_line`], [`parse_ws_message_into`]) allocate
+//! when the input contains a backslash-escaped string, because `serde_json`
+//! unescapes it into a buffer it owns. The synthetic node lines and captured
+//! `WebSocket` frames under test contain none; how often real hl-node lines
+//! do is NOT YET MEASURED and is to be counted once real lines exist.
+//! [`scan_node_header`] never allocates.
+//!
 //! The crate is I/O-free: parsing, pairing and statistics only. The capture
 //! side (tailing the node's files, holding the `WebSocket`) is a separate
 //! binary that writes [`Observation`]s as JSON Lines.
@@ -187,41 +195,54 @@ pub fn parse_node_line(line: &str, recv_ns: u64) -> Result<Observation, ParseErr
 /// without parsing the rest: the fast path for the node feed, constant cost
 /// however many events the line carries, no allocation.
 ///
-/// It answers only for the exact prefix hl-node writes, byte for byte, with
-/// no whitespace:
+/// **For stamping and routing only.** Use the result to timestamp an arrival
+/// and to decide where a line goes. Anything a strategy acts on (prices,
+/// sizes, fills) must come from the strict parse: [`parse_node_line`] is the
+/// validator, and it runs off the tick path.
+///
+/// It answers only for a complete line that starts with the exact prefix
+/// hl-node writes, byte for byte, with no whitespace:
 ///
 /// ```text
 /// {"local_time":"<no escapes>","block_time":"<timestamp>","block_number":<digits>
 /// ```
 ///
 /// followed by `,` or `}`. The timestamp must be one [`parse_naive_utc_ms`]
-/// accepts and the digits a `u64` without a leading zero. For anything else
-/// it returns `None`, and the caller falls back to [`parse_node_line`], which
-/// either parses the line or says what is wrong with it.
+/// accepts and the digits a `u64` without a leading zero. The line's last
+/// byte, not counting trailing JSON whitespace (space, tab, `\r`, `\n`),
+/// must be `}`. For anything else it returns `None`, and the caller falls
+/// back to [`parse_node_line`], which either parses the line or says what is
+/// wrong with it.
 ///
 /// # Contract
 ///
-/// A `Some` is a statement about the prefix only:
+/// Pass complete lines only: call this after the reader has seen the line's
+/// newline, never on a partial read. A `Some` is a statement about the
+/// prefix and the last byte, nothing in between:
 ///
-/// - The tail is not read. A line cut short or corrupted after
-///   `block_number` still gives `Some`, where [`parse_node_line`] gives an
-///   error.
+/// - End of line: a line cut short gives `None`, unless the cut lands right
+///   after a nested `}` (the end of an event object), which looks like a
+///   complete line. Passing complete lines only is what rules that case out.
+/// - The tail between the header and the closing `}` is not read. A line
+///   corrupt after `block_number` that still ends with `}` gives `Some`,
+///   where [`parse_node_line`] gives an error.
 /// - The first occurrence of each key is trusted. If a later duplicate
-///   `block_time` or `block_number` follows, [`parse_node_line`] reports the
-///   last one and this function the first.
+///   `block_time` or `block_number` follows, this function reports the first
+///   and [`parse_node_line`] the last (or an error, if the duplicate is not
+///   valid).
 /// - `local_time` is skipped, not validated.
 ///
 /// For a line that is a valid JSON object with unique keys, `Some((t, n))`
 /// means [`parse_node_line`] returns `Ok` with the same block time and
-/// height (property-tested in `tests/parse_equiv.rs`).
+/// height. Each case above is pinned by a test in `tests/parse_equiv.rs`.
 ///
 /// ```
 /// let line = br#"{"local_time":"2025-07-27T08:50:10.334741319","block_time":"2025-07-27T08:50:10.051000","block_number":676607012,"events":[]}"#;
-/// assert_eq!(
-///     hl_latency::scan_node_header(line),
-///     Some((1_753_606_210_051, 676_607_012))
-/// );
+/// let header = Some((1_753_606_210_051, 676_607_012));
+/// assert_eq!(hl_latency::scan_node_header(line), header);
+/// // Not a node line, and a node line cut short: both fall back.
 /// assert_eq!(hl_latency::scan_node_header(br#"{"block_number":1}"#), None);
+/// assert_eq!(hl_latency::scan_node_header(&line[..line.len() - 1]), None);
 /// ```
 #[must_use]
 pub fn scan_node_header(line: &[u8]) -> Option<(u64, u64)> {
@@ -252,6 +273,15 @@ pub fn scan_node_header(line: &[u8]) -> Option<(u64, u64)> {
     let block_number = digits.iter().try_fold(0u64, |acc, &c| {
         acc.checked_mul(10)?.checked_add(u64::from(c - b'0'))
     })?;
+    // End-of-line check: a complete line closes its object. Only trailing
+    // JSON whitespace (the newline, a `\r` before it) may follow.
+    let last = line
+        .iter()
+        .rev()
+        .find(|c| !matches!(c, b' ' | b'\t' | b'\r' | b'\n'))?;
+    if *last != b'}' {
+        return None;
+    }
     Some((block_time_ms, block_number))
 }
 
