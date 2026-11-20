@@ -1,0 +1,19 @@
+[package]
+name = "hl-alloc-gate"
+description = "Test gate that fails when a hot-path tick allocates after warmup."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+allocation-counter = "0.8.1"
+
+[dev-dependencies]
+hl-latency = { path = "../hl-latency" }
+
+[lints]
+workspace = true
