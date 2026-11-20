@@ -63,5 +63,6 @@ Dual-licensed under MIT or Apache-2.0, at your option. See
 
 - Running the reference `hl-node`: [docs/NODE_SETUP.md](docs/NODE_SETUP.md) (needs a host; approval pending).
 - Node vs public WebSocket latency: [docs/LATENCY_PROBE.md](docs/LATENCY_PROBE.md), crate `hl-latency`.
+- HFT path (node output to strategy ring to order, tick-to-order measurement): [docs/HFT_PATH.md](docs/HFT_PATH.md).
 - NautilusTrader feed interface: [docs/NAUTILUS_FEED.md](docs/NAUTILUS_FEED.md).
 - Testnet order path, step 1 (offline signer, nothing sent): [docs/ORDER_CLIENT.md](docs/ORDER_CLIENT.md), crate `hl-order`.
