@@ -704,3 +704,39 @@ pub fn run_interleaved(
     }
     Ok(reports)
 }
+
+/// What one round did besides measure.
+#[derive(Debug, Clone)]
+pub struct RoundLog {
+    /// The order the arms ran in.
+    pub order: Vec<Arm>,
+    /// `/proc/loadavg` just before the round.
+    pub load_before: String,
+    /// `/proc/loadavg` just after it.
+    pub load_after: String,
+}
+
+/// A whole run: per-arm results and a log of each round.
+#[derive(Debug)]
+pub struct Run {
+    /// The seed the arm orders came from.
+    pub seed: u64,
+    /// One merged report per arm, in the order the arms were asked for.
+    pub arms: Vec<ArmReport>,
+    /// One entry per round.
+    pub rounds: Vec<RoundLog>,
+}
+
+/// Stub.
+pub fn run_shuffled(
+    arms: &[Arm],
+    rounds: u32,
+    cfg: &RoundConfig,
+    seed: u64,
+) -> Result<Run, ReplayError> {
+    Ok(Run {
+        seed,
+        arms: run_interleaved(arms, rounds, cfg)?,
+        rounds: Vec::new(),
+    })
+}

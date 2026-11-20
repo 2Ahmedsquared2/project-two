@@ -124,6 +124,14 @@ impl LineBuf {
         &self.buf[self.last.0..self.last.1]
     }
 
+    /// Stub.
+    pub fn take_storage(&mut self) -> Result<(Box<[u8]>, usize), ReplayError> {
+        Err(ReplayError::LineTooLong { capacity: 0 })
+    }
+
+    /// Stub.
+    pub fn restore_storage(&mut self, _storage: Box<[u8]>, _filled: usize) {}
+
     /// Bytes buffered and not yet returned as a line.
     #[must_use]
     pub fn buffered(&self) -> usize {

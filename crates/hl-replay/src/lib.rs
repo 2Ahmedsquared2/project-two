@@ -38,7 +38,8 @@ mod stage;
 pub use hl_latency::Observation;
 
 pub use crate::arms::{
-    run_interleaved, run_round, Arm, ArmReport, RoundConfig, RoundOutcome, RoundResult,
+    run_interleaved, run_round, run_shuffled, Arm, ArmReport, RoundConfig, RoundLog, RoundOutcome,
+    RoundResult, Run,
 };
 pub use crate::clock::Clock;
 pub use crate::core::{BusyTick, Core, Hists, Polled, Step};

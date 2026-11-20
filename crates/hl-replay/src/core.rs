@@ -22,6 +22,9 @@ pub struct Hists {
     pub detect: LatencyHist,
     /// `t2 - feed`: the two above together, per line.
     pub total: LatencyHist,
+    /// `t2 - scheduled`: from when the line was due to be sent to bytes
+    /// handed to the socket. The headline for comparing arms.
+    pub sched_total: LatencyHist,
     /// Lines re-parsed by the strict parser off the timed path.
     pub validated: u64,
     /// Of those, lines a header-scan parser accepted and the strict parse
@@ -110,6 +113,12 @@ impl<H: Handle> Core<H> {
     #[must_use]
     pub fn with_strict_validation(mut self, every: u64) -> Self {
         self.validate_every = every;
+        self
+    }
+
+    /// Stub.
+    #[must_use]
+    pub fn with_schedule_stamps(self, _stamps: Arc<[AtomicU64]>) -> Self {
         self
     }
 
