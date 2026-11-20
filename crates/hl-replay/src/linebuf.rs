@@ -2,6 +2,8 @@
 
 use std::io::Read;
 
+use hl_latency::CompleteLine;
+
 use crate::ReplayError;
 
 /// A fixed-capacity byte buffer that yields complete `\n`-terminated lines.
@@ -100,9 +102,18 @@ impl LineBuf {
         Ok(n)
     }
 
+    /// The next complete line's bytes; see [`LineBuf::next_complete_line`].
+    pub fn next_line(&mut self) -> Option<&[u8]> {
+        self.next_complete_line().map(CompleteLine::as_bytes)
+    }
+
     /// The next complete line, without its newline, or `None` when only a
     /// partial line (or nothing) is buffered.
-    pub fn next_line(&mut self) -> Option<&[u8]> {
+    ///
+    /// This is the one place in the harness a [`CompleteLine`] is made, and
+    /// it is made only after the line's newline has been found in the
+    /// buffer, so the claim the type carries is true by construction.
+    pub fn next_complete_line(&mut self) -> Option<CompleteLine<'_>> {
         let from = self.scanned.max(self.start);
         let Some(i) = self.buf[from..self.end].iter().position(|&b| b == b'\n') else {
             self.scanned = self.end;
@@ -118,7 +129,7 @@ impl LineBuf {
             self.scanned = 0;
         }
         self.last = (a, b);
-        Some(&self.buf[a..b])
+        Some(CompleteLine::assume_newline_seen(&self.buf[a..b]))
     }
 
     /// The line [`LineBuf::next_line`] last returned, for as long as nothing

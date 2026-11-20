@@ -30,6 +30,8 @@ pub struct Hists {
     /// Of those, lines a header-scan parser accepted and the strict parse
     /// refused. Must be 0.
     pub scan_strict_mismatches: u64,
+    /// Lines a header-scan parser could not scan and parsed strictly.
+    pub scan_fallbacks: u64,
 }
 
 impl Hists {
@@ -42,6 +44,7 @@ impl Hists {
         self.sched_total.merge(&other.sched_total);
         self.validated += other.validated;
         self.scan_strict_mismatches += other.scan_strict_mismatches;
+        self.scan_fallbacks += other.scan_fallbacks;
     }
 }
 
@@ -168,7 +171,7 @@ impl<H: Handle> Core<H> {
     /// when the read that delivered it returned.
     #[inline]
     pub fn step(&mut self, t0_ns: u64) -> Result<Step, ReplayError> {
-        let Some(line) = self.lines.next_line() else {
+        let Some(line) = self.lines.next_complete_line() else {
             return Ok(Step::NoLine);
         };
         let outcome = self

@@ -8,9 +8,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use hl_replay::{
-    node_line, render_report, ActiveSigner, BusyTick, Clock, Core, HostInfo, LoopbackAddr,
-    Observation, Parser, ParserMode, Pipeline, Polled, ReplayError, RunMeta, Sink, Stage,
-    StageLabel, Step, StubBook, StubDecision,
+    node_line, render_report, ActiveSigner, BusyTick, Clock, CompleteLine, Core, HostInfo,
+    LoopbackAddr, Observation, Parser, ParserMode, Pipeline, Polled, ReplayError, RunMeta, Sink,
+    Stage, StageLabel, Step, StubBook, StubDecision,
 };
 
 /// A header-scan test double: reads the two header fields and nothing else,
@@ -27,7 +27,8 @@ impl Stage for CountingScan {
 }
 impl Parser for CountingScan {
     const MODE: ParserMode = ParserMode::HeaderScan;
-    fn parse(&mut self, line: &str, recv_ns: u64) -> Result<Observation, ReplayError> {
+    fn parse(&mut self, line: CompleteLine<'_>, recv_ns: u64) -> Result<Observation, ReplayError> {
+        let line = std::str::from_utf8(line.as_bytes()).unwrap();
         self.calls.set(self.calls.get() + 1);
         if !line.ends_with('}') {
             self.saw_partial.set(true);
@@ -161,19 +162,19 @@ fn the_report_says_what_was_checked_and_what_is_still_unmeasured() {
     };
     let text = render_report(&meta, &[]);
     assert!(
-        text.contains("scan-vs-strict: not applicable, the active parser is strict"),
+        text.contains("scan-vs-strict: every 16th line is re-parsed strictly after t2; any mismatch fails the run"),
         "{text}"
     );
     // So an older Value-parser run is never compared with a later one
     // unknowingly: the header names the parser and how complete lines are
     // enforced.
     assert!(
-        text.contains("parser: hl_latency::parse_node_line (strict)"),
+        text.contains("parser: hl_latency::scan_node_header, falling back to strict parse_node_line (header scan)"),
         "{text}"
     );
     assert!(
         text.contains(
-            "complete lines: by construction and debug_assert; CompleteLine type not used"
+            "complete lines: enforced by type (hl_latency::CompleteLine, made only where the reader has seen the newline)"
         ),
         "{text}"
     );

@@ -3,7 +3,7 @@
 //! Every stage is a trait with one implementation chosen at compile time:
 //! the pipeline is generic, so calls are statically dispatched and inlined.
 
-use hl_latency::Observation;
+use hl_latency::{CompleteLine, Observation};
 
 use crate::signer::PrototypeSigner;
 use crate::{Clock, ReplayError};
@@ -75,8 +75,15 @@ pub trait Parser: Stage {
     /// How much of the line this parser reads.
     const MODE: ParserMode = ParserMode::Strict;
 
-    /// Parses `line` (no trailing newline), stamped `recv_ns`.
-    fn parse(&mut self, line: &str, recv_ns: u64) -> Result<Observation, ReplayError>;
+    /// Parses `line`, stamped `recv_ns`. Taking a [`CompleteLine`] means a
+    /// parser cannot be handed a partial read.
+    fn parse(&mut self, line: CompleteLine<'_>, recv_ns: u64) -> Result<Observation, ReplayError>;
+
+    /// Lines a header-scan parser could not scan and parsed strictly
+    /// instead. Their timings are the strict parser's.
+    fn fallbacks(&self) -> u64 {
+        0
+    }
 }
 
 /// The best prices after a book update, in integer ticks.
@@ -139,8 +146,28 @@ impl Stage for NodeLineParser {
 
 impl Parser for NodeLineParser {
     #[inline]
-    fn parse(&mut self, line: &str, recv_ns: u64) -> Result<Observation, ReplayError> {
+    fn parse(&mut self, line: CompleteLine<'_>, recv_ns: u64) -> Result<Observation, ReplayError> {
+        let line = std::str::from_utf8(line.as_bytes()).map_err(|_| ReplayError::NotUtf8)?;
         Ok(hl_latency::parse_node_line(line, recv_ns)?)
+    }
+}
+
+/// Stub.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HeaderScanParser;
+
+impl Stage for HeaderScanParser {
+    const NAME: &'static str = "stub";
+    const LABEL: StageLabel = StageLabel::Stub;
+}
+
+impl Parser for HeaderScanParser {
+    fn parse(
+        &mut self,
+        _line: CompleteLine<'_>,
+        _recv_ns: u64,
+    ) -> Result<Observation, ReplayError> {
+        Err(ReplayError::Config("stub".to_owned()))
     }
 }
 
@@ -303,11 +330,16 @@ pub trait Handle {
     /// to send in it when the outcome says there is an order.
     fn on_line(
         &mut self,
-        line: &[u8],
+        line: CompleteLine<'_>,
         t0_ns: u64,
         clock: &Clock,
         out: &mut Vec<u8>,
     ) -> Result<LineOutcome, ReplayError>;
+
+    /// See [`Parser::fallbacks`].
+    fn scan_fallbacks(&self) -> u64 {
+        0
+    }
 }
 
 /// parser -> book -> decision -> signer, statically dispatched.
@@ -339,23 +371,12 @@ impl<P: Parser, B: Book, D: Decision, S: Signer> Handle for Pipeline<P, B, D, S>
     #[inline]
     fn on_line(
         &mut self,
-        line: &[u8],
+        line: CompleteLine<'_>,
         t0_ns: u64,
         clock: &Clock,
         out: &mut Vec<u8>,
     ) -> Result<LineOutcome, ReplayError> {
         out.clear();
-        // Complete lines only: a header scan can accept a line cut after a
-        // nested '}', so a parser must never see a partial one. Here that
-        // holds by construction (the only caller passes what
-        // `LineBuf::next_line` returned, which needs the newline) and this
-        // assert catches a slice that spans lines.
-        // TODO(PR #7): take `hl_latency::CompleteLine`, built in
-        // `LineBuf::next_line` at the point the newline is seen, once that
-        // type has landed; then this is enforced by the type, not asserted.
-        debug_assert!(!line.contains(&b'\n'), "parser handed more than one line");
-        // The UTF-8 check is part of parsing: the parser takes `&str`.
-        let line = std::str::from_utf8(line).map_err(|_| ReplayError::NotUtf8)?;
         let obs = self.parser.parse(line, t0_ns)?;
         let t1_ns = clock.now_ns();
         let top = self.book.apply(&obs);

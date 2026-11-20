@@ -2,9 +2,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use hl_replay::{
-    active_pipeline, node_line, stage_table, ActiveSigner, Book, Clock, Decision, Handle,
-    NodeLineParser, OrderIntent, Parser, Pipeline, PrototypeSigner, Signer, Stage, StageLabel,
-    StubBook, StubDecision, TopOfBook,
+    active_pipeline, node_line, stage_table, ActiveSigner, Book, Clock, CompleteLine, Decision,
+    Handle, HeaderScanParser, NodeLineParser, OrderIntent, Parser, ParserMode, Pipeline,
+    PrototypeSigner, Signer, Stage, StageLabel, StubBook, StubDecision, TopOfBook,
 };
 use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
 use secp256k1::{Message, Secp256k1};
@@ -40,7 +40,11 @@ fn every_stage_carries_its_honest_label() {
             ("send", StageLabel::Prototype),
         ]
     );
-    assert_eq!(t[1].name, "hl_latency::parse_node_line");
+    assert_eq!(
+        t[1].name,
+        "hl_latency::scan_node_header, falling back to strict parse_node_line"
+    );
+    assert_eq!(hl_replay::active_parser_mode(), ParserMode::HeaderScan);
     assert_eq!(StageLabel::Real.to_string(), "real");
     assert_eq!(StageLabel::Stub.to_string(), "stub");
     assert_eq!(StageLabel::Prototype.to_string(), "prototype");
@@ -52,9 +56,16 @@ fn every_stage_carries_its_honest_label() {
 fn the_real_parser_is_hl_latency_parse_node_line() {
     let l = line(676_607_012);
     let want = hl_latency::parse_node_line(&l, 9).unwrap();
-    assert_eq!(NodeLineParser.parse(&l, 9).unwrap(), want);
+    assert_eq!(
+        NodeLineParser
+            .parse(CompleteLine::assume_newline_seen(l.as_bytes()), 9)
+            .unwrap(),
+        want
+    );
     assert_eq!(want.block_number, Some(676_607_012));
-    assert!(NodeLineParser.parse("{not json", 9).is_err());
+    assert!(NodeLineParser
+        .parse(CompleteLine::assume_newline_seen(b"{not json"), 9)
+        .is_err());
 }
 
 #[test]
@@ -181,7 +192,12 @@ fn the_pipeline_turns_a_line_into_one_signed_order_and_stamps_t1() {
     let mut out = Vec::new();
     let t0 = clock.now_ns();
     let r = p
-        .on_line(line(42).as_bytes(), t0, &clock, &mut out)
+        .on_line(
+            CompleteLine::assume_newline_seen(line(42).as_bytes()),
+            t0,
+            &clock,
+            &mut out,
+        )
         .unwrap();
     assert!(r.order);
     assert!(r.t1_ns >= t0);
@@ -189,8 +205,13 @@ fn the_pipeline_turns_a_line_into_one_signed_order_and_stamps_t1() {
     let body: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert!(body["signature"]["r"].is_string());
     // The buffer is cleared per line: one order, not an ever-growing batch.
-    p.on_line(line(43).as_bytes(), t0, &clock, &mut out)
-        .unwrap();
+    p.on_line(
+        CompleteLine::assume_newline_seen(line(43).as_bytes()),
+        t0,
+        &clock,
+        &mut out,
+    )
+    .unwrap();
     assert_eq!(String::from_utf8_lossy(&out).lines().count(), 1);
 }
 
@@ -200,9 +221,21 @@ fn bad_input_is_an_error_not_a_skipped_sample() {
     let mut p = active_pipeline();
     let mut out = Vec::new();
     assert!(p
-        .on_line(b"{\"block_number\":1}", 0, &clock, &mut out)
+        .on_line(
+            CompleteLine::assume_newline_seen(b"{\"block_number\":1}"),
+            0,
+            &clock,
+            &mut out
+        )
         .is_err());
-    assert!(p.on_line(&[0xff, 0xfe, b'{'], 0, &clock, &mut out).is_err());
+    assert!(p
+        .on_line(
+            CompleteLine::assume_newline_seen(&[0xff, 0xfe, b'{']),
+            0,
+            &clock,
+            &mut out
+        )
+        .is_err());
 }
 
 /// Swapping a stage is a type change, nothing else: this is what the real
@@ -235,9 +268,14 @@ fn any_stage_can_be_swapped_by_type() {
     );
     let mut out = Vec::new();
     assert!(
-        p.on_line(line(1).as_bytes(), 0, &clock, &mut out)
-            .unwrap()
-            .order
+        p.on_line(
+            CompleteLine::assume_newline_seen(line(1).as_bytes()),
+            0,
+            &clock,
+            &mut out
+        )
+        .unwrap()
+        .order
     );
     assert_eq!(out.len(), 9);
 }
@@ -251,4 +289,39 @@ fn the_clock_is_monotonic_nanoseconds() {
     assert!(b - a >= 2_000_000, "{a} {b}");
     let copy = c;
     assert!(copy.now_ns() >= b, "copies share the epoch");
+}
+
+#[test]
+fn the_header_scan_agrees_with_the_strict_parse_and_falls_back_when_it_cannot_scan() {
+    let mut p = HeaderScanParser::default();
+    let l = line(676_607_012);
+    let want = hl_latency::parse_node_line(&l, 9).unwrap();
+    assert_eq!(
+        p.parse(CompleteLine::assume_newline_seen(l.as_bytes()), 9)
+            .unwrap(),
+        want
+    );
+    assert_eq!(
+        p.fallbacks(),
+        0,
+        "a node line as hl-node writes it is scanned"
+    );
+    // Valid JSON the scan does not recognise (leading space): strict answers.
+    let spaced = format!(" {l}");
+    let got = p
+        .parse(CompleteLine::assume_newline_seen(spaced.as_bytes()), 9)
+        .unwrap();
+    assert_eq!(got, want);
+    assert_eq!(p.fallbacks(), 1);
+    // Neither can read it: an error, counted as a fallback too.
+    assert!(p
+        .parse(CompleteLine::assume_newline_seen(b"{not json"), 9)
+        .is_err());
+    assert!(p
+        .parse(CompleteLine::assume_newline_seen(&[0xff, b'{']), 9)
+        .is_err());
+    assert_eq!(p.fallbacks(), 3);
+    assert_eq!(<HeaderScanParser as Parser>::MODE, ParserMode::HeaderScan);
+    assert_eq!(<HeaderScanParser as Stage>::LABEL, StageLabel::Real);
+    assert_eq!(<NodeLineParser as Parser>::MODE, ParserMode::Strict);
 }

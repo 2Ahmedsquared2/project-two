@@ -35,7 +35,7 @@ mod signer;
 mod sink;
 mod stage;
 
-pub use hl_latency::Observation;
+pub use hl_latency::{CompleteLine, Observation};
 
 pub use crate::arms::{
     run_interleaved, run_round, run_shuffled, Arm, ArmReport, RoundConfig, RoundLog, RoundOutcome,
@@ -52,7 +52,7 @@ pub use crate::signer::PrototypeSigner;
 pub use crate::sink::{loopback_pair, LoopbackAddr, Sink, SinkStats};
 pub use crate::stage::{
     active_parser_mode, active_pipeline, stage_table, ActiveBook, ActiveDecision, ActiveParser,
-    ActivePipeline, ActiveSigner, Book, Decision, Handle, LineOutcome, NodeLineParser, OrderIntent,
-    Parser, ParserMode, Pipeline, Signer, Stage, StageInfo, StageLabel, StubBook, StubDecision,
-    TopOfBook,
+    ActivePipeline, ActiveSigner, Book, Decision, Handle, HeaderScanParser, LineOutcome,
+    NodeLineParser, OrderIntent, Parser, ParserMode, Pipeline, Signer, Stage, StageInfo,
+    StageLabel, StubBook, StubDecision, TopOfBook,
 };
