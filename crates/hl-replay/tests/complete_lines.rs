@@ -164,6 +164,17 @@ fn the_report_says_what_was_checked_and_what_is_still_unmeasured() {
         text.contains("scan-vs-strict: not applicable, the active parser is strict"),
         "{text}"
     );
+    // So an older Value-parser run is never compared with a later one
+    // unknowingly: the header names the parser and how complete lines are
+    // enforced.
+    assert!(
+        text.contains("parser: hl_latency::parse_node_line (strict)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("complete lines: by construction and debug_assert; CompleteLine type not used"),
+        "{text}"
+    );
     assert!(
         text.contains("unmeasured: last-byte cache miss on real ~100 KB lines"),
         "{text}"
