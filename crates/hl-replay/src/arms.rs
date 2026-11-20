@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::core::{BusyTick, Core, Hists, Polled, Step};
 use crate::sink::{ensure_loopback_peer, loopback_pair, LoopbackAddr, Sink, SinkStats};
@@ -297,6 +297,7 @@ fn compio_arm(
     total: u64,
     ready: &SyncSender<Ready>,
 ) -> Result<Option<Hists>, ReplayError> {
+    use compio::buf::{IntoInner, IoBuf};
     use compio::driver::{DriverType, ProactorBuilder};
     use compio::io::{AsyncRead, AsyncWriteExt};
     use compio::BufResult;
@@ -327,20 +328,26 @@ fn compio_arm(
         ensure_loopback_peer(sink.peer_addr())?;
         let mut source = compio::net::TcpStream::from_std(source)?;
         let mut sink = compio::net::TcpStream::from_std(sink)?;
-        // io_uring reads fill a buffer the kernel owns for the duration, so
-        // this arm reads into its own buffer and copies into the line reader:
-        // one extra memcpy per read that the other arms do not pay.
-        let mut chunk: Vec<u8> = Vec::with_capacity(core.line_capacity() / 2);
         let _ = ready.send(Ready::Go);
         while core.lines_seen() < total {
-            let BufResult(read, buf) = source.read(chunk).await;
-            chunk = buf;
-            let n = read?;
+            // An io_uring read must own its buffer for the duration, so the
+            // reader lends its storage and the kernel fills it in place: the
+            // same single copy (kernel to reader) every other arm makes.
+            let (storage, at) = core.take_reader()?;
+            let BufResult(read, filled) = source.read(storage.slice(at..)).await;
+            let storage = filled.into_inner();
+            let n = match read {
+                Ok(n) => n,
+                Err(e) => {
+                    core.restore_reader(storage, 0);
+                    return Err(e.into());
+                }
+            };
+            core.restore_reader(storage, n);
             if n == 0 {
                 return Err(closed(&core, total));
             }
             let t0 = core.clock().now_ns();
-            core.push(&chunk[..n])?;
             loop {
                 match core.step(t0)? {
                     Step::NoLine => break,
@@ -413,41 +420,64 @@ fn hot_main(
     Ok((hists, pinned))
 }
 
-/// The open-loop feeder: one line every `interval`, stamped just before the
-/// write. Sleeps while the next line is far off and spins the last stretch,
-/// so the schedule is not at the mercy of timer slack.
+/// The open-loop feeder. Line `i` is due at `start + (i + 1) * interval` on
+/// the run's clock, whatever happened to the lines before it: a feeder that
+/// falls behind sends late lines at once rather than pushing the schedule
+/// back. Each line gets two stamps before its write: when it was due
+/// (`scheduled`) and when the write actually began (`actual`). Sleeps while
+/// the next line is far off and spins the last stretch, so the schedule is
+/// not at the mercy of timer slack.
 fn feed<W: Write>(
     mut sink: W,
     lines: &[String],
     interval: Duration,
     clock: Clock,
-    stamps: &[AtomicU64],
+    stamps: &FeedStamps,
     core: Option<usize>,
 ) -> Result<W, ReplayError> {
-    const SPIN: Duration = Duration::from_micros(200);
+    const SPIN_NS: u64 = 200_000;
     pin(core);
-    let mut next = Instant::now();
-    for (line, stamp) in lines.iter().cycle().zip(stamps) {
-        next += interval;
-        loop {
-            let now = Instant::now();
-            let Some(left) = next.checked_duration_since(now).filter(|d| !d.is_zero()) else {
-                // Behind schedule (we were descheduled): do not burst to catch up.
-                if now.duration_since(next) > interval {
-                    next = now;
-                }
-                break;
-            };
-            if left > SPIN {
-                std::thread::sleep(left.checked_sub(SPIN / 2).unwrap_or_default());
+    let interval_ns = u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX);
+    let mut due = clock.now_ns();
+    for ((line, scheduled), actual) in lines
+        .iter()
+        .cycle()
+        .zip(stamps.scheduled.iter())
+        .zip(stamps.actual.iter())
+    {
+        due = due.saturating_add(interval_ns);
+        let now = loop {
+            let now = clock.now_ns();
+            if now >= due {
+                break now;
+            }
+            if due - now > SPIN_NS {
+                std::thread::sleep(Duration::from_nanos(due - now - SPIN_NS / 2));
             } else {
                 std::hint::spin_loop();
             }
-        }
-        stamp.store(clock.now_ns(), Ordering::Relaxed);
+        };
+        scheduled.store(due, Ordering::Relaxed);
+        actual.store(now, Ordering::Relaxed);
         sink.write_all(line.as_bytes())?;
     }
     Ok(sink)
+}
+
+/// The feeder's two stamps per line, shared with the hot thread.
+struct FeedStamps {
+    scheduled: Arc<[AtomicU64]>,
+    actual: Arc<[AtomicU64]>,
+}
+
+impl FeedStamps {
+    fn new(lines: usize) -> Self {
+        let zeros = || (0..lines).map(|_| AtomicU64::new(0)).collect();
+        Self {
+            scheduled: zeros(),
+            actual: zeros(),
+        }
+    }
 }
 
 fn join<T>(h: std::thread::JoinHandle<T>, what: &str) -> Result<T, ReplayError> {
@@ -522,11 +552,12 @@ pub fn run_round(arm: Arm, cfg: &RoundConfig) -> Result<RoundOutcome, ReplayErro
     let line_capacity = longest.saturating_mul(2).max(64 * 1024);
 
     let clock = Clock::new();
-    let stamps: Arc<[AtomicU64]> = (0..total_lines).map(|_| AtomicU64::new(0)).collect();
+    let stamps = Arc::new(FeedStamps::new(total_lines));
     let sink = Sink::spawn_on(cfg.sink_bind, cfg.feeder_core)?;
     let sink_stream = sink.connect()?;
     let core = Core::new(active_pipeline(), clock, cfg.warmup, line_capacity)
-        .with_feed_stamps(Arc::clone(&stamps))
+        .with_feed_stamps(Arc::clone(&stamps.actual))
+        .with_schedule_stamps(Arc::clone(&stamps.scheduled))
         .with_strict_validation(match active_parser_mode() {
             // The strict parser is its own validator.
             ParserMode::Strict => 0,
@@ -666,43 +697,17 @@ pub struct ArmReport {
     pub unavailable: Option<String>,
 }
 
-/// Runs `rounds` rounds, each going through `arms` in order, so every arm
-/// sees the same machine under the same load: round 1 of every arm, then
-/// round 2 of every arm, and so on. An arm that is unavailable is skipped
-/// from then on and reported as such.
+/// Runs `rounds` rounds, each going through `arms` in the order given, so
+/// every arm sees the same machine under the same load: round 1 of every arm,
+/// then round 2 of every arm, and so on. An arm that is unavailable is
+/// skipped from then on and reported as such. [`run_shuffled`] is the same
+/// with a random order per round, and is what the binary uses.
 pub fn run_interleaved(
     arms: &[Arm],
     rounds: u32,
     cfg: &RoundConfig,
 ) -> Result<Vec<ArmReport>, ReplayError> {
-    let mut reports: Vec<ArmReport> = arms
-        .iter()
-        .map(|&arm| ArmReport {
-            arm,
-            rounds_run: 0,
-            hists: Hists::default(),
-            orders: 0,
-            hot_pinned: None,
-            unavailable: None,
-        })
-        .collect();
-    for _ in 0..rounds {
-        for report in &mut reports {
-            if report.unavailable.is_some() {
-                continue;
-            }
-            match run_round(report.arm, cfg)? {
-                RoundOutcome::Ran(r) => {
-                    report.rounds_run += 1;
-                    report.hists.merge(&r.hists);
-                    report.orders += r.sink.orders;
-                    report.hot_pinned = r.hot_pinned;
-                }
-                RoundOutcome::Unavailable(why) => report.unavailable = Some(why),
-            }
-        }
-    }
-    Ok(reports)
+    Ok(run_rounds(arms, rounds, cfg, None)?.arms)
 }
 
 /// What one round did besides measure.
@@ -710,7 +715,8 @@ pub fn run_interleaved(
 pub struct RoundLog {
     /// The order the arms ran in.
     pub order: Vec<Arm>,
-    /// `/proc/loadavg` just before the round.
+    /// `/proc/loadavg` just before the round: the 1, 5 and 15 minute load,
+    /// then runnable/total scheduling entities. Kept as the kernel printed it.
     pub load_before: String,
     /// `/proc/loadavg` just after it.
     pub load_after: String,
@@ -727,16 +733,87 @@ pub struct Run {
     pub rounds: Vec<RoundLog>,
 }
 
-/// Stub.
+/// Like [`run_interleaved`], but every round runs the arms in its own random
+/// order drawn from `seed`, so no arm always follows the same neighbour or
+/// always runs first on a cold machine. The same seed gives the same orders.
+/// The machine's load is read before and after each round.
 pub fn run_shuffled(
     arms: &[Arm],
     rounds: u32,
     cfg: &RoundConfig,
     seed: u64,
 ) -> Result<Run, ReplayError> {
+    run_rounds(arms, rounds, cfg, Some(seed))
+}
+
+fn loadavg() -> String {
+    std::fs::read_to_string("/proc/loadavg")
+        .map_or_else(|_| "unavailable".to_owned(), |s| s.trim().to_owned())
+}
+
+/// `SplitMix64`: small, seedable and good enough to shuffle a handful of arms.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn run_rounds(
+    arms: &[Arm],
+    rounds: u32,
+    cfg: &RoundConfig,
+    seed: Option<u64>,
+) -> Result<Run, ReplayError> {
+    let mut reports: Vec<ArmReport> = arms
+        .iter()
+        .map(|&arm| ArmReport {
+            arm,
+            rounds_run: 0,
+            hists: Hists::default(),
+            orders: 0,
+            hot_pinned: None,
+            unavailable: None,
+        })
+        .collect();
+    let mut rng = seed.unwrap_or(0);
+    let mut logs = Vec::new();
+    for _ in 0..rounds {
+        let mut order: Vec<usize> = (0..reports.len()).collect();
+        if seed.is_some() {
+            // Fisher-Yates.
+            for i in (1..order.len()).rev() {
+                let bound = u64::try_from(i + 1).unwrap_or(u64::MAX);
+                let j = usize::try_from(splitmix64(&mut rng) % bound).unwrap_or(0);
+                order.swap(i, j);
+            }
+        }
+        let load_before = loadavg();
+        for &i in &order {
+            let report = &mut reports[i];
+            if report.unavailable.is_some() {
+                continue;
+            }
+            match run_round(report.arm, cfg)? {
+                RoundOutcome::Ran(r) => {
+                    report.rounds_run += 1;
+                    report.hists.merge(&r.hists);
+                    report.orders += r.sink.orders;
+                    report.hot_pinned = r.hot_pinned;
+                }
+                RoundOutcome::Unavailable(why) => report.unavailable = Some(why),
+            }
+        }
+        logs.push(RoundLog {
+            order: order.iter().map(|&i| reports[i].arm).collect(),
+            load_before,
+            load_after: loadavg(),
+        });
+    }
     Ok(Run {
-        seed,
-        arms: run_interleaved(arms, rounds, cfg)?,
-        rounds: Vec::new(),
+        seed: seed.unwrap_or(0),
+        arms: reports,
+        rounds: logs,
     })
 }

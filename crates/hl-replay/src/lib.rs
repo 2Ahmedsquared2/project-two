@@ -47,7 +47,7 @@ pub use crate::error::ReplayError;
 pub use crate::hist::{LatencyHist, Summary, HIST_MAX_NS};
 pub use crate::input::{generated_lines, load_lines, node_line};
 pub use crate::linebuf::LineBuf;
-pub use crate::report::{render_report, write_artifacts, HostInfo, RunMeta, GIT_SHA};
+pub use crate::report::{render_report, render_run, write_artifacts, HostInfo, RunMeta, GIT_SHA};
 pub use crate::signer::PrototypeSigner;
 pub use crate::sink::{loopback_pair, LoopbackAddr, Sink, SinkStats};
 pub use crate::stage::{

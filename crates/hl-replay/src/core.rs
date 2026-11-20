@@ -39,6 +39,7 @@ impl Hists {
         self.e2e.merge(&other.e2e);
         self.detect.merge(&other.detect);
         self.total.merge(&other.total);
+        self.sched_total.merge(&other.sched_total);
         self.validated += other.validated;
         self.scan_strict_mismatches += other.scan_strict_mismatches;
     }
@@ -70,6 +71,7 @@ pub struct Core<H> {
     out: Vec<u8>,
     hists: Hists,
     feed_stamps: Option<Arc<[AtomicU64]>>,
+    schedule_stamps: Option<Arc<[AtomicU64]>>,
     t0: u64,
     t1: u64,
     validate_every: u64,
@@ -89,6 +91,7 @@ impl<H: Handle> Core<H> {
             out: Vec::with_capacity(1024),
             hists: Hists::default(),
             feed_stamps: None,
+            schedule_stamps: None,
             t0: 0,
             t1: 0,
             validate_every: 0,
@@ -116,10 +119,24 @@ impl<H: Handle> Core<H> {
         self
     }
 
-    /// Stub.
+    /// Gives the core the time each line was *scheduled* to be sent (index
+    /// = line number), so it can record [`Hists::sched_total`]. Measuring
+    /// from the schedule rather than from the write keeps a late feeder's
+    /// delay in the numbers (no coordinated omission).
     #[must_use]
-    pub fn with_schedule_stamps(self, _stamps: Arc<[AtomicU64]>) -> Self {
+    pub fn with_schedule_stamps(mut self, stamps: Arc<[AtomicU64]>) -> Self {
+        self.schedule_stamps = Some(stamps);
         self
+    }
+
+    /// Lends the reader's storage; see [`LineBuf::take_storage`].
+    pub fn take_reader(&mut self) -> Result<(Box<[u8]>, usize), ReplayError> {
+        self.lines.take_storage()
+    }
+
+    /// Returns the reader's storage; see [`LineBuf::restore_storage`].
+    pub fn restore_reader(&mut self, storage: Box<[u8]>, filled: usize) {
+        self.lines.restore_storage(storage, filled);
     }
 
     /// The run's clock.
@@ -142,8 +159,7 @@ impl<H: Handle> Core<H> {
         self.lines.advance(n);
     }
 
-    /// Copies bytes into the reader buffer, for engines whose reads fill an
-    /// owned buffer (`io_uring`).
+    /// Copies bytes into the reader buffer.
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), ReplayError> {
         self.lines.push(bytes)
     }
@@ -200,14 +216,18 @@ impl<H: Handle> Core<H> {
         }
         self.hists.parse.record(self.t1.saturating_sub(self.t0));
         self.hists.e2e.record(t2.saturating_sub(self.t0));
-        let fed = self
-            .feed_stamps
-            .as_ref()
-            .and_then(|s| s.get(usize::try_from(index).ok()?))
-            .map(|a| a.load(Ordering::Relaxed));
-        if let Some(fed) = fed {
+        let stamp = |stamps: &Option<Arc<[AtomicU64]>>| {
+            stamps
+                .as_ref()
+                .and_then(|s| s.get(usize::try_from(index).ok()?))
+                .map(|a| a.load(Ordering::Relaxed))
+        };
+        if let Some(fed) = stamp(&self.feed_stamps) {
             self.hists.detect.record(self.t0.saturating_sub(fed));
             self.hists.total.record(t2.saturating_sub(fed));
+        }
+        if let Some(due) = stamp(&self.schedule_stamps) {
+            self.hists.sched_total.record(t2.saturating_sub(due));
         }
     }
 

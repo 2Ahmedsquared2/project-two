@@ -6,7 +6,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::arms::ArmReport;
+use crate::arms::{ArmReport, Run};
 use crate::stage::{active_parser_mode, stage_table, ParserMode};
 use crate::{LatencyHist, ReplayError};
 
@@ -72,9 +72,10 @@ pub struct RunMeta {
     pub input: String,
 }
 
-/// The four metrics of an arm: file-name-safe label and histogram.
-fn metrics(a: &ArmReport) -> [(&'static str, &LatencyHist); 4] {
+/// The five metrics of an arm, headline first: file-name-safe label and histogram.
+fn metrics(a: &ArmReport) -> [(&'static str, &LatencyHist); 5] {
     [
+        ("sched-t2", &a.hists.sched_total),
         ("t2-t0", &a.hists.e2e),
         ("t1-t0", &a.hists.parse),
         ("feed-t0", &a.hists.detect),
@@ -123,12 +124,23 @@ pub fn render_report(meta: &RunMeta, arms: &[ArmReport]) -> String {
         s,
         "clock: one monotonic clock (std::time::Instant) for every stamp"
     );
-    let _ = writeln!(s, "  feed = feeder, just before it writes the line");
+    let _ = writeln!(
+        s,
+        "  sched = when the line was due: start + i * interval (a late feeder stays in the number)"
+    );
+    let _ = writeln!(
+        s,
+        "  feed  = feeder, just before it actually writes the line"
+    );
     let _ = writeln!(s, "  t0   = hot thread, read() returned the line's bytes");
     let _ = writeln!(s, "  t1   = parser returned");
     let _ = writeln!(
         s,
         "  t2   = write of the signed order to the sink socket returned"
+    );
+    let _ = writeln!(
+        s,
+        "headline: sched-t2 (includes the wake-up, which is what the arms differ on); feed-t2 beside it shows how much is the feeder's own lateness; t2-t0 is in-process; feed-t0 is detection"
     );
     let _ = writeln!(s, "unit: nanoseconds; rounds are merged histograms");
     match active_parser_mode() {
@@ -150,6 +162,12 @@ pub fn render_report(meta: &RunMeta, arms: &[ArmReport]) -> String {
         "unmeasured: last-byte cache miss on real ~100 KB lines (needs the Tokyo run on real node lines)"
     );
     let _ = writeln!(s);
+    render_rows(&mut s, arms);
+    s
+}
+
+/// One row per arm and metric, or the reason an arm could not run.
+fn render_rows(s: &mut String, arms: &[ArmReport]) {
     for a in arms {
         if let Some(why) = &a.unavailable {
             let _ = writeln!(s, "{:<21} unavailable: {why}", a.arm.name());
@@ -186,6 +204,27 @@ pub fn render_report(meta: &RunMeta, arms: &[ArmReport]) -> String {
                 a.hists.scan_strict_mismatches
             );
         }
+    }
+}
+
+/// [`render_report`] followed by the run's seed and, per round, the order the
+/// arms ran in and the kernel load figures before and after (1, 5 and 15 minute,
+/// then runnable/total), so a noisy round can be told from a quiet one.
+#[must_use]
+pub fn render_run(meta: &RunMeta, run: &Run) -> String {
+    let mut s = render_report(meta, &run.arms);
+    let _ = writeln!(s);
+    let _ = writeln!(s, "seed: {} (arm order per round)", run.seed);
+    for (i, r) in run.rounds.iter().enumerate() {
+        let order: Vec<&str> = r.order.iter().map(|a| a.name()).collect();
+        let _ = writeln!(
+            s,
+            "round {} order: {} | load before: {} | load after: {}",
+            i + 1,
+            order.join(", "),
+            r.load_before,
+            r.load_after
+        );
     }
     s
 }

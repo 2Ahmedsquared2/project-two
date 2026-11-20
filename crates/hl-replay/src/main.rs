@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hl_replay::{
-    generated_lines, load_lines, render_report, run_interleaved, write_artifacts, Arm, HostInfo,
+    generated_lines, load_lines, render_run, run_shuffled, write_artifacts, Arm, HostInfo,
     LoopbackAddr, RoundConfig, RunMeta, GIT_SHA,
 };
 
@@ -22,7 +22,9 @@ loopback socket (t2), per arm, rounds interleaved.
                               compio compio-sqpoll
                      detect:  file-busy-poll file-poll-10us file-poll-100us
                               file-inotify
-  --rounds N         rounds per arm, interleaved (default 5)
+  --rounds N         rounds per arm, interleaved, each round in its own
+                     random arm order (default 5)
+  --seed N           seed for the arm orders (default: from the clock)
   --lines N          lines per round, warmup included (default 11000)
   --warmup N         lines per round not recorded (default 1000)
   --interval-us N    microseconds between lines, open loop (default 1000)
@@ -52,6 +54,7 @@ struct Args {
     tail_dir: PathBuf,
     sink_bind: LoopbackAddr,
     out: Option<PathBuf>,
+    seed: u64,
 }
 
 fn parse_arms(list: &str) -> Result<Vec<Arm>, String> {
@@ -95,6 +98,9 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
         tail_dir: PathBuf::from("/dev/shm"),
         sink_bind: LoopbackAddr::ephemeral(),
         out: None,
+        seed: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::from(d.subsec_nanos())),
     };
     let mut no_pin = false;
     let mut it = argv.iter();
@@ -122,6 +128,7 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
             "--tail-dir",
             "--sink-bind",
             "--out",
+            "--seed",
         ];
         if !known.contains(&flag) {
             return Err(format!("unknown option {flag:?}"));
@@ -130,6 +137,7 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
         match flag {
             "--arms" => a.arms = parse_arms(v)?,
             "--rounds" => a.rounds = num(flag, v)?,
+            "--seed" => a.seed = num(flag, v)?,
             "--lines" => a.lines = num(flag, v)?,
             "--warmup" => a.warmup = num(flag, v)?,
             "--interval-us" => a.interval_us = num(flag, v)?,
@@ -206,7 +214,7 @@ fn main() -> ExitCode {
         tail_dir: args.tail_dir,
         sink_bind: args.sink_bind,
     };
-    let reports = match run_interleaved(&args.arms, args.rounds, &cfg) {
+    let run = match run_shuffled(&args.arms, args.rounds, &cfg, args.seed) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("hl-replay: {e}");
@@ -224,10 +232,10 @@ fn main() -> ExitCode {
         interval: cfg.interval,
         input,
     };
-    let report = render_report(&meta, &reports);
+    let report = render_run(&meta, &run);
     print!("{report}");
     if let Some(dir) = &args.out {
-        if let Err(e) = write_artifacts(dir, &report, &reports) {
+        if let Err(e) = write_artifacts(dir, &report, &run.arms) {
             eprintln!("hl-replay: --out: {e}");
             return ExitCode::FAILURE;
         }

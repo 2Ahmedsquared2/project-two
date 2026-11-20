@@ -147,8 +147,8 @@ fn each_round_runs_the_arms_in_its_own_seeded_random_order() {
         Arm::FileBusyPoll,
         Arm::FilePoll10us,
     ];
-    let run = run_shuffled(&arms, 6, &cfg("shuffle", 40, 10), 0xC0FFEE).unwrap();
-    assert_eq!(run.seed, 0xC0FFEE);
+    let run = run_shuffled(&arms, 6, &cfg("shuffle", 40, 10), 0x00C0_FFEE).unwrap();
+    assert_eq!(run.seed, 0x00C0_FFEE);
     assert_eq!(run.rounds.len(), 6);
     // Results come back in the order asked for, whatever order they ran in.
     assert_eq!(run.arms.iter().map(|a| a.arm).collect::<Vec<_>>(), arms);
@@ -174,7 +174,7 @@ fn each_round_runs_the_arms_in_its_own_seeded_random_order() {
         distinct.len() >= 3,
         "6 rounds of 4 arms, all in one order: not shuffled"
     );
-    let again = run_shuffled(&arms, 6, &cfg("shuffle2", 40, 10), 0xC0FFEE).unwrap();
+    let again = run_shuffled(&arms, 6, &cfg("shuffle2", 40, 10), 0x00C0_FFEE).unwrap();
     let orders = |r: &hl_replay::Run| r.rounds.iter().map(|x| x.order.clone()).collect::<Vec<_>>();
     assert_eq!(orders(&run), orders(&again), "same seed, same order");
     let other = run_shuffled(&arms, 6, &cfg("shuffle3", 40, 10), 1).unwrap();
@@ -214,8 +214,8 @@ fn the_cli_reports_seed_round_orders_load_and_the_headline_first() {
         "seed: 42",
         "round 1 order: ",
         "round 3 order: ",
-        "loadavg before: ",
-        "loadavg after: ",
+        "load before: ",
+        "load after: ",
     ] {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }

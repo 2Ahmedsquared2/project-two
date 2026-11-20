@@ -9,17 +9,24 @@ feeder --> reader --> parser --> book --> decision --> signer --> send --> loopb
 
 | Stamp | Taken when |
 |---|---|
-| `feed` | the feeder, just before it writes the line (open loop: one line every `--interval-us`, never waiting for an answer) |
+| `sched` | when the line was due: start + i x interval. The feeder is open loop: it never waits for an answer, and a late line is sent at once without moving the schedule |
+| `feed` | the feeder, just before it actually writes the line |
 | `t0` | the hot thread's `read` returned the line's bytes (line seen) |
 | `t1` | the parser returned |
 | `t2` | the write of the signed order to the sink socket returned (bytes handed to the socket) |
 
-Four HDR histograms per arm, nanoseconds, 3 significant digits, 1 ns to 60 s:
-`t2-t0` (the headline), `t1-t0`, `feed-t0` and `feed-t2`. `feed-t0` is where
-the arms differ most: it holds the runtime's or the file poller's wake-up
-delay, which `t2-t0` by definition does not. The report prints the sample
-count, p50, p90, p99, p99.9, p99.99 and max. It prints no mean. Rounds are
-merged histograms, never averaged percentiles.
+Five HDR histograms per arm, nanoseconds, 3 significant digits, 1 ns to 60 s:
+
+| Metric | Meaning |
+|---|---|
+| `sched-t2` | **the headline for comparing arms.** Due time to bytes handed to the socket. Includes the wake-up delay, which is what the arms differ on, and keeps a late feeder in the number (no coordinated omission) |
+| `feed-t2` | the same from the actual write. `sched-t2` minus this is the feeder's own lateness |
+| `feed-t0` | detection: actual write to line seen |
+| `t2-t0` | in-process: line seen to bytes handed to the socket |
+| `t1-t0` | line seen to parsed |
+
+The report prints the sample count, p50, p90, p99, p99.9, p99.99 and max, and
+no mean. Rounds are merged histograms, never averaged percentiles.
 
 ## Rerun on the Tokyo host
 
@@ -65,8 +72,14 @@ Detect arms (`--arms detect`): lines are appended to a file in `--tail-dir`
 | `file-poll-100us` | sleep 100 µs |
 | `file-inotify` | sleep on inotify `IN_MODIFY` |
 
-A round runs every arm once; `--rounds N` repeats that, so arm A's round 2
-comes after arm B's round 1 on the same machine under the same load. If
+A round runs every arm once, in a random order of its own drawn from
+`--seed` (printed, so a run can be repeated in the same order). The report
+ends with each round's order and the kernel's load figures before and after
+it (1, 5 and 15 minute load, runnable/total), so a noisy round can be told
+from a quiet one. Before trusting busy-poll tails on the Tokyo host, check
+that the feeder and hot cores have nothing else on them. Every arm reads
+straight into the reader's buffer, the `io_uring` arms included (the reader
+lends its storage for the read). If
 `io_uring` cannot be set up (seccomp, container policy, old kernel) the two
 compio arms print `unavailable: <reason>` and the run carries on.
 

@@ -12,13 +12,17 @@ use crate::ReplayError;
 /// [`LineBuf::next_line`].
 #[derive(Debug)]
 pub struct LineBuf {
-    buf: Vec<u8>,
+    buf: Box<[u8]>,
+    /// The storage's size; `buf` is empty while the storage is lent out.
+    cap: usize,
     start: usize,
     end: usize,
     /// Bytes in `start..scanned` are known to hold no newline.
     scanned: usize,
     /// Where the line last returned by `next_line` sits in `buf`.
     last: (usize, usize),
+    /// `(end, scanned)` saved while the storage is lent out.
+    lent: (usize, usize),
 }
 
 impl LineBuf {
@@ -26,11 +30,13 @@ impl LineBuf {
     #[must_use]
     pub fn with_capacity(cap: usize) -> Self {
         Self {
-            buf: vec![0; cap],
+            buf: vec![0; cap].into_boxed_slice(),
+            cap,
             start: 0,
             end: 0,
             scanned: 0,
             last: (0, 0),
+            lent: (0, 0),
         }
     }
 
@@ -51,9 +57,7 @@ impl LineBuf {
             self.last = (0, 0);
         }
         if self.end == self.buf.len() {
-            return Err(ReplayError::LineTooLong {
-                capacity: self.buf.len(),
-            });
+            return Err(ReplayError::LineTooLong { capacity: self.cap });
         }
         Ok(&mut self.buf[self.end..])
     }
@@ -71,7 +75,7 @@ impl LineBuf {
     ///
     /// [`ReplayError::LineTooLong`] when they do not fit; nothing is copied.
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), ReplayError> {
-        let capacity = self.buf.len();
+        let capacity = self.cap;
         if bytes.is_empty() {
             return Ok(());
         }
@@ -124,13 +128,34 @@ impl LineBuf {
         &self.buf[self.last.0..self.last.1]
     }
 
-    /// Stub.
+    /// Lends the storage out, for a runtime whose reads must own their
+    /// buffer (`io_uring`). Returns it with the offset to read at: fill
+    /// `storage[offset..]`, then give it back with
+    /// [`LineBuf::restore_storage`]. Until then the reader is empty and
+    /// refuses input. No allocation and no copy beyond moving a pending
+    /// partial line to the front, as [`LineBuf::spare_mut`] does.
+    ///
+    /// # Errors
+    ///
+    /// [`ReplayError::LineTooLong`] when the buffer is full of one
+    /// unfinished line (or is already lent).
     pub fn take_storage(&mut self) -> Result<(Box<[u8]>, usize), ReplayError> {
-        Err(ReplayError::LineTooLong { capacity: 0 })
+        self.spare_mut()?;
+        self.lent = (self.end, self.scanned);
+        self.end = 0;
+        self.scanned = 0;
+        self.last = (0, 0);
+        Ok((std::mem::take(&mut self.buf), self.lent.0))
     }
 
-    /// Stub.
-    pub fn restore_storage(&mut self, _storage: Box<[u8]>, _filled: usize) {}
+    /// Takes back the storage lent by [`LineBuf::take_storage`], with
+    /// `filled` new bytes written at the offset that call returned.
+    pub fn restore_storage(&mut self, storage: Box<[u8]>, filled: usize) {
+        self.buf = storage;
+        self.end = self.lent.0.saturating_add(filled).min(self.buf.len());
+        self.scanned = self.lent.1;
+        self.lent = (0, 0);
+    }
 
     /// Bytes buffered and not yet returned as a line.
     #[must_use]
