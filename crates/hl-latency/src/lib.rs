@@ -217,6 +217,24 @@ pub fn parse_ws_message(msg: &str, recv_ns: u64) -> Result<Vec<Observation>, Par
         _ => Ok(Vec::new()),
     }
 }
+
+/// Stub: see the failing tests in `tests/parse_equiv.rs` and `tests/alloc.rs`.
+pub fn parse_ws_message_into(
+    msg: &str,
+    recv_ns: u64,
+    out: &mut Vec<Observation>,
+) -> Result<(), ParseError> {
+    out.clear();
+    out.extend(parse_ws_message(msg, recv_ns)?);
+    Ok(())
+}
+
+/// Stub: see the failing tests in `tests/parse_equiv.rs` and `tests/alloc.rs`.
+#[must_use]
+pub fn scan_node_header(_line: &[u8]) -> Option<(u64, u64)> {
+    None
+}
+
 /// One block seen by both sources.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Pair {
