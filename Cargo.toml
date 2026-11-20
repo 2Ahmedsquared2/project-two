@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/hl-book-ref", "crates/hl-dataset", "crates/book-check", "crates/hl-latency"]
+members = ["crates/hl-book-ref", "crates/hl-dataset", "crates/book-check", "crates/hl-latency", "crates/hl-node-convert"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,8 @@ authors = ["Project Two contributors"]
 [workspace.dependencies]
 hl-book-ref = { path = "crates/hl-book-ref", version = "0.1.0" }
 hl-dataset = { path = "crates/hl-dataset", version = "0.1.0" }
+hl-latency = { path = "crates/hl-latency", version = "0.1.0" }
+book-check = { path = "crates/book-check", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
