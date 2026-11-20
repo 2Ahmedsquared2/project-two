@@ -13,7 +13,13 @@
 //! [`measure`] or [`count_ticks`] are seen. A tick that hands work to another
 //! thread must be gated on that thread.
 //!
-//! Stub: nothing is counted yet.
+//! ```
+//! let mut buf: Vec<u8> = Vec::new();
+//! hl_alloc_gate::assert_no_alloc_after_warmup("copy into a reused buffer", 8, 1000, |_| {
+//!     buf.clear();
+//!     buf.extend_from_slice(b"same size every tick");
+//! });
+//! ```
 
 /// Heap activity of one measured region, on the calling thread.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -43,28 +49,72 @@ pub struct TickReport {
 
 /// Runs `f` and reports what it allocated on this thread.
 pub fn measure<R>(f: impl FnOnce() -> R) -> (R, Allocs) {
-    (f(), Allocs::default())
+    let mut out = None;
+    let info = allocation_counter::measure(|| out = Some(f()));
+    let allocs = Allocs {
+        count: info.count_total,
+        bytes: info.bytes_total,
+    };
+    match out {
+        Some(r) => (r, allocs),
+        // `allocation_counter::measure` calls its closure exactly once.
+        None => unreachable!("measured closure did not run"),
+    }
 }
 
 /// Runs `tick` `warmup` times unmeasured, then `ticks` times measured one by
 /// one. `tick` receives the tick index, counting from 0 across warmup and
 /// measured ticks, so a test can feed it different input each time.
 pub fn count_ticks(warmup: u64, ticks: u64, mut tick: impl FnMut(u64)) -> TickReport {
-    for i in 0..warmup.saturating_add(ticks) {
+    for i in 0..warmup {
         tick(i);
     }
-    TickReport {
+    let mut report = TickReport {
         ticks,
         ..TickReport::default()
+    };
+    for n in 0..ticks {
+        let ((), a) = measure(|| tick(warmup.saturating_add(n)));
+        if a.count == 0 {
+            continue;
+        }
+        report.allocating_ticks += 1;
+        report.total.count += a.count;
+        report.total.bytes += a.bytes;
+        if report.first.is_none() {
+            report.first = Some((n, a));
+        }
+        if report.worst.is_none_or(|(_, w)| a.count > w.count) {
+            report.worst = Some((n, a));
+        }
     }
+    report
 }
 
 /// The gate: panics, naming `what`, if any tick after warmup allocates.
 ///
 /// # Panics
 ///
-/// When a measured tick allocates. The message gives the first offending
-/// tick, the worst tick and the totals.
+/// When a measured tick allocates, or when `ticks` is 0 (a gate that measured
+/// nothing must not pass). The message gives the first offending tick, the
+/// worst tick and the totals.
 pub fn assert_no_alloc_after_warmup(what: &str, warmup: u64, ticks: u64, tick: impl FnMut(u64)) {
-    let _ = (what, count_ticks(warmup, ticks, tick));
+    assert!(ticks > 0, "{what}: zero ticks measured");
+    let r = count_ticks(warmup, ticks, tick);
+    if let (Some((first, fa)), Some((worst, wa))) = (r.first, r.worst) {
+        panic!(
+            "{what}: {} of {} ticks allocated after {warmup} warmup ticks \
+             ({} allocations, {} bytes in total); \
+             first at tick {first} ({} allocations, {} bytes); \
+             worst at tick {worst} ({} allocations, {} bytes)",
+            r.allocating_ticks,
+            r.ticks,
+            r.total.count,
+            r.total.bytes,
+            fa.count,
+            fa.bytes,
+            wa.count,
+            wa.bytes,
+        );
+    }
 }
