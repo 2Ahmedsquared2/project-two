@@ -13,6 +13,7 @@ against; this repository starts there.
 | `hl-dataset`   | A versioned JSON Lines format (v2) for a recorded dataset: blocks with raw transactions and per-order effects, plus `l2_book` / `l4_book` states per asset, integer ticks/lots with audit decimal strings. Validating reader and writer, and `hl-convert` from the public-data capture. Spec: [docs/dataset-format.md](docs/dataset-format.md). |
 | `hl-latency`   | Joins arrivals of the same block from our node's output and from the public WebSocket (block time key, one host clock) and reports the node's lead: p50/p90/p99/p99.9. Plan: [docs/LATENCY_PROBE.md](docs/LATENCY_PROBE.md). |
 | `hl-alloc-gate` | Test-only gate: `assert_no_alloc_after_warmup` fails a test when a hot-path tick touches the heap after warmup (counting allocator, per thread). Dev-dependency only. |
+| `hl-order`     | Testnet-only signer and order client: limit order (Alo/Gtc/Ioc), cancel by oid, `scheduleCancel`. Byte-identical to the Python SDK by golden vectors; no transport, nothing sent. Mainnet is not constructible. [docs/ORDER_CLIENT.md](docs/ORDER_CLIENT.md). |
 | `book-check`   | Replays a dataset through one candidate book per asset and reports the first divergence: block, coin, side, price level and the field that differs (size, order count, queue position). Exits non-zero on divergence. `--replay` replays raw signed actions per [docs/ACTION_ORDERING.md](docs/ACTION_ORDERING.md) (the spec of record). |
 | `hl-node-convert` | Converts `hl-node` output (raw book diffs, order statuses, `l4Snapshots` seed and check books) into a v2 dataset of per-order ops that `book-check` verifies. Schemas, sources and open questions: [docs/dataset-format.md](docs/dataset-format.md#converting-hl-node-output-hl-node-convert). |
 
@@ -63,3 +64,4 @@ Dual-licensed under MIT or Apache-2.0, at your option. See
 - Running the reference `hl-node`: [docs/NODE_SETUP.md](docs/NODE_SETUP.md) (needs a host; approval pending).
 - Node vs public WebSocket latency: [docs/LATENCY_PROBE.md](docs/LATENCY_PROBE.md), crate `hl-latency`.
 - NautilusTrader feed interface: [docs/NAUTILUS_FEED.md](docs/NAUTILUS_FEED.md).
+- Testnet order path, step 1 (offline signer, nothing sent): [docs/ORDER_CLIENT.md](docs/ORDER_CLIENT.md), crate `hl-order`.
