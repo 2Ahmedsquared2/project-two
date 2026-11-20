@@ -114,6 +114,7 @@ dependencies = [
  "hl-capture",
  "hl-latency",
  "libfuzzer-sys",
+ "serde_json",
 ]
 
 [[package]]
