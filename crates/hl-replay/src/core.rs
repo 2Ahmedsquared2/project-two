@@ -22,6 +22,11 @@ pub struct Hists {
     pub detect: LatencyHist,
     /// `t2 - feed`: the two above together, per line.
     pub total: LatencyHist,
+    /// Lines re-parsed by the strict parser off the timed path.
+    pub validated: u64,
+    /// Of those, lines a header-scan parser accepted and the strict parse
+    /// refused. Must be 0.
+    pub scan_strict_mismatches: u64,
 }
 
 impl Hists {
@@ -88,6 +93,12 @@ impl<H: Handle> Core<H> {
     #[must_use]
     pub fn with_feed_stamps(mut self, stamps: Arc<[AtomicU64]>) -> Self {
         self.feed_stamps = Some(stamps);
+        self
+    }
+
+    /// Stub: validation is not implemented yet.
+    #[must_use]
+    pub fn with_strict_validation(self, _every: u64) -> Self {
         self
     }
 
