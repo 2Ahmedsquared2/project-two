@@ -57,3 +57,34 @@ fn node_arm_captures_lines_from_a_file_that_appears_during_the_run() {
         .iter()
         .all(|o| o.source == Source::Node && o.recv_ns > 0));
 }
+
+#[test]
+fn duration_bounds_the_run_even_with_a_long_poll() {
+    let t = tempfile::tempdir().unwrap();
+    let start = std::time::Instant::now();
+    let status = bin()
+        .arg("node")
+        .arg(t.path())
+        .arg("--out")
+        .arg(t.path().join("obs.jsonl"))
+        .args(["--duration-s", "1", "--poll-us", "3000000"])
+        .status()
+        .unwrap();
+    let took = start.elapsed();
+    assert!(status.success());
+    assert!(took < Duration::from_millis(1800), "ran {took:?}");
+}
+
+#[test]
+fn max_line_bytes_flag_is_accepted() {
+    let t = tempfile::tempdir().unwrap();
+    let status = bin()
+        .arg("node")
+        .arg(t.path())
+        .arg("--out")
+        .arg(t.path().join("obs.jsonl"))
+        .args(["--duration-s", "0", "--max-line-bytes", "4096"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}

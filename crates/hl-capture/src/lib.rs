@@ -19,6 +19,6 @@ mod lines;
 mod tail;
 mod ws;
 
-pub use lines::{LineSplitter, StampedLine};
+pub use lines::{LineSplitter, StampedLine, DEFAULT_MAX_LINE};
 pub use tail::{hourly_key, newest_hourly_file, NodeTailer, TailStats};
 pub use ws::{WsFilter, WsStats};

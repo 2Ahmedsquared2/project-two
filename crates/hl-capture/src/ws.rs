@@ -12,7 +12,8 @@ pub struct WsStats {
     pub frames: u64,
     /// Snapshot frames dropped (first per subscription since the last reset).
     pub snapshots_dropped: u64,
-    /// Frames `hl_latency::parse_ws_message` rejected.
+    /// Frames `hl_latency::parse_ws_message` rejected, and `l2Book`/`trades`
+    /// frames without one non-empty coin.
     pub bad_frames: u64,
 }
 
@@ -25,19 +26,40 @@ pub struct WsFilter {
     stats: WsStats,
 }
 
-/// `(channel, coin)` of a data frame; `None` for other channels.
-fn subscription(frame: &str) -> Option<(String, String)> {
-    let v: Value = serde_json::from_str(frame).ok()?;
-    let channel = v.get("channel")?.as_str()?;
-    let data = v.get("data")?;
-    let coin = match channel {
-        "l2Book" => data.get("coin"),
-        "trades" => data.get(0).and_then(|t| t.get("coin")),
-        _ => return None,
+/// Identity of a frame: `Data(channel, coin)` for `l2Book` and `trades`,
+/// `Other` for channels that carry no observations, `Invalid` for a data frame
+/// whose coin is missing, not a string, empty, or (for `trades`) not the same
+/// in every trade.
+enum Identity {
+    Data(String, String),
+    Other,
+    Invalid,
+}
+
+fn coin_of(d: &Value) -> Option<&str> {
+    d.get("coin")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+}
+
+fn identity(frame: &str) -> Identity {
+    let Ok(v) = serde_json::from_str::<Value>(frame) else {
+        return Identity::Invalid;
+    };
+    let (channel, coin) = match v.get("channel").and_then(Value::as_str) {
+        Some(ch @ "l2Book") => (ch, v.get("data").and_then(coin_of)),
+        Some(ch @ "trades") => {
+            let trades = v.get("data").and_then(Value::as_array);
+            let first = trades.and_then(|t| t.first()).and_then(coin_of);
+            let same = trades.is_some_and(|t| t.iter().all(|x| coin_of(x) == first));
+            (ch, first.filter(|_| same))
+        }
+        _ => return Identity::Other,
+    };
+    match coin {
+        Some(c) => Identity::Data(channel.to_owned(), c.to_owned()),
+        None => Identity::Invalid,
     }
-    .and_then(Value::as_str)
-    .unwrap_or_default();
-    Some((channel.to_owned(), coin.to_owned()))
 }
 
 impl WsFilter {
@@ -60,11 +82,21 @@ impl WsFilter {
             self.stats.bad_frames += 1;
             return Vec::new();
         };
-        if subscription(frame).is_some_and(|key| self.seen.insert(key)) {
-            self.stats.snapshots_dropped += 1;
-            return Vec::new();
+        match identity(frame) {
+            Identity::Invalid => {
+                self.stats.bad_frames += 1;
+                Vec::new()
+            }
+            Identity::Data(channel, coin) => {
+                if self.seen.insert((channel, coin)) {
+                    self.stats.snapshots_dropped += 1;
+                    Vec::new()
+                } else {
+                    obs
+                }
+            }
+            Identity::Other => obs,
         }
-        obs
     }
 
     /// Counters so far.

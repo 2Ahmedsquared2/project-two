@@ -1,7 +1,7 @@
 //! `hl-capture`: the probe's capture side.
 //!
 //! ```text
-//! hl-capture node <dir> --out <obs.jsonl> [--poll-us N] [--duration-s N]
+//! hl-capture node <dir> --out <obs.jsonl> [--poll-us N] [--duration-s N] [--max-line-bytes N]
 //! ```
 //!
 //! `node` follows the newest hourly file under `<dir>` (for example
@@ -9,7 +9,9 @@
 //! [`hl_latency::Observation`] per line to `--out`, stamped with
 //! `CLOCK_REALTIME` right after each `read`. It polls every `--poll-us`
 //! microseconds (default 100: pin the probe to its own core) and stops after
-//! `--duration-s` seconds (default: never). Counters go to stderr at exit.
+//! `--duration-s` seconds (default: never; the last sleep is cut short so the
+//! run ends on time). Lines longer than `--max-line-bytes` (default 1 MiB)
+//! are dropped and counted. Counters go to stderr at exit.
 //! Exit codes: 0 ok, 1 I/O error, 2 usage.
 //!
 //! The public `WebSocket` arm (`hl_capture::WsFilter`) gets its socket
@@ -23,13 +25,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hl_capture::NodeTailer;
 
-const USAGE: &str = "usage: hl-capture node <dir> --out <obs.jsonl> [--poll-us N] [--duration-s N]";
+const USAGE: &str = "usage: hl-capture node <dir> --out <obs.jsonl> [--poll-us N] [--duration-s N] [--max-line-bytes N]";
 
 struct Args {
     root: PathBuf,
     out: PathBuf,
     poll: Duration,
     duration: Option<Duration>,
+    max_line: usize,
 }
 
 fn parse_args(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
@@ -38,6 +41,7 @@ fn parse_args(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
     }
     let root = PathBuf::from(it.next()?);
     let (mut out, mut poll, mut duration) = (None, Duration::from_micros(100), None);
+    let mut max_line = hl_capture::DEFAULT_MAX_LINE;
     while let Some(flag) = it.next() {
         let value = it.next()?;
         let num = || value.to_str()?.parse::<u64>().ok();
@@ -45,6 +49,7 @@ fn parse_args(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
             "--out" => out = Some(PathBuf::from(&value)),
             "--poll-us" => poll = Duration::from_micros(num()?),
             "--duration-s" => duration = Some(Duration::from_secs(num()?)),
+            "--max-line-bytes" => max_line = usize::try_from(num()?).ok().filter(|&n| n > 0)?,
             _ => return None,
         }
     }
@@ -53,6 +58,7 @@ fn parse_args(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
         out: out?,
         poll,
         duration,
+        max_line,
     })
 }
 
@@ -71,10 +77,10 @@ fn run(args: &Args) -> std::io::Result<()> {
             .append(true)
             .open(&args.out)?,
     );
-    let mut tail = NodeTailer::new(&args.root);
+    let mut tail = NodeTailer::with_max_line(&args.root, args.max_line);
     let mut clock = realtime_ns;
-    let start = Instant::now();
-    while args.duration.is_none_or(|d| start.elapsed() < d) {
+    let deadline = args.duration.and_then(|d| Instant::now().checked_add(d));
+    while deadline.is_none_or(|d| Instant::now() < d) {
         let obs = tail.poll(&mut clock)?;
         // Serialise after stamping; flush per batch so a crash loses little.
         for o in &obs {
@@ -84,13 +90,17 @@ fn run(args: &Args) -> std::io::Result<()> {
         if !obs.is_empty() {
             out.flush()?;
         }
-        std::thread::sleep(args.poll);
+        // Never sleep past the deadline.
+        let nap = deadline.map_or(args.poll, |d| {
+            args.poll.min(d.saturating_duration_since(Instant::now()))
+        });
+        std::thread::sleep(nap);
     }
     out.flush()?;
     let s = tail.stats();
     eprintln!(
-        "{{\"lines\":{},\"bad_lines\":{},\"rotations\":{},\"reads\":{}}}",
-        s.lines, s.bad_lines, s.rotations, s.reads
+        "{{\"lines\":{},\"bad_lines\":{},\"oversized_lines\":{},\"rotations\":{},\"reads\":{}}}",
+        s.lines, s.bad_lines, s.oversized_lines, s.rotations, s.reads
     );
     Ok(())
 }

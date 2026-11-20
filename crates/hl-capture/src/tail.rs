@@ -76,6 +76,9 @@ pub struct TailStats {
     pub rotations: u64,
     /// `read` calls that returned data.
     pub reads: u64,
+    /// Lines dropped for exceeding the line cap (see
+    /// [`NodeTailer::with_max_line`]); not included in `bad_lines`.
+    pub oversized_lines: u64,
 }
 
 #[derive(Debug)]
@@ -106,11 +109,18 @@ impl NodeTailer {
     /// appears later is read from its start.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self::with_max_line(root, crate::DEFAULT_MAX_LINE)
+    }
+
+    /// Like [`Self::new`], dropping (and counting) lines longer than
+    /// `max_line` bytes so memory stays bounded.
+    #[must_use]
+    pub fn with_max_line(root: impl Into<PathBuf>, max_line: usize) -> Self {
         Self {
             root: root.into(),
             current: None,
             polled: false,
-            splitter: LineSplitter::new(),
+            splitter: LineSplitter::with_max_line(max_line),
             buf: vec![0; BUF],
             lines: Vec::new(),
             stats: TailStats::default(),
@@ -193,7 +203,10 @@ impl NodeTailer {
     /// Counters so far.
     #[must_use]
     pub fn stats(&self) -> TailStats {
-        self.stats
+        TailStats {
+            oversized_lines: self.splitter.oversized(),
+            ..self.stats
+        }
     }
 
     /// The file currently followed.

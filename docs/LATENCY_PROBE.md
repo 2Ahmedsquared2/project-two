@@ -80,15 +80,21 @@ target (`fuzz/`, `cargo +nightly fuzz run hl_latency_parsers`), tests
 including real captured WS frames.
 
 Done (capture, `crates/hl-capture`): node arm. `hl-capture node <dir> --out
-obs.jsonl [--poll-us N] [--duration-s N]` follows the newest hourly file
+obs.jsonl [--poll-us N] [--duration-s N] [--max-line-bytes N]` follows the newest hourly file
 (numeric `{date}/{hour}` order, so hour 10 is newer than 9), reads a file that
 exists at start from its end and every later file from byte 0, drains the old
 file before switching at rotation, and stamps `CLOCK_REALTIME` once per `read`
 that returns data, before parsing; a line split across reads carries the stamp
-of the read that delivered its newline. Bad lines are counted, not fatal.
+of the read that delivered its newline. Bad lines are counted, not fatal. Lines longer than `--max-line-bytes`
+(default 1 MiB) are dropped and counted (`oversized_lines`), so a stream
+without newlines holds at most that much. `--duration-s` is a hard deadline:
+the last poll sleep is cut short.
 Polling (default 100 us, on a pinned core) rather than inotify for now.
 `WsFilter` drops the first `l2Book`/`trades` frame per coin after each
-(re)connect and counts malformed frames. Tested against fake node files
+(re)connect and counts malformed frames, including `l2Book`/`trades` frames
+whose coin is missing, null, empty, not a string or (for `trades`) not the
+same in every trade. A second cargo-fuzz target, `hl_capture_inputs`, feeds
+arbitrary chunks through the line splitter and filter. Tested against fake node files
 (append, partial line, rotation, late-appearing file) and synthetic and
 captured WS frames.
 

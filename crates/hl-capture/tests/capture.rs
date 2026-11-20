@@ -331,3 +331,109 @@ fn real_captured_frames_pass_after_snapshot() {
     assert!(f.on_frame(book, 1).is_empty());
     assert_eq!(f.on_frame(book, 2), vec![ws_obs(1_795_128_590_474, 2)]);
 }
+
+// ---- review fixes (CI/CD, PR #3): bounded lines, WS identity ----------------
+
+#[test]
+fn line_without_newline_is_bounded_and_counted() {
+    let mut s = LineSplitter::with_max_line(8);
+    let mut out = Vec::new();
+    s.push(b"0123456789abcdef", 1, &mut out);
+    assert!(s.pending() <= 8, "held {} bytes", s.pending());
+    s.push(b"more-junk", 2, &mut out);
+    assert!(s.pending() <= 8);
+    // The rest of the oversized line up to its newline is discarded too; the
+    // next line is intact.
+    s.push(b"tail\nok\n", 3, &mut out);
+    assert_eq!(
+        out,
+        vec![StampedLine {
+            bytes: b"ok".to_vec(),
+            recv_ns: 3
+        }]
+    );
+    assert_eq!(s.oversized(), 1);
+    assert_eq!(s.pending(), 0);
+}
+
+#[test]
+fn line_completed_in_one_read_over_the_cap_is_dropped() {
+    let mut s = LineSplitter::with_max_line(4);
+    let mut out = Vec::new();
+    s.push(b"abcd\nabcde\nab", 1, &mut out);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].bytes, b"abcd");
+    assert_eq!((s.oversized(), s.pending()), (1, 2));
+}
+
+#[test]
+fn default_cap_stops_a_4_mib_delimiter_free_stream() {
+    const { assert!(hl_capture::DEFAULT_MAX_LINE < 4 * 1024 * 1024) };
+    let mut s = LineSplitter::new();
+    let mut out = Vec::new();
+    let chunk = vec![b'x'; 64 * 1024];
+    for _ in 0..64 {
+        s.push(&chunk, 1, &mut out);
+    }
+    assert!(s.pending() <= hl_capture::DEFAULT_MAX_LINE);
+    assert!(out.is_empty());
+    assert_eq!(s.oversized(), 1);
+}
+
+proptest! {
+    #[test]
+    fn pending_never_exceeds_the_cap(
+        data in proptest::collection::vec(prop_oneof![Just(b'\n'), Just(b'a')], 0..300),
+        cuts in proptest::collection::vec(0usize..300, 0..10),
+        cap in 1usize..32,
+    ) {
+        let mut s = LineSplitter::with_max_line(cap);
+        let mut out = Vec::new();
+        let mut cuts: Vec<usize> = cuts.into_iter().map(|c| c.min(data.len())).collect();
+        cuts.sort_unstable();
+        let mut prev = 0;
+        for c in cuts.into_iter().chain(std::iter::once(data.len())) {
+            s.push(&data[prev..c], 0, &mut out);
+            prev = c;
+            prop_assert!(s.pending() <= cap);
+        }
+        prop_assert!(out.iter().all(|l| l.bytes.len() <= cap));
+    }
+}
+
+#[test]
+fn oversized_node_lines_are_counted_bad() {
+    let t = tempfile::tempdir().unwrap();
+    let f = touch(t.path(), "20261119", "8");
+    let mut tail = NodeTailer::with_max_line(t.path(), 160);
+    let (mut clock, _) = ticking();
+    assert!(tail.poll(&mut clock).unwrap().is_empty());
+    append(&f, &format!("{}\n", "x".repeat(200)));
+    append(&f, &node_line("2026-11-19T08:00:00.070", 2));
+    assert_eq!(tail.poll(&mut clock).unwrap().len(), 1);
+    assert_eq!(tail.stats().oversized_lines, 1);
+}
+
+#[test]
+fn data_frames_without_a_coin_are_bad_frames() {
+    let frames = [
+        r#"{"channel":"l2Book","data":{"time":10,"levels":[[],[]]}}"#,
+        r#"{"channel":"l2Book","data":{"coin":null,"time":10,"levels":[[],[]]}}"#,
+        r#"{"channel":"l2Book","data":{"coin":"","time":10,"levels":[[],[]]}}"#,
+        r#"{"channel":"l2Book","data":{"coin":7,"time":10,"levels":[[],[]]}}"#,
+        r#"{"channel":"trades","data":[{"time":10}]}"#,
+        r#"{"channel":"trades","data":[{"coin":"","time":10}]}"#,
+        r#"{"channel":"trades","data":[{"coin":"BTC","time":10},{"time":11}]}"#,
+        r#"{"channel":"trades","data":[{"coin":"BTC","time":10},{"coin":"ETH","time":11}]}"#,
+        r#"{"channel":"trades","data":[]}"#,
+    ];
+    let mut f = WsFilter::new();
+    for fr in frames {
+        // Twice: the second would pass the snapshot drop if identity were
+        // accepted.
+        assert!(f.on_frame(fr, 1).is_empty(), "{fr}");
+        assert!(f.on_frame(fr, 2).is_empty(), "{fr}");
+    }
+    let s = f.stats();
+    assert_eq!((s.bad_frames, s.snapshots_dropped), (18, 0));
+}
