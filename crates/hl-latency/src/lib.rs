@@ -191,6 +191,53 @@ pub fn parse_node_line(line: &str, recv_ns: u64) -> Result<Observation, ParseErr
     })
 }
 
+/// A whole line of the node's output: bytes whose terminating newline the
+/// reader has already seen.
+///
+/// [`scan_node_header`] takes only this type, so "complete lines only" is
+/// enforced by the compiler instead of by a comment: a caller holding a
+/// partial read has to write [`CompleteLine::assume_newline_seen`] to get
+/// one, and that name is the claim. There is no `From<&[u8]>`, `Deref` or
+/// other implicit conversion, on purpose.
+///
+/// Zero cost: a transparent wrapper round the slice, `Copy`, no check at
+/// construction (the newline itself may or may not be included; the type
+/// records what the caller saw, not what the bytes contain).
+///
+/// A raw slice is not accepted:
+///
+/// ```compile_fail,E0308
+/// let line: &[u8] = br#"{"local_time":"x","block_time":"2025-07-27T08:50:10.051000","block_number":1}"#;
+/// let _ = hl_latency::scan_node_header(line);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct CompleteLine<'a>(&'a [u8]);
+
+impl<'a> CompleteLine<'a> {
+    /// Wraps `bytes` as a complete line.
+    ///
+    /// By calling this the caller states that it has **seen the newline
+    /// that terminates this line** (or the end of a finished file): `bytes`
+    /// is everything the writer wrote for the line, not the front of a read
+    /// still in progress. Nothing is checked here and nothing can be; a
+    /// partial read passed through this constructor can make
+    /// [`scan_node_header`] answer for a line that was cut right after a
+    /// nested `}`.
+    ///
+    /// `bytes` may include the trailing `\n` (and a `\r` before it) or not.
+    #[must_use]
+    pub const fn assume_newline_seen(bytes: &'a [u8]) -> Self {
+        Self(bytes)
+    }
+
+    /// The line's bytes, as given to [`CompleteLine::assume_newline_seen`].
+    #[must_use]
+    pub const fn as_bytes(self) -> &'a [u8] {
+        self.0
+    }
+}
+
 /// Reads `(block_time_ms, block_number)` from the start of a node line
 /// without parsing the rest: the fast path for the node feed, constant cost
 /// however many events the line carries, no allocation.
