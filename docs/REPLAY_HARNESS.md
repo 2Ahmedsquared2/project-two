@@ -85,7 +85,10 @@ The report also prints `warning:` lines, which never stop a run:
   every `nohz_full` CPU. `all` and stepped ranges (`0-7:2/4`) are read as CPU
   lists. A list with any part the harness cannot read (the kernel's `N` for
   the last CPU, as in `0,2-N`) is unreadable as a whole, never partly read,
-  and gets a line saying the pinned cores were not checked against it;
+  and gets a line saying the pinned cores were not checked against it. So
+  does a list the kernel itself refuses: one naming a CPU number of 8192 or
+  more (past the widest CPU mask an x86-64 or arm64 kernel is built with), or
+  a stride using more than its group (`0-7:3/2`);
 - with `nohz_full` unreadable, a core outside `rcu_nocbs` (or `rcu_nocbs` not
   set) is reported as "whether it is offloaded from RCU callbacks is
   undetermined", not as not offloaded;

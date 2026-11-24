@@ -270,6 +270,24 @@ impl NodeTailer {
         clock: &mut dyn FnMut() -> u64,
         sink: &mut S,
     ) -> std::io::Result<()> {
+        self.poll_into_with(clock, sink, newest_hourly_file)
+    }
+
+    /// [`Self::poll_into`] with the look for the newest hourly file under
+    /// the root supplied by the caller. `find` is called at most once, and
+    /// only by a poll that rescans; [`Self::poll_into`] passes
+    /// [`newest_hourly_file`]. Tests use it to act at the exact point of the
+    /// look.
+    pub fn poll_into_with<S, F>(
+        &mut self,
+        clock: &mut dyn FnMut() -> u64,
+        sink: &mut S,
+        find: F,
+    ) -> std::io::Result<()>
+    where
+        S: ObservationSink + ?Sized,
+        F: FnOnce(&Path) -> std::io::Result<Option<PathBuf>>,
+    {
         let mut budget = MAX_READS_PER_POLL;
         self.backlogged = false;
         self.drain(clock, sink, &mut budget)?;
@@ -284,7 +302,7 @@ impl NodeTailer {
         }
         self.stats.rescans += 1;
         let first = !std::mem::replace(&mut self.polled, true);
-        if let Some(newest) = newest_hourly_file(&self.root)? {
+        if let Some(newest) = find(&self.root)? {
             let key = hourly_key(&newest);
             let newer = match (&self.current, key) {
                 (None, Some(_)) => true,

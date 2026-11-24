@@ -192,22 +192,29 @@ impl HostFacts {
             .collect()
     }
 
-    /// The CPUs the kernel command line isolates (`isolcpus=`), if it names
-    /// them one by one and every part of the list was read.
+    /// The CPUs the kernel command line isolates (`isolcpus=`), in ascending
+    /// order and once each, if it names them one by one and every part of the
+    /// list was read.
     #[must_use]
     pub fn isolated_cpus(&self) -> Option<Vec<usize>> {
         match self.cpu_list("isolcpus")? {
-            CpuList::Listed(cpus) => Some(cpus),
+            CpuList::Listed(ranges) => Some(
+                (0..MAX_CPUS)
+                    .filter(|cpu| ranges.iter().any(|r| r.contains(*cpu)))
+                    .collect(),
+            ),
             CpuList::All | CpuList::Unreadable => None,
         }
     }
 
     /// The CPUs a kernel command-line list names, if it is set. One part this
     /// harness cannot read (the kernel's `N` for the last CPU, an unknown
-    /// word) makes the whole list unreadable: a partly read list would report
-    /// a core as outside a list that holds it.
+    /// word) or the kernel itself refuses (a CPU number at or past
+    /// [`MAX_CPUS`], a stride using more than its group) makes the whole list
+    /// unreadable: a partly read list would report a core as outside a list
+    /// that holds it. Ranges are kept as ranges, never expanded CPU by CPU.
     fn cpu_list(&self, key: &str) -> Option<CpuList> {
-        let mut cpus = Vec::new();
+        let mut ranges = Vec::new();
         let mut all = false;
         for part in self.cmdline_value(key)?.split(',') {
             if part.eq_ignore_ascii_case("all") {
@@ -218,39 +225,17 @@ impl HostFacts {
             if key == "isolcpus" && ISOLCPUS_FLAGS.contains(&part) {
                 continue;
             }
-            // A range may carry a stride: `first-last:used/group`.
-            let (range, stride) = match part.split_once(':') {
-                None => (part, None),
-                Some((range, stride)) => {
-                    let used_of_group = stride.split_once('/').and_then(|(used, group)| {
-                        Some((used.parse::<usize>().ok()?, group.parse::<usize>().ok()?))
-                    });
-                    match used_of_group {
-                        Some((used, group)) if group > 0 => (range, Some((used, group))),
-                        _ => return Some(CpuList::Unreadable),
-                    }
-                }
-            };
-            let (first, last) = range.split_once('-').unwrap_or((range, range));
-            let (Ok(first), Ok(last)) = (first.parse::<usize>(), last.parse::<usize>()) else {
-                return Some(CpuList::Unreadable);
-            };
-            if first > last {
-                return Some(CpuList::Unreadable);
-            }
-            match stride {
-                Some((used, group)) => {
-                    cpus.extend((first..=last).filter(|cpu| (cpu - first) % group < used));
-                }
-                None => cpus.extend(first..=last),
+            match CpuRange::parse(part) {
+                Some(range) => ranges.push(range),
+                None => return Some(CpuList::Unreadable),
             }
         }
         Some(if all {
             CpuList::All
-        } else if cpus.is_empty() {
+        } else if ranges.iter().all(|r| r.used == 0) {
             CpuList::Unreadable
         } else {
-            CpuList::Listed(cpus)
+            CpuList::Listed(ranges)
         })
     }
 
@@ -272,7 +257,7 @@ impl HostFacts {
             Some(CpuList::All) => Vec::new(),
             Some(CpuList::Listed(listed)) => pinned
                 .iter()
-                .filter(|(_, core)| !listed.contains(core))
+                .filter(|(_, core)| !listed.iter().any(|r| r.contains(*core)))
                 .map(|(role, core)| format!("{role} core {core} is not in {key} ({raw})"))
                 .collect(),
             Some(CpuList::Unreadable) => vec![format!(
@@ -295,17 +280,17 @@ impl HostFacts {
         match self.cpu_list("rcu_nocbs") {
             Some(CpuList::Listed(listed)) => pinned
                 .iter()
-                .filter(|(_, core)| !listed.contains(core))
+                .filter(|(_, core)| !listed.iter().any(|r| r.contains(*core)))
                 .map(|(role, core)| {
                     format!(
-                        "{role} core {core} is not in rcu_nocbs ({raw}) and nohz_full ({tickless}) was not read: whether it is offloaded from RCU callbacks is undetermined"
+                        "{role} core {core} is not in rcu_nocbs ({raw}) and nohz_full ({tickless}) could not be parsed: whether it is offloaded from RCU callbacks is undetermined"
                     )
                 })
                 .collect(),
             None if !pinned.is_empty() => {
                 let (cores, verb) = name_cores(pinned);
                 vec![format!(
-                    "rcu_nocbs is not set and nohz_full ({tickless}) was not read: whether {cores} {verb} offloaded from RCU callbacks is undetermined"
+                    "rcu_nocbs is not set and nohz_full ({tickless}) could not be parsed: whether {cores} {verb} offloaded from RCU callbacks is undetermined"
                 )]
             }
             // `all` offloads every core; an unreadable rcu_nocbs gets its own line.
@@ -330,7 +315,7 @@ impl HostFacts {
         // capture does not record which CPU booted; it is normally CPU 0.
         let names_cpu_0 = match &tickless {
             Some(CpuList::All) => true,
-            Some(CpuList::Listed(listed)) => listed.contains(&0),
+            Some(CpuList::Listed(listed)) => listed.iter().any(|r| r.contains(0)),
             Some(CpuList::Unreadable) | None => false,
         };
         if names_cpu_0 {
@@ -351,7 +336,7 @@ impl HostFacts {
                 .copied()
                 .filter(|(_, core)| match &tickless {
                     Some(CpuList::All) => false,
-                    Some(CpuList::Listed(listed)) => !listed.contains(core),
+                    Some(CpuList::Listed(listed)) => !listed.iter().any(|r| r.contains(*core)),
                     Some(CpuList::Unreadable) | None => true,
                 })
                 .collect();
@@ -406,10 +391,58 @@ const ISOLCPUS_FLAGS: [&str; 3] = ["nohz", "domain", "managed_irq"];
 enum CpuList {
     /// The word `all`.
     All,
-    /// These CPUs.
-    Listed(Vec<usize>),
+    /// The CPUs in any of these ranges.
+    Listed(Vec<CpuRange>),
     /// Set, with a part this harness cannot read.
     Unreadable,
+}
+
+/// One more than the largest CPU number a list may name: the widest CPU mask
+/// an x86-64 kernel can be built with (Linux v6.8 `arch/x86/Kconfig`,
+/// `NR_CPUS_RANGE_END`, 8192 with `CPUMASK_OFFSTACK`; arm64 stops at 4096).
+/// The kernel refuses a list naming a CPU at or past its mask width (-ERANGE,
+/// v6.8 `lib/bitmap-str.c`, `bitmap_check_region`).
+const MAX_CPUS: usize = 8192;
+
+/// One part of a CPU list: `first`, `first-last` or `first-last:used/group`
+/// (Linux v6.8 `Documentation/admin-guide/kernel-parameters.rst`, "cpu
+/// lists"). The range is split into groups of `group` CPUs and names the
+/// first `used` of each.
+struct CpuRange {
+    first: usize,
+    last: usize,
+    used: usize,
+    group: usize,
+}
+
+impl CpuRange {
+    /// Reads one part, or `None` for a part this harness cannot read or the
+    /// kernel refuses: `bitmap_check_region` returns -EINVAL for a descending
+    /// range, a group of 0 or `used > group`, and -ERANGE for a CPU past the
+    /// mask.
+    fn parse(part: &str) -> Option<Self> {
+        let (range, stride) = match part.split_once(':') {
+            None => (part, None),
+            Some((range, stride)) => {
+                let (used, group) = stride.split_once('/')?;
+                (range, Some((used.parse().ok()?, group.parse().ok()?)))
+            }
+        };
+        let (first, last) = range.split_once('-').unwrap_or((range, range));
+        let (first, last) = (first.parse::<usize>().ok()?, last.parse::<usize>().ok()?);
+        // A plain range is one group, all of it used.
+        let (used, group): (usize, usize) = stride.unwrap_or((1, 1));
+        (first <= last && last < MAX_CPUS && group > 0 && used <= group).then_some(Self {
+            first,
+            last,
+            used,
+            group,
+        })
+    }
+
+    fn contains(&self, cpu: usize) -> bool {
+        (self.first..=self.last).contains(&cpu) && (cpu - self.first) % self.group < self.used
+    }
 }
 
 /// "feeder core 2 and hot core 3" with the verb that agrees with it.
