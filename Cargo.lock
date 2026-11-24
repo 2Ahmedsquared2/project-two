@@ -868,6 +868,7 @@ dependencies = [
 name = "hl-capture"
 version = "0.1.0"
 dependencies = [
+ "hl-alloc-gate",
  "hl-latency",
  "proptest",
  "serde_json",
