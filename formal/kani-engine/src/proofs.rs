@@ -713,3 +713,72 @@ fn engine_no_panic_any_action() {
     kani::cover!(placed, "an order placed");
     assert!(e.resync(&[]).is_ok());
 }
+
+/// F3 (a). Bounds: snapshot <= 2 orders, ONE order leg (domain of
+/// `order_req`) with an arbitrary `oid_hint` (None or any u64), STP on/off.
+/// The outcome (apart from `oid_mismatches`) and the resulting state equal
+/// the no-hint run; with the hint None or equal to the counter,
+/// `oid_mismatches == 0`.
+#[kani::proof]
+#[kani::unwind(5)]
+fn engine_oid_hint_does_not_influence() {
+    let base = engine_with(2, kani::any());
+    let o = order_req();
+    let h: Option<Oid> = if kani::any() {
+        Some(Oid(kani::any()))
+    } else {
+        None
+    };
+    let mut plain = base.clone();
+    plain.execute_block(
+        1,
+        &[UserAction::Order {
+            user: USERS[0],
+            orders: &[o],
+        }],
+    );
+    let mut hinted = base.clone();
+    let oh = [OrderReq { oid_hint: h, ..o }];
+    hinted.execute_block(
+        1,
+        &[UserAction::Order {
+            user: USERS[0],
+            orders: &oh,
+        }],
+    );
+    let mut a = hinted.outcome().clone();
+    let m = a.oid_mismatches;
+    a.oid_mismatches = 0;
+    assert!(a == *plain.outcome());
+    assert!(engine_view(&hinted) == engine_view(&plain));
+    if h.is_none() || h == Some(base.next_oid()) {
+        assert!(m == 0);
+    }
+    kani::cover!(h.is_some() && m == 0, "correct hint");
+}
+
+/// F3 (b), refined. Same bounds. A leg that takes an oid (counter moved)
+/// with a hint different from the counter gives `oid_mismatches == 1`.
+#[kani::proof]
+#[kani::unwind(5)]
+fn engine_oid_hint_mismatch_counted() {
+    let mut e = engine_with(2, kani::any());
+    let c = e.next_oid();
+    let h = Oid(kani::any());
+    let o = [OrderReq {
+        oid_hint: Some(h),
+        ..order_req()
+    }];
+    e.execute_block(
+        1,
+        &[UserAction::Order {
+            user: USERS[0],
+            orders: &o,
+        }],
+    );
+    let took = e.next_oid() != c;
+    if took && h != c {
+        assert!(e.outcome().oid_mismatches == 1);
+    }
+    kani::cover!(took && h != c, "counted mismatch");
+}

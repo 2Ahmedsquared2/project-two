@@ -13,7 +13,8 @@ the native node.
 |---|---|---|---|
 | `tests/exhaustive_resync.rs` | exhaustive enumeration (evidence, not a Kani proof) | snapshot 0-2 orders (side x px 1..3 x sz 1..2 x 2 users x cloid none/1/2), ONE single-leg action (order GTC/ALO/IOC x cloid x prio 0/1, cancel or modify by oid 1/2/10/11 or cloid 1/2), 2 users, STP on/off: 19,096,440 cases | **0 failures**: `resync(&[])` restores the pre-block engine (orders + queue order, L2, next oid, oid index, cloid resolution) and after the block the oid index is a bijection and each (user, cloid) resolves to its newest resting order. On `56514ca` 379,904 cases failed, all bug B1, fixed by lane 1 in `ff7821e` |
 | `tests/repro_b1_cloid_reuse.rs` | regression test | one case | failed on `56514ca` (B1), passes on `feae97a` |
-| `src/proofs.rs` (12 Kani harnesses) | Kani | on each harness | written and compiled; **not yet verified**: see "Kani blocker" |
+| `tests/exhaustive_oid_hint.rs` (F3) | exhaustive enumeration (evidence, not a Kani proof) | snapshot 0-1 order, block of TWO single-leg actions (order side x px {1,3} x sz {0,2} x TIF {GTC,ALO,IOC,Other} x pre-reject {none,TickSize}; modify oid 1/10; cancel), hint {None,10,11,12} per leg: 10,053,137 cases | **(a)** 0 failures: outcome (except `oid_mismatches`) and state equal the no-hint run for ANY hints; `oid_mismatches == 0` when every hint is None or equal to the counter. **(b) refined** 0 failures: `oid_mismatches` = number of oid-taking legs with a differing hint. **(b) as stated fails**: a differing hint on a leg that takes no oid (pre-reject, zero size/price, modify of an unknown order) is never counted (F3-gap, sent to lane 1) |
+| `src/proofs.rs` (14 Kani harnesses) | Kani | on each harness | written and compiled; **not yet verified**: see "Kani blocker" |
 
 ### B1: reused live cloid broke rollback (hl-exec bug, fixed in `ff7821e`)
 
@@ -49,12 +50,15 @@ is journalled, so `resync` restores an overwritten entry.
 | Mutant | Check | Result |
 |---|---|---|
 | `m1-rollback-skips-resize.patch` (rollback ignores `Resized` entries) | `exhaustive_resync` | killed on `56514ca` and on `feae97a` (failures outside B1 appear, test fails) |
+| `m2-hint-is-oid.patch` (the hint becomes the oid, as at `506239f`) | `exhaustive_oid_hint` | killed: (a) and (b) fail |
+| `m3-mismatch-never-counted.patch` | `exhaustive_oid_hint` | killed: (b) fails |
 
 ## Run
 
 ```bash
 cargo test --release -p kani-engine --test exhaustive_resync -- --nocapture   # ~25 s on 4 vCPU
 cargo test -p kani-engine --test repro_b1_cloid_reuse                          # B1 regression
+cargo test --release -p kani-engine --test exhaustive_oid_hint -- --nocapture  # F3, ~20 s
 formal/kani-engine/scripts/build-kani.sh                                        # patched Kani 0.68.0
 cargo kani -p kani-engine --harness <name>
 ```

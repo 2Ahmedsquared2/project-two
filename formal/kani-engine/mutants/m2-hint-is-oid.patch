@@ -1,0 +1,19 @@
+--- a/crates/hl-exec/src/engine.rs
++++ b/crates/hl-exec/src/engine.rs
+@@ -444,11 +444,13 @@
+     /// counts in [`BlockOutcome::oid_mismatches`], so a block that needed
+     /// native's answer cannot count as reproduced.
+     fn take_oid(&mut self, hint: Option<Oid>) -> Oid {
+-        let oid = Oid(self.next_oid);
+-        if hint.is_some_and(|h| h != oid) {
++        // MUTANT M2: the hint becomes the oid (506239f behaviour).
++        let own = Oid(self.next_oid);
++        if hint.is_some_and(|h| h != own) {
+             self.out.oid_mismatches = self.out.oid_mismatches.saturating_add(1);
+         }
+-        self.next_oid = self.next_oid.saturating_add(1);
++        let oid = hint.unwrap_or(own);
++        self.next_oid = oid.0.saturating_add(1);
+         oid
+     }
+ 
