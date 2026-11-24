@@ -94,6 +94,20 @@ ends. The writer thread then writes every record the ring still holds, so the
 process exits after the deadline by however long that backlog takes (measured
 0.5 to 0.95 s for 350k to 600k queued records, debug build, loaded shared
 machine); nothing already read is discarded.
+
+`SIGTERM` or `SIGINT` (Ctrl-C) ends a run the same way as the deadline: the
+reader stops, prints a `signal` line and `{"reader_stopped":true}`, the writer
+writes what the ring holds, the counters are printed with
+`"stop_signal":15` (or `2`; `null` for a run no signal stopped), and the exit
+status is 0. Such a run is as valid as a `--duration-s` run and is judged by
+`ring_dropped` like one; bytes the node wrote that the reader had not read yet
+are not captured. `busy-poll` and the default `poll` notice the signal at
+once; a long `--poll-us` and `inotify` notice it within 100 ms (every wait is
+capped at that, about ten empty reads a second while idle). **A second signal
+ends the process at once** with status 128 + the signal number (143, 130), no
+counters and possibly a cut-off last record: that run is invalid. Use it only
+when the writer cannot finish (a disk that stopped accepting writes).
+`SIGKILL` and `SIGHUP` are not handled: they lose the ring and the counters.
 After its first poll it writes `{"ready":true}` to stderr (after the `detect`
 line); a harness that creates or renames in a file it expects read must wait
 for that line first, or a slow start can make the file count as history (read
@@ -166,7 +180,12 @@ Exit codes: 0 every record passed, 1 a record failed (or a gap, when asked),
 
 A newer hourly file is looked for every `--rescan-ms` (default 1000) and, in
 `inotify` mode, when a directory changes; never per poll, and only once the
-current file is read to its end. The look is a directory walk on the reader
+current file is read to its end. When the look finds a newer file, the old one
+is read to its end once more before the switch, so a line the node appended to
+it while the look ran is kept (those are ordinary lines, not post-rotation
+ones). What the node appends to the old file after that is not read: the node
+is taken to finish a file before it starts the next (not verified against real
+`hl-node` output). The look is a directory walk on the reader
 thread (13 us with one date directory, 262 us with thirty, shared machine):
 keep the interval coarse and **prune old date directories**. What the
 switching poll reads from a new file may be stamped up to `--rescan-ms` late:
@@ -177,7 +196,7 @@ the walk to the writer thread is the follow-up.
 
 Counters at exit (stderr, one JSON object): `lines`, `written`, `ring_dropped`,
 `bad_lines`, `oversized_lines`, `scan_fallbacks`, `height_breaks`, `rotations`,
-`post_rotation_lines`, `rescans`, `reads`.
+`post_rotation_lines`, `rescans`, `reads`, `stop_signal`.
 `WsFilter` drops the first `l2Book`/`trades` frame per coin after each
 (re)connect and counts malformed frames, including `l2Book`/`trades` frames
 whose coin is missing, null, empty, not a string or (for `trades`) not the
