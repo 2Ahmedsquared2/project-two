@@ -918,6 +918,7 @@ name = "hl-order"
 version = "0.1.0"
 dependencies = [
  "criterion 0.5.1",
+ "hl-alloc-gate",
  "k256",
  "proptest",
  "rmp",

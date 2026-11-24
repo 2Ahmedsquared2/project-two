@@ -24,9 +24,15 @@ thiserror = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }
 criterion = { version = "0.5", default-features = false }
+# Test-only: fails a test when a signature allocates after warmup.
+hl-alloc-gate = { path = "../hl-alloc-gate" }
 
 [[bench]]
 name = "sign_order"
+harness = false
+
+[[bench]]
+name = "sign_percentiles"
 harness = false
 
 [lints]
