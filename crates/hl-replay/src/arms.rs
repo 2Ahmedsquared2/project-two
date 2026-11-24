@@ -28,6 +28,8 @@ pub enum Arm {
     /// compio on `io_uring`, pinned.
     Compio,
     /// compio on `io_uring` with a kernel submission-queue polling thread.
+    /// Pinned, it needs [`RoundConfig::sqpoll_core`]: a core for that thread
+    /// other than the hot core. Without one it is unavailable.
     CompioSqpoll,
     /// Tail a file by spinning on `read`.
     FileBusyPoll,
@@ -130,6 +132,9 @@ pub struct RoundConfig {
     pub feeder_core: Option<usize>,
     /// Core for the hot thread, or `None`.
     pub hot_core: Option<usize>,
+    /// Core for the kernel's submission-queue polling thread of the
+    /// `compio-sqpoll` arm, or `None`.
+    pub sqpoll_core: Option<usize>,
     /// Directory for the file the detect-mode arms tail (`/dev/shm` is the
     /// honest choice: the node's output is read from the page cache).
     pub tail_dir: PathBuf,
@@ -149,6 +154,10 @@ pub struct RoundResult {
     /// `Some(true)` if the hot thread was pinned as asked, `Some(false)` if
     /// pinning was refused, `None` if this arm was not asked to pin.
     pub hot_pinned: Option<bool>,
+    /// The CPUs the kernel's submission-queue polling thread may run on
+    /// (its `Cpus_allowed_list`, read from `/proc` once the ring exists).
+    /// `None` for an arm without such a thread, or when it could not be read.
+    pub sqpoll_cpus: Option<String>,
 }
 
 /// A round either ran or could not on this host.
@@ -171,7 +180,97 @@ enum Source {
     File(PathBuf),
 }
 
-type HotResult = Result<(Option<Hists>, Option<bool>), ReplayError>;
+/// What the hot thread hands back: its histograms (`None` when the arm was
+/// unavailable), whether it was pinned, and its polling thread's CPUs.
+struct HotOut {
+    hists: Option<Hists>,
+    pinned: Option<bool>,
+    sqpoll_cpus: Option<String>,
+}
+
+type HotResult = Result<HotOut, ReplayError>;
+
+/// A kernel submission-queue polling thread, and the core it is given.
+#[derive(Clone, Copy)]
+struct SqPoll {
+    core: Option<usize>,
+}
+
+/// Why the `compio-sqpoll` arm cannot run with these cores, if it cannot.
+///
+/// The kernel's polling thread (`iou-sqp`) is created by the hot thread and
+/// spins. Given no CPU of its own it starts beside its creator: on Linux 6.1
+/// it was seen on the pinned hot thread's core in 4 of 5 samples although it
+/// was allowed on every core, and on a hot core the scheduler does not
+/// balance (`isolcpus`) nothing would move it off. Two spinning threads on
+/// one core are time-sliced against each other, milliseconds where the other
+/// arms take microseconds (the Tokyo runs of d7f9087; that this is their
+/// cause is inferred, not yet confirmed there). A pinned run therefore needs
+/// a core for the polling thread that is not the hot core.
+fn sqpoll_core_refusal(hot_core: Option<usize>, sqpoll_core: Option<usize>) -> Option<String> {
+    let hot = hot_core?;
+    let what = match sqpoll_core {
+        Some(c) if c != hot => return None,
+        Some(_) => "was given the hot thread's core",
+        None => "was given no core, so it would start beside the hot thread",
+    };
+    Some(format!(
+        "the kernel's polling thread {what} (core {hot}) and would spin there against it: pass --sqpoll-core N with another core"
+    ))
+}
+
+/// The CPUs of the polling thread that appeared since `before` was read.
+///
+/// The thread names itself and takes its CPU when it first runs, not when
+/// the ring is made, so this waits (at most 200 ms, before the round starts,
+/// so nothing measured is delayed) until it shows and, when it was given a
+/// core, until the kernel reports that core. It returns the last reading
+/// either way: what the kernel says, not what was asked. `None` if the
+/// thread never shows.
+fn new_sqpoll_thread_cpus(before: &[(String, String)], asked: Option<usize>) -> Option<String> {
+    let asked = asked.map(|c| c.to_string());
+    let mut last = None;
+    for _ in 0..200 {
+        let new: Vec<String> = sqpoll_threads()
+            .into_iter()
+            .filter(|(tid, _)| !before.iter().any(|(old, _)| old == tid))
+            .map(|(_, cpus)| cpus)
+            .collect();
+        if !new.is_empty() {
+            last = Some(new.join(" | "));
+            if asked.is_none() || last == asked {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    last
+}
+
+/// The `iou-sqp` kernel threads of this process: `(tid, Cpus_allowed_list)`.
+/// Empty where `/proc` has no such thing.
+fn sqpoll_threads() -> Vec<(String, String)> {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return Vec::new();
+    };
+    tasks
+        .filter_map(|task| {
+            let task = task.ok()?;
+            let comm = std::fs::read_to_string(task.path().join("comm")).ok()?;
+            if !comm.starts_with("iou-sqp") {
+                return None;
+            }
+            let status = std::fs::read_to_string(task.path().join("status")).ok()?;
+            let cpus = status
+                .lines()
+                .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))?;
+            Some((
+                task.file_name().to_string_lossy().into_owned(),
+                cpus.trim().to_owned(),
+            ))
+        })
+        .collect()
+}
 
 fn pin(core: Option<usize>) -> Option<bool> {
     core.map(|id| core_affinity::set_for_current(core_affinity::CoreId { id }))
@@ -349,12 +448,13 @@ fn tokio_arm(
 
 #[cfg(feature = "compio")]
 fn compio_arm(
-    sqpoll: bool,
+    sqpoll: Option<SqPoll>,
     source: TcpStream,
     sink: TcpStream,
     mut core: Core<ActivePipeline>,
     total: u64,
     ready: &SyncSender<Ready>,
+    sqpoll_cpus: &mut Option<String>,
 ) -> Result<Option<Hists>, ReplayError> {
     use compio::buf::{IntoInner, IoBuf};
     use compio::driver::{DriverType, ProactorBuilder};
@@ -363,13 +463,21 @@ fn compio_arm(
 
     let mut proactor = ProactorBuilder::new();
     proactor.driver_type(DriverType::IoUring);
-    if sqpoll {
-        proactor.sqpoll_idle(Duration::from_secs(10));
-    }
     let unavailable = |why: String| {
         let _ = ready.send(Ready::Unavailable(why));
         Ok(None)
     };
+    if let Some(sq) = sqpoll {
+        proactor.sqpoll_idle(Duration::from_secs(10));
+        if let Some(core) = sq.core {
+            let Ok(cpu) = u32::try_from(core) else {
+                return unavailable(format!("--sqpoll-core {core} is not a CPU number"));
+            };
+            proactor.sqpoll_cpu(cpu);
+        }
+    }
+    // The polling thread is the `iou-sqp` task that appears with the ring.
+    let before = sqpoll.map(|_| sqpoll_threads());
     let rt = match compio::runtime::RuntimeBuilder::new()
         .with_proactor(proactor)
         .build()
@@ -382,6 +490,9 @@ fn compio_arm(
             "compio fell back to the {:?} driver: io_uring is not usable on this host",
             rt.driver_type()
         ));
+    }
+    if let Some(before) = before {
+        *sqpoll_cpus = new_sqpoll_thread_cpus(&before, sqpoll.and_then(|sq| sq.core));
     }
     rt.block_on(async move {
         ensure_loopback_peer(sink.peer_addr())?;
@@ -428,12 +539,13 @@ fn compio_arm(
 #[cfg(not(feature = "compio"))]
 #[allow(clippy::unnecessary_wraps)]
 fn compio_arm(
-    _sqpoll: bool,
+    _sqpoll: Option<SqPoll>,
     _source: TcpStream,
     _sink: TcpStream,
     _core: Core<ActivePipeline>,
     _total: u64,
     ready: &SyncSender<Ready>,
+    _sqpoll_cpus: &mut Option<String>,
 ) -> Result<Option<Hists>, ReplayError> {
     let _ = ready.send(Ready::Unavailable(
         "built without the `compio` cargo feature".to_owned(),
@@ -449,15 +561,28 @@ fn hot_main(
     core: Core<ActivePipeline>,
     total: u64,
     hot_core: Option<usize>,
+    sqpoll_core: Option<usize>,
     ready: SyncSender<Ready>,
     abort: &AtomicBool,
 ) -> HotResult {
+    if arm == Arm::CompioSqpoll {
+        if let Some(why) = sqpoll_core_refusal(hot_core, sqpoll_core) {
+            let _ = ready.send(Ready::Unavailable(why));
+            return Ok(HotOut {
+                hists: None,
+                pinned: None,
+                sqpoll_cpus: None,
+            });
+        }
+    }
     // The multi-thread runtime is the unpinned baseline on purpose.
     let pinned = if arm == Arm::TokioMultiThread {
         None
     } else {
         pin(hot_core)
     };
+    let mut sqpoll_cpus = None;
+    let sqpoll = SqPoll { core: sqpoll_core };
     let hists = match (arm, source) {
         (Arm::BusyPoll, Source::Tcp(s)) => Some(busy_arm(s, sink, core, total, &ready)?),
         (Arm::TokioCurrentThread, Source::Tcp(s)) => {
@@ -466,8 +591,12 @@ fn hot_main(
         (Arm::TokioMultiThread, Source::Tcp(s)) => {
             Some(tokio_arm(true, s, sink, core, total, ready)?)
         }
-        (Arm::Compio, Source::Tcp(s)) => compio_arm(false, s, sink, core, total, &ready)?,
-        (Arm::CompioSqpoll, Source::Tcp(s)) => compio_arm(true, s, sink, core, total, &ready)?,
+        (Arm::Compio, Source::Tcp(s)) => {
+            compio_arm(None, s, sink, core, total, &ready, &mut sqpoll_cpus)?
+        }
+        (Arm::CompioSqpoll, Source::Tcp(s)) => {
+            compio_arm(Some(sqpoll), s, sink, core, total, &ready, &mut sqpoll_cpus)?
+        }
         (_, Source::File(path)) => file_arm(arm, &path, sink, core, total, &ready, abort)?,
         (_, Source::Tcp(_)) => {
             return Err(ReplayError::Config(format!(
@@ -476,7 +605,11 @@ fn hot_main(
             )))
         }
     };
-    Ok((hists, pinned))
+    Ok(HotOut {
+        hists,
+        pinned,
+        sqpoll_cpus,
+    })
 }
 
 /// The open-loop feeder. Line `i` is due at `start + (i + 1) * interval` on
@@ -629,7 +762,7 @@ pub fn run_round(arm: Arm, cfg: &RoundConfig) -> Result<RoundOutcome, ReplayErro
     let (ready_tx, ready_rx) = sync_channel(1);
     let hot = {
         let abort = Arc::clone(&abort);
-        let hot_core = cfg.hot_core;
+        let (hot_core, sqpoll_core) = (cfg.hot_core, cfg.sqpoll_core);
         std::thread::Builder::new()
             .name(format!("hl-replay-{}", arm.name()))
             .spawn(move || {
@@ -640,6 +773,7 @@ pub fn run_round(arm: Arm, cfg: &RoundConfig) -> Result<RoundOutcome, ReplayErro
                     core,
                     total,
                     hot_core,
+                    sqpoll_core,
                     ready_tx,
                     &abort,
                 )
@@ -698,8 +832,7 @@ pub fn run_round(arm: Arm, cfg: &RoundConfig) -> Result<RoundOutcome, ReplayErro
     let sink_stats = sink.finish();
     cleanup(&tail_path);
     drop(feed_end?);
-    let (hists, hot_pinned) = hot_result?;
-    checked(arm, total, hists, sink_stats?, hot_pinned)
+    checked(arm, total, hot_result?, sink_stats?)
 }
 
 /// A round counts only if what reached the sink is what was fed and no
@@ -707,10 +840,14 @@ pub fn run_round(arm: Arm, cfg: &RoundConfig) -> Result<RoundOutcome, ReplayErro
 fn checked(
     arm: Arm,
     total: u64,
-    hists: Option<Hists>,
+    hot: HotOut,
     sink: SinkStats,
-    hot_pinned: Option<bool>,
 ) -> Result<RoundOutcome, ReplayError> {
+    let HotOut {
+        hists,
+        pinned: hot_pinned,
+        sqpoll_cpus,
+    } = hot;
     let Some(hists) = hists else {
         return Err(ReplayError::Thread(format!(
             "{} reported ready and then produced nothing",
@@ -736,6 +873,7 @@ fn checked(
         sink,
         fed: total,
         hot_pinned,
+        sqpoll_cpus,
     })))
 }
 
@@ -752,6 +890,8 @@ pub struct ArmReport {
     pub orders: u64,
     /// Whether the hot thread was pinned; see [`RoundResult::hot_pinned`].
     pub hot_pinned: Option<bool>,
+    /// See [`RoundResult::sqpoll_cpus`]; the last round's.
+    pub sqpoll_cpus: Option<String>,
     /// Why the arm could not run here, if it could not.
     pub unavailable: Option<String>,
 }
@@ -833,6 +973,7 @@ fn run_rounds(
             hists: Hists::default(),
             orders: 0,
             hot_pinned: None,
+            sqpoll_cpus: None,
             unavailable: None,
         })
         .collect();
@@ -860,6 +1001,7 @@ fn run_rounds(
                     report.hists.merge(&r.hists);
                     report.orders += r.sink.orders;
                     report.hot_pinned = r.hot_pinned;
+                    report.sqpoll_cpus = r.sqpoll_cpus;
                 }
                 RoundOutcome::Unavailable(why) => report.unavailable = Some(why),
             }

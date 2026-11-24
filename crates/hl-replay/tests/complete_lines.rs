@@ -157,6 +157,7 @@ fn the_report_says_what_was_checked_and_what_is_still_unmeasured() {
         host: HostInfo::default(),
         feeder_core: None,
         hot_core: None,
+        sqpoll_core: None,
         rounds: 1,
         measured_per_round: 1,
         warmup_per_round: 0,
