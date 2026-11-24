@@ -39,7 +39,7 @@ mkdir -p results
 ./scripts/capture-host.sh "$facts"       # read-only; second argument names the NIC if it is not the default route's
 ./target/release/hl-replay \
   --arms all --rounds 5 --lines 11000 --warmup 1000 --interval-us 1000 \
-  --feeder-core 2 --hot-core 3 \
+  --feeder-core 2 --hot-core 3 --sqpoll-core 4 \
   --host-facts "$facts" --out "$out"
 ```
 
@@ -155,7 +155,8 @@ repository's development machines. The harness never requires or reads this
 section; the report only says `rtt-manual: present` or `absent`.
 
 Set `--feeder-core` and `--hot-core` to two different physical cores, the hot
-one isolated if the host has isolated cores. To replay recorded node output
+one isolated if the host has isolated cores, and `--sqpoll-core` to a third
+(see the `compio-sqpoll` arm below; without it that arm does not run). To replay recorded node output
 instead of generated lines, add `--input <file>` (one block-info JSON line per
 line; the file is cycled). Send Latency the whole `--out` directory, which
 includes `host-facts.txt`.
@@ -176,7 +177,27 @@ socket.
 | `tokio-current-thread` | tokio `current_thread`, pinned |
 | `tokio-multi-thread` | tokio multi-thread, 2 workers, task spawned, never pinned: the stock setup |
 | `compio` | compio 0.19.2 on `io_uring`, pinned |
-| `compio-sqpoll` | the same with a kernel submission-queue polling thread |
+| `compio-sqpoll` | the same with a kernel submission-queue polling thread; pinned, it needs `--sqpoll-core` (below) |
+
+`compio-sqpoll` has a second spinning thread, the kernel's `iou-sqp` polling
+thread, which the hot thread creates. Give it a core with `--sqpoll-core N`:
+not the hot core, and best a third isolated core (on the feeder's core it
+competes with the feeder, which shows up as feeder lateness in `feed-t2`). A
+pinned run without `--sqpoll-core` reports the arm `unavailable` and says so;
+`--sqpoll-core` equal to `--hot-core` is a usage error. With `--no-pin` the
+thread is left free unless the flag names a core. The report's `pinning:` line
+names the core asked for, and each `compio-sqpoll` row carries
+`sqpoll=cpus:<list>`: the thread's `Cpus_allowed_list` as the kernel reports
+it once the ring exists (`unknown` if it could not be read).
+
+Why: in the Tokyo runs of d7f9087 (hot core 15, kernel 7.0) this arm's t1-t0,
+the parser alone, was p50 9 ms against about 1 µs on every other arm, in whole
+milliseconds. The likely cause is the polling thread spinning on the hot core,
+where it starts and, on a core the scheduler does not balance, stays. That
+cause is **inferred, not confirmed**: on a 2-core Linux 6.1 machine the thread
+was seen on the hot core in 4 of 5 samples while allowed on both cores, but
+the millisecond t1-t0 did not reproduce there. A Tokyo run with
+`--sqpoll-core` on a third core confirms it if t1-t0 returns to about 1 µs.
 
 Detect arms (`--arms detect`): lines are appended to a file in `--tail-dir`
 (default `/dev/shm`) and the reader tails it, as the node's output is read.

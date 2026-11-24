@@ -33,6 +33,10 @@ loopback socket (t2), per arm, rounds interleaved.
   --distinct N       distinct generated lines (default 64)
   --feeder-core N    core for the feeder and sink (default 0)
   --hot-core N       core for the hot thread (default 1)
+  --sqpoll-core N    core for the kernel polling thread of compio-sqpoll; not
+                     the hot core. A pinned run without it reports that arm
+                     unavailable: the thread would start, and spin, beside
+                     the hot thread
   --no-pin           pin nothing
   --tail-dir DIR     where detect arms tail their file (default /dev/shm)
   --sink-bind ADDR   sink listen address; loopback only (default 127.0.0.1:0)
@@ -172,6 +176,7 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
             "--distinct",
             "--feeder-core",
             "--hot-core",
+            "--sqpoll-core",
             "--tail-dir",
             "--sink-bind",
             "--out",
@@ -194,6 +199,7 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
             "--distinct" => a.distinct = num(flag, v)?,
             "--feeder-core" => a.feeder_core = Some(num(flag, v)?),
             "--hot-core" => a.hot_core = Some(num(flag, v)?),
+            "--sqpoll-core" => a.sqpoll_core = Some(num(flag, v)?),
             "--tail-dir" => a.tail_dir = PathBuf::from(v),
             "--host-facts" => a.host_facts = Some(PathBuf::from(v)),
             "--sink-bind" => a.sink_bind = v.parse().map_err(|e| format!("--sink-bind: {e}"))?,
@@ -203,6 +209,12 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
     if no_pin {
         a.feeder_core = None;
         a.hot_core = None;
+    }
+    if a.sqpoll_core.is_some() && a.sqpoll_core == a.hot_core {
+        return Err(
+            "--sqpoll-core must not be the --hot-core: the kernel polling thread would spin against the hot thread"
+                .to_owned(),
+        );
     }
     validate(&a)?;
     Ok(Some(a))

@@ -1,9 +1,10 @@
 //! The `compio-sqpoll` arm's kernel polling thread must not share the hot
 //! thread's core. Created by a pinned thread with no CPU of its own, the
-//! `iou-sqp` thread inherits that thread's affinity and spins on its core
-//! (seen on the Tokyo box: t1-t0 p50 9 ms where every other arm has ~1 µs).
-//! So the arm takes a core for it (`sqpoll_core`, `--sqpoll-core`), refuses
-//! to run pinned without one, and reports where the thread may run.
+//! spinning `iou-sqp` thread starts beside its creator and can stay on its
+//! core (on the Tokyo box t1-t0 was p50 9 ms where every other arm has
+//! about 1 µs). So the arm takes a core for it (`sqpoll_core`,
+//! `--sqpoll-core`), refuses to run pinned without one, and reports where
+//! the kernel says the thread may run.
 #![cfg(all(target_os = "linux", feature = "compio"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
