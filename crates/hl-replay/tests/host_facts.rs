@@ -1546,16 +1546,56 @@ fn a_polling_thread_outside_the_isolated_set_warns_as_the_other_cores_do() {
         sqpoll_warnings(&f, None, None, Some(13)),
         ["isolcpus is not set: sqpoll core 13 is not isolated"]
     );
-    // Only isolation is asked of the polling thread's core: it is a kernel
-    // thread, and nohz_full and rcu_nocbs lines stay about the other two.
-    let f = file_with_topology(
-        "isolcpus: 13-15\nnohz_full: 14-15\nrcu_nocbs: 14-15",
-        "active: 0",
-        numa,
+}
+
+/// Latency's rule: the polling thread spins and picks up submissions, so the
+/// tick and RCU callbacks on its core delay them as they delay the hot
+/// thread. All three pinned cores are judged by the same lists.
+#[test]
+fn a_polling_thread_outside_nohz_full_or_rcu_nocbs_warns_as_the_other_cores_do() {
+    let topo = |cmdline: &str| file_with_topology(cmdline, "active: 0", "node0 cpus: 0-15");
+    let f = topo("isolcpus: 13-15\nnohz_full: 14-15\nrcu_nocbs: 14-15");
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(13)),
+        [
+            "sqpoll core 13 is not in nohz_full (14-15)",
+            "sqpoll core 13 is not in rcu_nocbs (14-15)",
+        ]
     );
+    // In nohz_full its RCU callbacks are offloaded already.
+    let f = topo("isolcpus: 13-15\nnohz_full: 13-15\nrcu_nocbs: 14-15");
     assert_eq!(
         sqpoll_warnings(&f, Some(14), Some(15), Some(13)),
         Vec::<String>::new()
+    );
+    // Offloaded but not tickless.
+    let f = topo("isolcpus: 13-15\nnohz_full: 14-15\nrcu_nocbs: 13-15");
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(13)),
+        ["sqpoll core 13 is not in nohz_full (14-15)"]
+    );
+    // Tokyo: none of the three is set.
+    let f = topo("isolcpus: not set\nnohz_full: not set\nrcu_nocbs: not set");
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(13)),
+        [
+            "isolcpus is not set: feeder core 14, hot core 15 and sqpoll core 13 are not isolated",
+            "nohz_full is not set: feeder core 14, hot core 15 and sqpoll core 13 are not tickless",
+            "rcu_nocbs is not set: feeder core 14, hot core 15 and sqpoll core 13 are not offloaded from RCU callbacks",
+        ]
+    );
+    // A polling thread on CPU 0 that nohz_full names: the boot CPU keeps the tick.
+    let f = topo("isolcpus: 0-15\nnohz_full: 0-15\nrcu_nocbs: 0-15");
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(0)),
+        ["sqpoll core 0 is in nohz_full (0-15), but the kernel forces the boot CPU (normally CPU 0) outside nohz_full: it may still take the tick"]
+    );
+    // An unreadable nohz_full leaves its offload undetermined too.
+    let f = topo("isolcpus: 13-15\nnohz_full: 2-N\nrcu_nocbs: 14-15");
+    let got = sqpoll_warnings(&f, Some(14), Some(15), Some(13));
+    assert!(
+        got.contains(&"sqpoll core 13 is not in rcu_nocbs (14-15) and nohz_full (2-N) could not be parsed: whether it is offloaded from RCU callbacks is undetermined".to_owned()),
+        "{got:?}"
     );
 }
 
