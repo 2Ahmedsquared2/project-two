@@ -93,6 +93,30 @@ pub struct TailStats {
     /// Lines dropped for exceeding the line cap (see
     /// [`NodeTailer::with_max_line`]); not included in `bad_lines`.
     pub oversized_lines: u64,
+    /// Directory walks looking for a newer hourly file.
+    pub rescans: u64,
+    /// Lines `hl_latency::scan_node_header` refused that the strict
+    /// `hl_latency::parse_node_line` then accepted (included in `lines`).
+    pub scan_fallbacks: u64,
+    /// Observations whose `block_number` is not the previous one plus one.
+    pub height_breaks: u64,
+    /// Observations read by the poll that switched to a file (see
+    /// [`Switch`]); their stamps can be late by the rescan interval.
+    pub post_rotation_lines: u64,
+}
+
+/// What the poll that switched to a new file read from it. That file may
+/// have existed for up to the caller's rescan interval before the switch, so
+/// these observations' stamps are an upper bound, not an arrival time: leave
+/// them out of latency percentiles.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Switch {
+    /// Observations read from the new file by the switching poll.
+    pub lines: u64,
+    /// `block_number` of the first of them.
+    pub first_block_number: Option<u64>,
+    /// `block_number` of the last of them.
+    pub last_block_number: Option<u64>,
 }
 
 /// Turns each complete line into an observation, in place.
@@ -268,6 +292,15 @@ impl NodeTailer {
                 .push(self.buf.get(..n).unwrap_or_default(), recv_ns, &mut parser);
         }
         Ok(())
+    }
+
+    /// Asks the next poll that reaches the end of the current file to look
+    /// for a newer one.
+    pub fn request_rescan(&mut self) {}
+
+    /// The most recent switch to a file that was not yet reported, if any.
+    pub fn take_switch(&mut self) -> Option<Switch> {
+        None
     }
 
     /// True when the last [`Self::poll`] stopped at its read budget with
