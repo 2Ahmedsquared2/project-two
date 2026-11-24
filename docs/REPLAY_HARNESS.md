@@ -164,10 +164,10 @@ The report prints this table from the stage types themselves:
 | parser | real, mode `header scan` | `hl_latency::scan_node_header` (block time and height from the fixed prefix), falling back to the strict `parse_node_line` for a line it cannot scan |
 | book | stub | fixed 16-level arrays; prices derived from the block number, not from the line |
 | decision | stub | one ALO order per update |
-| signer | prototype | msgpack + 3x keccak-256 + libsecp256k1 + JSON body; placeholder domain, **not checked against SDK vectors** |
+| signer | real | `HlOrderSigner`: `hl-order`'s `Signer::sign_l1` (msgpack into keccak-256, EIP-712 agent digest, k256 RFC 6979) + the SDK request body, testnet source, throwaway key. Real because `tests/real_signer.rs` signs all 12 `hl-order` golden vectors through it byte for byte. Build with `--features prototype-signer` to run the old `PrototypeSigner` (libsecp256k1, placeholder domain) for comparison; the report then says `signer=prototype` |
 | send | prototype | plain TCP write to loopback: no TLS, no WebSocket framing, no NIC |
 
-So `t2-t0` today is a header scan plus a plausible signing cost. It is not
+So `t2-t0` today is a header scan plus the real signing cost. It is not
 tick-to-trade, and it is not comparable with runs made before the header
 scan (the report's `parser:` line says which parser a run used). Every row is tagged `parser=strict` or
 `parser=header scan` so a header scan's cost is never read as a full parse.
@@ -208,13 +208,13 @@ are four aliases in `crates/hl-replay/src/stage.rs`:
 pub type ActiveParser = HeaderScanParser;
 pub type ActiveBook = StubBook;
 pub type ActiveDecision = StubDecision;
-pub type ActiveSigner = PrototypeSigner; // <- the one line to change
+pub type ActiveSigner = HlOrderSigner; // PrototypeSigner with --features prototype-signer
 ```
 
-For the real signer: implement `Stage` (with
-`LABEL = StageLabel::Real` once it passes the SDK vectors) and `Signer` for
-it, give it a `throwaway()` constructor, and change the alias. The report's
-`signer=` label follows from the type.
+To swap the signer: implement `Stage` and `Signer` for the new type, give it
+a `throwaway()` constructor, and change the alias. The report's `signer=`
+label follows from the type; label it `real` only with a test against the SDK
+golden vectors, as `tests/real_signer.rs` does for `HlOrderSigner`.
 
 ## Allocation gates
 

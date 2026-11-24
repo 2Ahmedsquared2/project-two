@@ -12,9 +12,9 @@ use std::net::TcpStream;
 use hl_alloc_gate::{assert_no_alloc_after_warmup, count_ticks};
 use hl_replay::{
     generated_lines, loopback_pair, ActiveSigner, Book, BusyTick, Clock, CompleteLine, Core,
-    Decision, Handle, HeaderScanParser, LatencyHist, LineBuf, LoopbackAddr, NodeLineParser,
-    Observation, OrderIntent, Parser, Pipeline, Polled, ReplayError, Signer, Sink, Stage,
-    StageLabel, StubBook, StubDecision,
+    Decision, Handle, HeaderScanParser, HlOrderSigner, LatencyHist, LineBuf, LoopbackAddr,
+    NodeLineParser, Observation, OrderIntent, Parser, Pipeline, Polled, PrototypeSigner,
+    ReplayError, Signer, Sink, Stage, StageLabel, StubBook, StubDecision,
 };
 
 const WARMUP: u64 = 64;
@@ -63,26 +63,43 @@ fn gate_decision() {
     });
 }
 
+fn gate_signer_of<S: Signer>(name: &str, mut s: S) {
+    let mut out = Vec::new();
+    assert_no_alloc_after_warmup(name, WARMUP, TICKS, |i| {
+        out.clear();
+        let intent = OrderIntent {
+            asset: 0,
+            is_buy: i % 2 == 0,
+            px_ticks: 670_000 + i % 5000,
+            sz_lots: 100 + i % 7,
+            nonce: 1_753_606_210_051 + i,
+        };
+        s.sign(&intent, &mut out).unwrap();
+        black_box(&out);
+    });
+}
+
+/// The signer the harness runs.
 #[test]
 fn gate_signer() {
-    let mut s = ActiveSigner::throwaway();
-    let mut out = Vec::new();
-    assert_no_alloc_after_warmup(
+    gate_signer_of("signer: the active signer", ActiveSigner::throwaway());
+}
+
+/// The real signer, whichever one is active.
+#[test]
+fn gate_signer_real() {
+    gate_signer_of(
+        "signer: HlOrderSigner (hl-order sign_l1 + request body)",
+        HlOrderSigner::throwaway(),
+    );
+}
+
+/// The prototype kept for comparison, whichever one is active.
+#[test]
+fn gate_signer_prototype() {
+    gate_signer_of(
         "signer: prototype keccak + libsecp256k1",
-        WARMUP,
-        TICKS,
-        |i| {
-            out.clear();
-            let intent = OrderIntent {
-                asset: 0,
-                is_buy: i % 2 == 0,
-                px_ticks: 670_000 + i % 5000,
-                sz_lots: 100 + i % 7,
-                nonce: 1_753_606_210_051 + i,
-            };
-            s.sign(&intent, &mut out).unwrap();
-            black_box(&out);
-        },
+        PrototypeSigner::throwaway(),
     );
 }
 

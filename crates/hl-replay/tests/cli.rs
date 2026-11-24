@@ -67,7 +67,7 @@ fn a_small_run_prints_the_report_and_writes_the_raw_histograms() {
         "scan-vs-strict: validated=26 mismatches=0 fallbacks=0",
         "book=stub",
         "decision=stub",
-        "signer=prototype",
+        SIGNER_LABEL,
         "send=prototype",
         "busy-poll",
         "tokio-current-thread",
@@ -314,3 +314,11 @@ fn an_unavailable_arm_is_reported_not_fatal() {
     );
     assert!(text.contains("n=90"));
 }
+
+/// The real signer by default; the prototype under `--features
+/// prototype-signer`, which exists to compare the two.
+const SIGNER_LABEL: &str = if cfg!(feature = "prototype-signer") {
+    "signer=prototype"
+} else {
+    "signer=real"
+};
