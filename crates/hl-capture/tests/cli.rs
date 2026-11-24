@@ -730,6 +730,183 @@ mod signals {
         assert!(!rest.contains("\"lines\""), "no counters line: {rest}");
         drop(pipe);
     }
+
+    // ---- a signal after the deadline, during the final write (issue #52, item 2)
+
+    /// A run whose reader has stopped at its `--duration-s` deadline while
+    /// its writer cannot write, so the process cannot end by itself.
+    struct HeldAfterDeadline {
+        child: Child,
+        err: BufReader<ChildStderr>,
+        /// The read end of the FIFO that is `--out`; reading it lets the
+        /// writer go on.
+        pipe: fs::File,
+        /// How many bytes this test put in the FIFO to fill it.
+        filler: usize,
+        _guard: Watchdog,
+        _dir: tempfile::TempDir,
+    }
+
+    /// Fills the FIFO at `path` until not one more byte fits, and returns
+    /// how many bytes that took. The FIFO must have a reader.
+    fn fill(path: &std::path::Path) -> usize {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut w = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .unwrap();
+        let mut filled = 0;
+        // Whole pages first, then single bytes: a refused page-sized write
+        // can still leave room for a smaller one.
+        for chunk in [&[b'\n'; 4096][..], &[b'\n'; 1][..]] {
+            loop {
+                match w.write(chunk) {
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("filling the FIFO: {e}"),
+                }
+            }
+        }
+        filled
+    }
+
+    /// No sleep decides anything here. `--out` is a FIFO this test has
+    /// filled to the last byte before the node file exists, so the writer
+    /// thread blocks on its first write and stays blocked until the test
+    /// reads the FIFO. The reader takes in the burst and stops at its
+    /// deadline; from that stop line on, the process is alive and its
+    /// writer is mid-write, for as long as the test likes.
+    fn held_after_deadline() -> HeldAfterDeadline {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("node_raw_book_diffs");
+        let dir = root.join("hourly").join("20261119");
+        fs::create_dir_all(&dir).unwrap();
+        let staged = t.path().join("staged");
+        fs::write(&staged, burst(2000)).unwrap();
+        let fifo = t.path().join("obs.fifo");
+        assert!(Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let mut child = bin()
+            .arg("node")
+            .arg(&root)
+            .arg("--out")
+            .arg(&fifo)
+            .args(["--detect", "poll", "--poll-us", "1000"])
+            .args(["--duration-s", "2"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let guard = watchdog(&child);
+        // The binary's open of the FIFO waits for this reader.
+        let pipe = fs::File::open(&fifo).unwrap();
+        let mut err = BufReader::new(child.stderr.take().unwrap());
+        read_until(&mut err, READY);
+        // Nothing has been written yet: there is no node file.
+        let filler = fill(&fifo);
+        fs::rename(&staged, dir.join("8")).unwrap();
+        let before = read_until(&mut err, READER_STOPPED);
+        assert!(
+            !before.contains("\"signal\""),
+            "the deadline stopped the reader, not a signal: {before}"
+        );
+        HeldAfterDeadline {
+            child,
+            err,
+            pipe,
+            filler,
+            _guard: guard,
+            _dir: t,
+        }
+    }
+
+    /// One signal after the reader stopped at its deadline changes nothing:
+    /// once the writer can write again the run ends as a deadline run does,
+    /// with exit 0, every record written, and no signal reported.
+    ///
+    /// The signal is pending or handled before the FIFO is read, and the
+    /// process cannot get past its blocked write or its join without
+    /// running the handler first, so a handler that exited on the first
+    /// signal would always be seen here as status 143.
+    fn one_signal_during_the_final_write_changes_nothing(signal: &str) {
+        let mut run = held_after_deadline();
+        send(&run.child, signal);
+        // Let the writer go on: read the FIFO to its end, which comes when
+        // the process has closed it.
+        let mut written = Vec::new();
+        run.pipe.read_to_end(&mut written).unwrap();
+        let mut rest = String::new();
+        run.err.read_to_string(&mut rest).unwrap();
+        let status = run.child.wait().unwrap();
+        assert_eq!(status.code(), Some(0), "{signal}: {status}: {rest}");
+        assert!(!rest.contains("\"signal\""), "{signal}: {rest}");
+        let c = counters(rest.as_bytes());
+        assert!(c["stop_signal"].is_null(), "{signal}: {c}");
+        assert_eq!(c["ring_dropped"], 0, "{signal}: {c}");
+        assert_eq!(c["written"], c["lines"], "{signal}: {c}");
+        let lines = c["lines"].as_u64().unwrap();
+        assert!(
+            lines > 0,
+            "{signal}: the writer was only held if there was something to write: {c}"
+        );
+        let (filler, records) = written.split_at(run.filler);
+        assert!(filler.iter().all(|&b| b == b'\n'), "{signal}");
+        let obs = read_observations(records).unwrap();
+        let heights: Vec<_> = obs.iter().map(|o| o.block_number.unwrap()).collect();
+        assert_eq!(
+            heights,
+            (0..lines).collect::<Vec<_>>(),
+            "{signal}: every record the reader pushed was written, in order"
+        );
+    }
+
+    #[test]
+    fn a_sigterm_during_the_final_write_after_the_deadline_changes_nothing() {
+        one_signal_during_the_final_write_changes_nothing("TERM");
+    }
+
+    #[test]
+    fn a_sigint_during_the_final_write_after_the_deadline_changes_nothing() {
+        one_signal_during_the_final_write_changes_nothing("INT");
+    }
+
+    /// Signals are still the way out of a final write that cannot finish:
+    /// the first one after the deadline counts as the first, so a repeat
+    /// ends the process with 128 + the signal number and no counters line.
+    ///
+    /// Nothing outside the process shows when it has handled the first
+    /// signal, and two of the same kind sent before that are one signal to
+    /// the kernel. So the signal is sent again every 20 ms until the process
+    /// is gone, instead of sleeping and hoping one gap was long enough. This
+    /// pins that repeats exit, not that it is exactly the second that does;
+    /// the test above pins that the first does not.
+    #[test]
+    fn repeated_signals_during_the_final_write_after_the_deadline_force_exit() {
+        let mut run = held_after_deadline();
+        let mut sent = 0;
+        let status = loop {
+            if let Some(status) = run.child.try_wait().unwrap() {
+                break status;
+            }
+            send(&run.child, "TERM");
+            sent += 1;
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let mut rest = String::new();
+        run.err.read_to_string(&mut rest).unwrap();
+        assert_eq!(
+            status.code(),
+            Some(128 + 15),
+            "{status} after {sent} signals: {rest}"
+        );
+        assert!(sent >= 2, "one signal ended it: {rest}");
+        assert!(!rest.contains("\"lines\""), "no counters line: {rest}");
+        assert!(!rest.contains("\"signal\""), "{rest}");
+    }
 }
 
 // ---- a walk error on the writer thread (issue #57, item 1) --------------------

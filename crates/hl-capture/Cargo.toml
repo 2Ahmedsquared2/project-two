@@ -31,6 +31,10 @@ hl-strict-pass = { path = "../hl-strict-pass" }
 proptest = { workspace = true }
 tempfile = "3"
 
+# tests/cli.rs: `O_NONBLOCK`, to fill the named pipe that holds the writer.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 # Plain timing harnesses (percentiles on stdout), not criterion:
 #   cargo bench -p hl-capture --bench capture
 #   cargo bench -p hl-capture --bench legacy

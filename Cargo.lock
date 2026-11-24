@@ -882,6 +882,7 @@ dependencies = [
  "hl-strict-pass",
  "inotify",
  "itoa",
+ "libc",
  "memchr",
  "proptest",
  "rtrb",
