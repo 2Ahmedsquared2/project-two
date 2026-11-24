@@ -76,6 +76,13 @@ fn gate(what: &str, events: usize, scouted: bool) {
     let mut seen = 0u64;
     // The first poll finds the file and follows it from its end.
     tail.poll_into(&mut clock, &mut sink).unwrap();
+    if scouted {
+        // The scout thread is running before anything is measured.
+        tail.request_rescan();
+        while tail.look_pending() {
+            std::thread::yield_now();
+        }
+    }
     assert_no_alloc_after_warmup(what, WARMUP, TICKS, |i| {
         file.write_all(&lines[usize::try_from(i).unwrap()]).unwrap();
         if scouted {

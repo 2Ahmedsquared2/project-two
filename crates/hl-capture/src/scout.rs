@@ -115,13 +115,21 @@ impl Scout {
     /// it is newer than the last one handed over and the slot is free.
     pub fn look(&mut self) -> std::io::Result<()> {
         self.looks += 1;
-        // Not implemented yet (red): finds nothing.
-        let _ = (
-            &self.tx,
-            hourly_key,
-            newest_hourly_file,
-            File::open::<&Path>,
-        );
+        let Some(path) = newest_hourly_file(&self.root)? else {
+            return Ok(());
+        };
+        let Some(key) = hourly_key(&path) else {
+            return Ok(());
+        };
+        if self.last.is_some_and(|last| key <= last) || self.tx.is_full() {
+            // Nothing new, or the reader has not taken the last one yet:
+            // that one stays queued and this one is found again later.
+            return Ok(());
+        }
+        let file = File::open(&path)?;
+        if self.tx.push(Found { path, key, file }).is_ok() {
+            self.last = Some(key);
+        }
         Ok(())
     }
 

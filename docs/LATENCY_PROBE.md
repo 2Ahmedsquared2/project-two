@@ -211,14 +211,32 @@ is read to its end once more before the switch, so a line the node appended to
 it while the look ran is kept (those are ordinary lines, not post-rotation
 ones). What the node appends to the old file after that is not read: the node
 is taken to finish a file before it starts the next (not verified against real
-`hl-node` output). The look is a directory walk on the reader
-thread (13 us with one date directory, 262 us with thirty, shared machine):
-keep the interval coarse and **prune old date directories**. What the
+`hl-node` output). The look is a directory walk, and it runs on the **writer
+thread** (the scout), not on the reader: the reader walks once, at its first
+poll, and after that only takes what the scout found, one wait-free pop when
+its file is at its end. The scout also opens the new file. Measured on a
+loaded shared 4-core machine (tmpfs, n=2000, `cargo bench -p hl-capture
+--bench rotation`), the time one due look keeps the reader from reading:
+
+| date directories | reader walks (before) p50 / p99 / max | scout (now) p50 / p99 / max |
+|---|---|---|
+| 1 | 12.85 / 18.01 / 6184.85 us | 0.17 / 0.25 / 1.13 us |
+| 30 | 245.65 / 3293.28 / 22536.06 us | 0.19 / 0.57 / 69.01 us |
+
+The price is paid at rotation only. The writer thread notices a request to
+look within its 1 ms idle sleep (or one chunk of 1024 records while it is
+writing a backlog), so in `inotify` mode a new file's first line is stamped
+later than before: from just before the file is created to the stamp, p50 /
+p99 / max 144.81 / 197.48 / 241.80 us before and 867.62 / 6152.78 / 6647.20
+us now (n=240 new files, same machine and harness). Those lines were already
+excluded: they are the `post_rotation_lines`. Pruning old date directories
+still shortens the walk, but it no longer affects any stamp outside a
+rotation. What the
 switching poll reads from a new file may be stamped up to `--rescan-ms` late:
 it is reported as a `rotation` line on stderr (`late_lines`,
 `first_block_number`, `last_block_number`) and counted in
-`post_rotation_lines`; leave those block numbers out of percentiles. Moving
-the walk to the writer thread is the follow-up.
+`post_rotation_lines`; leave those block numbers out of percentiles. The
+`rescans` counter is the reader's one walk plus the scout's.
 
 Counters at exit (stderr, one JSON object): `lines`, `written`, `ring_dropped`,
 `bad_lines`, `oversized_lines`, `scan_fallbacks`, `height_breaks`, `rotations`,

@@ -12,6 +12,9 @@
 //! non-zero drop count is known to be incomplete and should be thrown away.
 //! Records already in the ring are never overwritten, so what reaches the
 //! file is always in order.
+//!
+//! The writer thread also carries the look for a newer hourly file (see
+//! [`crate::Scout`]): [`RingSource::run_with`] calls a hook between chunks.
 
 use std::io::Write;
 use std::time::Duration;
@@ -125,9 +128,8 @@ impl RingSource {
     ) -> std::io::Result<u64> {
         let mut total = 0;
         loop {
-            // Not implemented yet (red): the hook is never called.
-            let _ = &mut between;
-            let n = self.write_available(&mut out)?;
+            between()?;
+            let n = self.write_up_to(&mut out, WRITE_CHUNK)?;
             total += n;
             if n > 0 {
                 continue;
