@@ -716,3 +716,34 @@ fn reduce_only_as_plain_is_off_by_default_and_skips_trigger_and_frontend_market(
         vec![1]
     );
 }
+
+/// Price checks in native's order (the 122 ZRO/STRK/MANTA/W/xyz legs in
+/// 1232430001..1232440000): more decimals than the grid (6 - szDecimals
+/// for a perp) is "Order has invalid price." with no asset suffix, and it
+/// wins over the 5-significant-figure rule; a price on the grid with more
+/// than 5 significant figures is still "tick size"; price 0 is still
+/// "invalid price". TST: szDecimals 2, so 4 price decimals.
+#[test]
+fn price_decimals_beyond_the_grid_are_invalid_price_before_sig_figs() {
+    let leg = |p: &str| json!({"type":"order","orders":[{"a":7,"b":true,"p":p,"s":"1","r":false,"t":{"limit":{"tif":"Gtc"}}}],"grouping":"na"});
+    let cases = [
+        // too many decimals, <= 5 significant figures (STRK/MANTA/W class)
+        ("0.03199", json!({"error":"Order has invalid price."})),
+        // too many decimals and > 5 significant figures (ZRO/xyz class)
+        ("1.142061", json!({"error":"Order has invalid price."})),
+        // within the grid, > 5 significant figures (the 23-leg control)
+        (
+            "12.3456",
+            json!({"error":"Price must be divisible by tick size. asset=7"}),
+        ),
+        // zero price (the 23 HYPE legs)
+        ("0", json!({"error":"Order has invalid price."})),
+    ];
+    for (p, want) in cases {
+        let mut e = engine();
+        let a = leg(p);
+        let out = e.execute_block(1_000_000_000_000, &[ua("order", &a, ALICE)]);
+        assert_eq!(status(&out.results[0]), &want, "price {p}");
+        assert!(out.book_diffs.is_empty(), "price {p}");
+    }
+}

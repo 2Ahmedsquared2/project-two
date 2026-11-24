@@ -928,8 +928,11 @@ fn leg_req(meta: &AssetTable, leg: &Value, priority: u64) -> Option<(OrderReq, L
             v
         }
         Ok(v) => v,
+        // More decimals than the grid: native's "Order has invalid price.",
+        // checked before significant figures (122 of 122 legs in
+        // 1232430001..1232440000, 94 of them also over 5 significant figures).
         Err(Units::TooManyDecimals) => {
-            pre = Some(RejectReason::TickSize);
+            pre = Some(RejectReason::InvalidPrice);
             0
         }
         Err(_) => return None,
@@ -1195,7 +1198,9 @@ fn reject_text(meta: &AssetTable, asset: Asset, r: RejectReason, in_modify: bool
         RejectReason::UnknownOrder => "Order was never placed, already canceled, or filled.".into(),
         RejectReason::ModifyUnknownOrder => return "Cannot modify canceled or filled order".into(),
         RejectReason::TickSize => "Price must be divisible by tick size.".into(),
-        RejectReason::ZeroPrice => return "Order has invalid price.".into(),
+        RejectReason::ZeroPrice | RejectReason::InvalidPrice => {
+            return "Order has invalid price.".into()
+        }
         RejectReason::LotSize => return "Order has invalid size.".into(),
         RejectReason::ZeroSize => return "Order has zero size.".into(),
         other => return format!("p2 engine internal: {other:?}"),
