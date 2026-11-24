@@ -218,7 +218,7 @@ pub enum OrderStatus {
 }
 
 /// Per-action response: a range into [`BlockOutcome::statuses`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ActionResponse {
     /// First status index.
     pub start: u32,

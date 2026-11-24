@@ -230,6 +230,10 @@ struct Block {
     types: Vec<String>,
     native: Vec<Value>,
     expires: Vec<Option<u64>>,
+    /// Every asset a decoded leg names (for the unseeded-book check).
+    assets: Vec<Asset>,
+    /// Actions per signed-action bundle (native's in-block order is per bundle).
+    bundle_lens: Vec<u32>,
 }
 
 impl Block {
@@ -295,6 +299,7 @@ fn decode_block(meta: &Meta, line: &str) -> Block {
         let sas = bundle[1]["signed_actions"].as_array().unwrap();
         let rs = resp[1].as_array().unwrap();
         assert_eq!(sas.len(), rs.len());
+        b.bundle_lens.push(sas.len() as u32);
         for (sa, r) in sas.iter().zip(rs) {
             let a = &sa["action"];
             let t = a["type"].as_str().unwrap_or("?").to_owned();
@@ -313,6 +318,7 @@ fn decode_block(meta: &Meta, line: &str) -> Block {
                     for o in a["orders"].as_array().into_iter().flatten() {
                         let (leg, uns) = decode_leg(meta, o, prio);
                         unsupported |= uns || leg.reduce_only || leg.tif == Tif::Other;
+                        b.assets.push(leg.asset);
                         legs.push(leg);
                     }
                     b.orders.push(legs);
@@ -323,6 +329,7 @@ fn decode_block(meta: &Meta, line: &str) -> Block {
                     for c in a["cancels"].as_array().into_iter().flatten() {
                         let asset = c["a"].as_u64().or(c["asset"].as_u64()).unwrap_or(0) as Asset;
                         unsupported |= !meta.by_idx.contains_key(&asset);
+                        b.assets.push(asset);
                         let target = if t == "cancel" {
                             OrderRef::Oid(Oid(c["o"].as_u64().unwrap_or(0)))
                         } else {
@@ -349,6 +356,7 @@ fn decode_block(meta: &Meta, line: &str) -> Block {
                         };
                         let (leg, uns) = decode_leg(meta, &m["order"], 0);
                         unsupported |= uns || leg.reduce_only || leg.tif == Tif::Other;
+                        b.assets.push(leg.asset);
                         ms.push(ModifyReq { target, order: leg });
                     }
                     b.modifies.push(ms);
@@ -509,6 +517,32 @@ fn response_json(meta: &Meta, b: &Block, i: usize, st: &[OrderStatus], expired: 
     }
 }
 
+/// Parse a decimal from native's OUTPUT (diffs), which may print trailing
+/// zeros past the asset's decimals ("2923.0" for a 0-decimal coin). Inputs
+/// (order legs) stay on the strict `parse_fixed` path.
+fn parse_out(s: &str, dec: u32) -> u64 {
+    let t = if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        s
+    };
+    if let Some(v) = parse_fixed(t.as_bytes(), dec) {
+        return v;
+    }
+    // Native prints some sizes via f64 ("3748301.7000000002"): round to the
+    // asset's units and require the residual to be float noise only.
+    let f: f64 = s
+        .parse()
+        .unwrap_or_else(|_| panic!("bad native decimal {s}"));
+    let scaled = f * 10f64.powi(dec.cast_signed());
+    let r = scaled.round();
+    assert!(
+        (scaled - r).abs() < 1e-3 && r >= 0.0,
+        "native decimal {s} is not on a {dec}-decimal grid"
+    );
+    r as u64
+}
+
 fn parse_diffs(meta: &Meta, line: &str) -> (u64, Vec<BookDiff>, usize) {
     let v: Value = serde_json::from_str(line).unwrap();
     let h = v["block_number"].as_u64().unwrap();
@@ -524,8 +558,8 @@ fn parse_diffs(meta: &Meta, line: &str) -> (u64, Vec<BookDiff>, usize) {
             Some("B" | "Bid") => Side::Bid,
             _ => Side::Ask,
         };
-        let px = Px(parse_fixed(e["px"].as_str().unwrap().as_bytes(), info.px_dec).unwrap());
-        let sz = |s: &Value| Sz(parse_fixed(s.as_str().unwrap().as_bytes(), info.sz_dec).unwrap());
+        let px = Px(parse_out(e["px"].as_str().unwrap(), info.px_dec));
+        let sz = |s: &Value| Sz(parse_out(s.as_str().unwrap(), info.sz_dec));
         let d = &e["raw_book_diff"];
         let kind = if d == "remove" {
             DiffKind::Remove
@@ -554,17 +588,29 @@ fn parse_diffs(meta: &Meta, line: &str) -> (u64, Vec<BookDiff>, usize) {
     (h, out, unknown)
 }
 
-fn load_seed(meta: &Meta, path: &str) -> (u64, Vec<RestingOrder>, usize) {
+struct Seed {
+    height: u64,
+    orders: Vec<RestingOrder>,
+    skipped: usize,
+    /// Native's next oid at the seed height, when the seed carries it.
+    next_oid: Option<u64>,
+    /// Assets whose book the seed holds (empty books included).
+    seeded: std::collections::HashSet<Asset>,
+}
+
+fn load_seed(meta: &Meta, path: &str) -> Seed {
     let v: Value = serde_json::from_reader(BufReader::new(File::open(path).unwrap())).unwrap();
     let h = v[0].as_u64().unwrap();
     let mut out = Vec::new();
     let mut skipped = 0;
+    let mut seeded = std::collections::HashSet::new();
     for cb in v[1].as_array().unwrap() {
         let coin = cb[0].as_str().unwrap();
         let Some(&asset) = meta.by_name.get(coin) else {
             skipped += 1;
             continue;
         };
+        seeded.insert(asset);
         let info = &meta.by_idx[&asset];
         for (si, side) in [(0, Side::Bid), (1, Side::Ask)] {
             for uo in cb[1][si].as_array().unwrap() {
@@ -588,7 +634,13 @@ fn load_seed(meta: &Meta, path: &str) -> (u64, Vec<RestingOrder>, usize) {
             }
         }
     }
-    (h, out, skipped)
+    Seed {
+        height: h,
+        orders: out,
+        skipped,
+        next_oid: v[2]["next_oid"].as_u64(),
+        seeded,
+    }
 }
 
 fn arg(name: &str) -> Option<String> {
@@ -602,17 +654,24 @@ fn main() {
     let meta = load_meta(&arg("--meta").expect("--meta"));
     let max: usize = arg("--max").map_or(usize::MAX, |s| s.parse().unwrap());
     let show: usize = arg("--show").map_or(5, |s| s.parse().unwrap());
-    let (seed_h, seed, skipped) = load_seed(&meta, &arg("--seed").expect("--seed"));
+    let Seed {
+        height: seed_h,
+        orders: seed,
+        skipped,
+        next_oid: seed_next,
+        seeded,
+    } = load_seed(&meta, &arg("--seed").expect("--seed"));
     eprintln!(
-        "seed height {seed_h}: {} resting orders, {skipped} coins not in meta",
-        seed.len()
+        "seed height {seed_h}: {} resting orders in {} books, {skipped} coins not in meta, next_oid {seed_next:?}",
+        seed.len(),
+        seeded.len()
     );
     let assets: Vec<Asset> = meta.by_idx.keys().copied().collect();
     let max_oid = seed.iter().map(|o| o.oid.0).max().unwrap_or(0);
     let mut e = Engine::from_l4_snapshot(
         &assets,
         seed,
-        Some(Oid(max_oid + 1)),
+        Some(Oid(seed_next.unwrap_or(max_oid + 1))),
         Capacity::default(),
         EngineConfig::default(),
     )
@@ -633,6 +692,7 @@ fn main() {
         }
     }
     let mut native_diffs: BTreeMap<u64, (Vec<BookDiff>, usize)> = BTreeMap::new();
+    let mut unseeded_diffs: HashMap<u64, usize> = HashMap::new();
     let first = blocks.first().map_or(0, |b| b.height);
     let last = blocks.last().map_or(0, |b| b.height);
     for line in BufReader::new(File::open(arg("--diffs").expect("--diffs")).unwrap()).lines() {
@@ -641,8 +701,15 @@ fn main() {
         if h < first || h > last {
             continue;
         }
+        // Diffs on books the seed does not hold are not compared or adopted;
+        // the block is flagged unseeded-book instead.
+        let (keep, drop): (Vec<BookDiff>, Vec<BookDiff>) =
+            d.into_iter().partition(|x| seeded.contains(&x.asset));
+        if !drop.is_empty() {
+            *unseeded_diffs.entry(h).or_default() += drop.len();
+        }
         let ent = native_diffs.entry(h).or_default();
-        ent.0.extend(d);
+        ent.0.extend(keep);
         ent.1 += unk;
     }
     // Native next-oid per block from statuses (resync path only).
@@ -675,10 +742,14 @@ fn main() {
     for b in &blocks {
         let acts = b.actions();
         let t0 = Instant::now();
-        let out = e.execute_block_with_expiry(b.time_ms, &acts, &b.expires);
+        let out = e.execute_block_bundled(b.time_ms, &acts, &b.expires, &b.bundle_lens);
         let ns = t0.elapsed().as_nanos() as u64;
         times_ns.push(ns);
         let mut why: Vec<String> = Vec::new();
+        // A block touching a book the seed does not hold cannot count.
+        if b.assets.iter().any(|a| !seeded.contains(a)) || unseeded_diffs.contains_key(&b.height) {
+            why.push("unseeded-book".into());
+        }
         if out.has_unsupported {
             let mut kinds: Vec<&str> = b
                 .acts
@@ -739,6 +810,7 @@ fn main() {
         let ours_d: Vec<BookDiff> = out
             .diffs
             .iter()
+            .filter(|d| seeded.contains(&d.asset))
             .map(|d| BookDiff { cloid: None, ..*d })
             .collect();
         if &ours_d != nd {

@@ -330,6 +330,10 @@ fn run(acts: &[Act]) -> Result<(), String> {
             }
         }
         for d in &e.outcome().diffs {
+            // A full fill is `update` to 0 then `remove`; the remove applies it.
+            if matches!(d.kind, DiffKind::Update { new: Sz(0), .. }) {
+                continue;
+            }
             mirror
                 .apply(&diff_to_op(d))
                 .map_err(|err| format!("act {i}: our diff {d:?} does not apply: {err}"))?;
@@ -544,4 +548,164 @@ fn expired_actions_are_rejected_without_an_oid() {
     );
     assert!(!out.has_unsupported);
     assert_eq!(e.next_oid(), Oid(2));
+}
+
+/// A leg that rested whole with no fill.
+fn rest(oid: u64, sz: u64) -> OrderStatus {
+    OrderStatus::Placed {
+        oid: Oid(oid),
+        filled: Sz(0),
+        notional: 0,
+        rested: Sz(sz),
+    }
+}
+
+/// Native's in-block order (our node's blocks 1232430001..=1232432000:
+/// consistent with the diff order on 2,000/2,000 blocks): within each
+/// signed-action bundle, actions sending no GTC/IOC leg first, then cancels,
+/// then actions sending a GTC/IOC (or trigger) leg; input order inside each
+/// class; bundles in input order. Responses stay in input order.
+#[test]
+fn bundled_block_runs_alo_then_cancels_then_gtc_per_bundle() {
+    let mut e = engine();
+    // Block 1: a resting ask (oid 1) that the cancel below targets.
+    let ask = [req(false, 105, 3, Tif::Gtc, None)];
+    e.execute_block(
+        0,
+        &[UserAction::Order {
+            user: user(1),
+            orders: &ask,
+        }],
+    );
+    assert_eq!(e.next_oid(), Oid(2));
+    // Bundle 1 (input order): GTC buy crossing 105, cancel oid 1, ALO bid 90.
+    // Native order: ALO (oid 2), cancel (removes 1), GTC (oid 3, rests: no ask left).
+    // Bundle 2: ALO bid 91 (oid 4) after everything in bundle 1.
+    let gtc = [req(true, 105, 1, Tif::Gtc, None)];
+    let cancel = [CancelReq {
+        asset: A,
+        target: OrderRef::Oid(Oid(1)),
+    }];
+    let alo = [req(true, 90, 1, Tif::Alo, None)];
+    let alo2 = [req(true, 91, 1, Tif::Alo, None)];
+    let acts = [
+        UserAction::Order {
+            user: user(2),
+            orders: &gtc,
+        },
+        UserAction::Cancel {
+            user: user(1),
+            cancels: &cancel,
+        },
+        UserAction::Order {
+            user: user(3),
+            orders: &alo,
+        },
+        UserAction::Order {
+            user: user(3),
+            orders: &alo2,
+        },
+    ];
+    let out = e.execute_block_bundled(0, &acts, &[], &[3, 1]);
+    assert_eq!(out.responses.len(), 4);
+    assert_eq!(out.statuses_of(0), &[rest(3, 1)]);
+    assert_eq!(out.statuses_of(1), &[OrderStatus::Cancelled]);
+    assert_eq!(out.statuses_of(2), &[rest(2, 1)]);
+    assert_eq!(out.statuses_of(3), &[rest(4, 1)]);
+    let seq: Vec<(u64, bool)> = out
+        .diffs
+        .iter()
+        .map(|d| (d.oid.0, matches!(d.kind, DiffKind::Remove)))
+        .collect();
+    assert_eq!(seq, vec![(2, false), (1, true), (3, false), (4, false)]);
+    assert!(e.check_invariants());
+}
+
+/// With no bundle lengths the whole block is one bundle; input order is
+/// kept only by the unbundled `execute_block`.
+#[test]
+fn bundled_block_without_lengths_is_one_bundle() {
+    let mut e = engine();
+    let gtc = [req(true, 100, 1, Tif::Gtc, None)];
+    let alo = [req(true, 90, 1, Tif::Alo, None)];
+    let acts = [
+        UserAction::Order {
+            user: user(2),
+            orders: &gtc,
+        },
+        UserAction::Order {
+            user: user(3),
+            orders: &alo,
+        },
+    ];
+    let out = e.execute_block_bundled(0, &acts, &[], &[]);
+    assert_eq!(out.statuses_of(0), &[rest(2, 1)]);
+    assert_eq!(out.statuses_of(1), &[rest(1, 1)]);
+}
+
+/// Native's diff shape for a match (our node's blocks 1232430001..=1232432000,
+/// 5,193/5,193 maker-update runs): every maker fill is an `update` (to 0 for
+/// a full fill), then the fully filled makers are removed in fill order,
+/// then the taker's own `new` if it rests.
+#[test]
+fn match_diffs_are_updates_then_removes_then_new() {
+    let mut e = engine();
+    let asks = [
+        req(false, 100, 2, Tif::Alo, None),
+        req(false, 100, 5, Tif::Alo, None),
+    ];
+    e.execute_block(
+        0,
+        &[UserAction::Order {
+            user: user(1),
+            orders: &asks,
+        }],
+    );
+    // Buy 4 @ 100 (fills oid 1 fully, oid 2 by 2), then a GTC rest at 99 is
+    // not involved; a second taker buys 4 @ 101: fills the 3 left, rests 1.
+    let t1 = [req(true, 100, 4, Tif::Gtc, None)];
+    let t2 = [req(true, 101, 4, Tif::Gtc, None)];
+    let out = e.execute_block(
+        0,
+        &[
+            UserAction::Order {
+                user: user(2),
+                orders: &t1,
+            },
+            UserAction::Order {
+                user: user(3),
+                orders: &t2,
+            },
+        ],
+    );
+    let seq: Vec<(u64, String)> = out
+        .diffs
+        .iter()
+        .map(|d| {
+            (
+                d.oid.0,
+                match d.kind {
+                    DiffKind::New { sz, .. } => format!("new {}", sz.0),
+                    DiffKind::Update { orig, new } => format!("upd {}->{}", orig.0, new.0),
+                    DiffKind::Remove => "remove".to_owned(),
+                },
+            )
+        })
+        .collect();
+    let want: Vec<(u64, String)> = [
+        (1, "upd 2->0"),
+        (2, "upd 5->3"),
+        (1, "remove"),
+        (2, "upd 3->0"),
+        (2, "remove"),
+        (4, "new 1"),
+    ]
+    .iter()
+    .map(|&(o, s)| (o, s.to_owned()))
+    .collect();
+    assert_eq!(seq, want);
+    // Resync from native's shape (update to 0, then remove) must load.
+    let native = out.diffs.clone();
+    e.resync(&native).expect("native full-fill shape resyncs");
+    assert!(e.check_invariants());
 }

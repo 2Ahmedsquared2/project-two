@@ -139,6 +139,20 @@ fn ix(b: u32) -> usize {
     usize::try_from(b).unwrap_or(usize::MAX)
 }
 
+/// Native in-block class of an action: 0 sends no GTC/IOC leg, 1 cancel,
+/// 2 sends a GTC, IOC or other (trigger) leg.
+fn exec_class(a: &UserAction<'_>) -> u8 {
+    let taker = |t: Tif| !matches!(t, Tif::Alo);
+    match *a {
+        UserAction::Cancel { .. } => 1,
+        UserAction::Order { orders, .. } => u8::from(orders.iter().any(|o| taker(o.tif))) * 2,
+        UserAction::Modify { modifies, .. } => {
+            u8::from(modifies.iter().any(|m| taker(m.order.tif))) * 2
+        }
+        UserAction::Noop | UserAction::Unsupported(_) => 0,
+    }
+}
+
 fn status_idx(v: &[OrderStatus]) -> u32 {
     u32::try_from(v.len()).unwrap_or(u32::MAX)
 }
@@ -288,29 +302,87 @@ impl Engine {
         actions: &[UserAction<'_>],
         expires_after: &[Option<u64>],
     ) -> &BlockOutcome {
+        self.begin_block(block_time_ms);
+        for (i, a) in actions.iter().enumerate() {
+            let r = self.exec_one(a, expires_after.get(i).copied().flatten(), block_time_ms);
+            self.out.responses.push(r);
+        }
+        &self.out
+    }
+
+    /// Execute one block in native's in-block order. `bundle_lens[j]` is the
+    /// number of actions in the block's `j`-th signed-action bundle (actions
+    /// past the sum form one last bundle; empty = the whole block is one
+    /// bundle). Within each bundle, actions run in three passes, input order
+    /// inside each: (1) actions that send no GTC/IOC leg (ALO orders and
+    /// modifies, noop, unsupported), (2) cancels, (3) actions that send at
+    /// least one GTC, IOC or other (trigger) leg. Responses stay indexed by
+    /// input position. Hyperliquid's docs describe this three-class order;
+    /// the per-bundle scope and trigger legs counting as class 3 are from our
+    /// node's blocks 1232430001..=1232432000, where it agrees with native's
+    /// diff order on 2,000/2,000 blocks. Zero allocation after warm-up.
+    pub fn execute_block_bundled(
+        &mut self,
+        block_time_ms: u64,
+        actions: &[UserAction<'_>],
+        expires_after: &[Option<u64>],
+        bundle_lens: &[u32],
+    ) -> &BlockOutcome {
+        self.begin_block(block_time_ms);
+        let n = actions.len();
+        self.out.responses.resize(n, ActionResponse::default());
+        let mut base = 0usize;
+        let mut lens = bundle_lens.iter();
+        while base < n {
+            let len = lens
+                .next()
+                .map_or(n - base, |&l| usize::try_from(l).unwrap_or(usize::MAX));
+            let end = base.saturating_add(len).min(n);
+            for class in 0..3u8 {
+                for (i, a) in actions.iter().enumerate().take(end).skip(base) {
+                    if exec_class(a) != class {
+                        continue;
+                    }
+                    let r =
+                        self.exec_one(a, expires_after.get(i).copied().flatten(), block_time_ms);
+                    self.out.responses[i] = r;
+                }
+            }
+            if end == base {
+                // A zero-length bundle: move to the next one.
+                continue;
+            }
+            base = end;
+        }
+        &self.out
+    }
+
+    fn begin_block(&mut self, block_time_ms: u64) {
         for &b in &self.touched {
             self.touched_mark[ix(b)] = false;
         }
         self.touched.clear();
         self.block_start_oid = self.next_oid;
         self.out.clear(block_time_ms);
-        for (i, a) in actions.iter().enumerate() {
-            let start = status_idx(&self.out.statuses);
-            let mut unsupported = false;
-            if expires_after
-                .get(i)
-                .copied()
-                .flatten()
-                .is_some_and(|ea| ea < block_time_ms)
-            {
-                self.out.responses.push(ActionResponse {
-                    start,
-                    end: start,
-                    unsupported: false,
-                    expired: true,
-                });
-                continue;
-            }
+    }
+
+    fn exec_one(
+        &mut self,
+        a: &UserAction<'_>,
+        expires_after: Option<u64>,
+        block_time_ms: u64,
+    ) -> ActionResponse {
+        let start = status_idx(&self.out.statuses);
+        let mut unsupported = false;
+        if expires_after.is_some_and(|ea| ea < block_time_ms) {
+            return ActionResponse {
+                start,
+                end: start,
+                unsupported: false,
+                expired: true,
+            };
+        }
+        {
             match *a {
                 UserAction::Order { user, orders } => {
                     for o in orders {
@@ -336,15 +408,14 @@ impl Engine {
                     self.out.has_unsupported = true;
                 }
             }
-            let end = status_idx(&self.out.statuses);
-            self.out.responses.push(ActionResponse {
-                start,
-                end,
-                unsupported,
-                expired: false,
-            });
         }
-        &self.out
+        let end = status_idx(&self.out.statuses);
+        ActionResponse {
+            start,
+            end,
+            unsupported,
+            expired: false,
+        }
     }
 
     fn push_status(&mut self, s: OrderStatus) {
@@ -643,6 +714,9 @@ impl Engine {
                     self.index_rest(b, slot, d.user, d.cloid, d.oid);
                     self.next_oid = self.next_oid.max(d.oid.0.saturating_add(1));
                 }
+                // Native writes a full fill as `update` to 0 then `remove`:
+                // the remove that follows takes the order out.
+                DiffKind::Update { new: Sz(0), .. } => {}
                 DiffKind::Update { new, .. } => {
                     let &(ob, slot) = self
                         .oids

@@ -639,8 +639,10 @@ impl Book {
     /// Match a taker against the opposite side: best price first, FIFO
     /// within a level, each fill at the resting price, until the taker's
     /// price no longer crosses or its size is used up. Appends the makers'
-    /// diffs (`Update` for a partial fill, `Remove` for a full fill or a
-    /// self-trade cancel) and the fills. Never rests anything.
+    /// diffs in native's shape: an `Update` per fill (to 0 for a full fill;
+    /// a self-trade cancel is a `Remove` in place), then a `Remove` for each
+    /// fully filled maker in fill order. Appends the fills. Never rests
+    /// anything.
     pub fn match_taker(
         &mut self,
         t: Taker,
@@ -648,6 +650,7 @@ impl Book {
         fills: &mut Vec<Fill>,
     ) -> MatchResult {
         let opp = t.side.opposite();
+        let d0 = diffs.len();
         let mut r = MatchResult {
             remaining: t.sz.0,
             ..MatchResult::default()
@@ -684,7 +687,14 @@ impl Book {
                 .notional
                 .saturating_add(u128::from(best.0) * u128::from(take));
             if take == maker.sz.0 {
-                diffs.push(self.diff(&maker, DiffKind::Remove));
+                // Native: `update` to 0 now, `remove` after the taker's run.
+                diffs.push(self.diff(
+                    &maker,
+                    DiffKind::Update {
+                        orig: maker.sz,
+                        new: Sz(0),
+                    },
+                ));
                 let _ = self.remove(slot);
             } else {
                 let new = Sz(maker.sz.0 - take);
@@ -696,6 +706,17 @@ impl Book {
                     },
                 ));
                 let _ = self.resize(slot, new);
+            }
+        }
+        // Then the fully filled makers' removes, in fill order (no allocation:
+        // indexes into the diffs appended above).
+        for i in d0..diffs.len() {
+            let d = diffs[i];
+            if matches!(d.kind, DiffKind::Update { new: Sz(0), .. }) {
+                diffs.push(BookDiff {
+                    kind: DiffKind::Remove,
+                    ..d
+                });
             }
         }
         r
