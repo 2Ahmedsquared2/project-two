@@ -11,11 +11,31 @@
 #
 # Uses bash builtins only, apart from those three optional tools, so it gives
 # the same file layout on a stripped host.
+#
+# The options are the script's own. A caller that runs `set -e` with SHELLOPTS
+# exported hands errexit and pipefail to every bash it starts, and under
+# errexit one fact that cannot be read ends the capture instead of being
+# written as unavailable (#38).
 set -u
+set +e +o pipefail
 shopt -s nullglob
 
 out="${1:?usage: capture-host.sh FILE [IFACE]}"
 iface="${2:-}"
+
+# A capture that ends non-zero says so: its status, how far it had got and the
+# command it ended on. The line goes to a copy of stderr taken here, because
+# the script turns its own stderr away around reads that may fail. A capture
+# that works prints nothing, and none of this changes the file.
+exec {errfd}>&2
+step="start"
+on_exit() {
+  local rc=$? last="$BASH_COMMAND"
+  ((rc == 0)) && return 0
+  printf 'capture-host.sh: exit %s; file: %s; last step: %s; last command: %s\n' \
+    "$rc" "$out" "$step" "$last" >&"$errfd"
+}
+trap on_exit EXIT
 
 # The value of a file, or why not.
 rd() {
@@ -42,6 +62,7 @@ tool() {
 section() { # NAME, body on stdin from the function named by the rest
   local name="$1"
   shift
+  step="section $name"
   printf '== begin %s\n' "$name"
   "$@"
   printf '== end %s\n' "$name"
@@ -186,7 +207,8 @@ s_irqbalance() {
   for f in /proc/[0-9]*/comm; do
     seen=1
     name=""
-    { name="$(<"$f")"; } 2>/dev/null || continue
+    # A process that has ended since the glob has no comm left: skipped.
+    { IFS= read -r name <"$f"; } 2>/dev/null || continue
     if [[ "$name" == irqbalance ]]; then
       pid="${f%/comm}"
       printf 'running (pid %s)\n' "${pid##*/}"
@@ -254,9 +276,11 @@ s_thp() {
 }
 
 [[ -n "$iface" ]] || iface="$(default_iface)"
+step="opening the file"
 TZ=UTC printf -v now '%(%Y-%m-%dT%H:%M:%SZ)T' -1
 
 {
+  step="header"
   printf 'hl-host-facts v1\n'
   printf 'captured-utc: %s\n' "$now"
   printf 'kernel: '
