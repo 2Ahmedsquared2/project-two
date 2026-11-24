@@ -1,0 +1,12 @@
+diff --git a/crates/hl-exec/src/book.rs b/crates/hl-exec/src/book.rs
+index 5fbe754..3696bf6 100644
+--- a/crates/hl-exec/src/book.rs
++++ b/crates/hl-exec/src/book.rs
+@@ -603,7 +603,6 @@ impl Book {
+             .checked_sub(n.sz.0)
+             .and_then(|t| t.checked_add(sz.0))
+             .ok_or(BookError::LevelOverflow)?;
+-        self.levels[idx(n.level)].total = total;
+         self.nodes[idx(slot)].sz = sz;
+         {
+             self.journal.push(Undo::Resized { slot, old: n.sz });
