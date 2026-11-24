@@ -7,7 +7,7 @@
 //! ```text
 //! cargo run --release -p hl-exec --example replay -- \
 //!   --meta DIR --seed l4.json --replica replica.jsonl --diffs diffs.jsonl \
-//!   [--statuses statuses.jsonl] [--max N] [--show K] [--heights-out FILE]
+//!   [--statuses statuses.jsonl] [--max N] [--show K] [--heights-out FILE.tsv]
 //! ```
 //!
 //! `--meta DIR` holds `meta.json`, `spotMeta.json`, `perpDexs.json` and
@@ -758,7 +758,8 @@ fn main() {
         }
     }
     let mut k = 0usize;
-    let mut reproduced: Vec<u64> = Vec::new();
+    // (height, verdict): "reproduced" or the block's mismatch classes.
+    let mut verdicts: Vec<(u64, String)> = Vec::new();
     let mut classes: BTreeMap<String, usize> = BTreeMap::new();
     let mut examples: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut times_ns: Vec<u64> = Vec::new();
@@ -910,12 +911,13 @@ fn main() {
         }
         if why.is_empty() {
             k += 1;
-            reproduced.push(b.height);
+            verdicts.push((b.height, "reproduced".into()));
             counted_ns.push(ns);
         } else {
             for w in &why {
                 *classes.entry(w.clone()).or_default() += 1;
             }
+            verdicts.push((b.height, why.join(",")));
             // Adopt native's book and counter (non-reproduced block only).
             if let Err(err) = e.resync(&attach_cloids(nd, &status_cloids)) {
                 eprintln!("h{}: resync failed: {err:?}; stopping", b.height);
@@ -926,14 +928,14 @@ fn main() {
     }
     println!("blocks N={n} heights {first_seen}..={last_seen}  reproduced k={k}");
     if let Some(p) = arg("--heights-out") {
-        let body = reproduced
+        let body = verdicts
             .iter()
-            .map(u64::to_string)
+            .map(|(h, v)| format!("{h}\t{v}"))
             .collect::<Vec<_>>()
             .join("\n")
             + "\n";
         std::fs::write(&p, body).unwrap();
-        println!("reproduced heights written to {p}");
+        println!("per-block verdicts (height TAB reproduced|classes) written to {p}");
     }
     println!("non-reproduced blocks by class (a block can be in several):");
     let mut cl: Vec<_> = classes.into_iter().collect();
