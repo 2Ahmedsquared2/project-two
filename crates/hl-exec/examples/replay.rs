@@ -812,8 +812,21 @@ fn end_state_check(e: &Engine, meta_dir: &str, path: &str, last_seen: u64) {
         .split(',')
         .filter_map(|c| meta.by_name.get(c.trim()).copied())
         .collect();
+    // Outcome coins whose outcome settled or was created inside the window
+    // (`--window-changed "#E,#E,.."`): the engine does not model the outcome
+    // lifecycle, so they are tallied apart and are never engine findings.
+    let changed: std::collections::HashSet<Asset> = arg("--window-changed")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|c| {
+            let c = c.trim();
+            meta.by_name.get(c).copied().or_else(|| meta.add_outcome(c))
+        })
+        .collect();
     let label = |a: Asset| {
-        if unconfirmed.contains(&a) {
+        if changed.contains(&a) {
+            "outcome (settled or created in window)"
+        } else if unconfirmed.contains(&a) {
             "outcome (map unconfirmed)"
         } else {
             kind(a)
@@ -870,13 +883,47 @@ fn end_state_check(e: &Engine, meta_dir: &str, path: &str, last_seen: u64) {
             t[2] += 1;
         }
     }
+    // Books the engine holds that the reference lacks: listed as "not in
+    // reference", never as differences.
+    let mut absent: BTreeMap<&str, [usize; 2]> = BTreeMap::new();
+    for b in e.books() {
+        let a = b.asset();
+        if want.contains_key(&a) {
+            continue;
+        }
+        let n = [Side::Bid, Side::Ask]
+            .into_iter()
+            .map(|s| b.levels(s).map(|px| b.queue(s, px).count()).sum::<usize>())
+            .sum::<usize>();
+        let t = absent.entry(label(a)).or_default();
+        t[0] += 1;
+        t[1] += n;
+    }
     for (k, t) in &tally {
         println!(
             "  {k}: {} equal, {} same orders in another queue order, {} differing, {} missing from the engine",
             t[0], t[1], t[2], t[3]
         );
     }
+    for (k, t) in &absent {
+        println!(
+            "  {k}: {} engine books not in reference ({} resting orders), not compared",
+            t[0], t[1]
+        );
+    }
     let ours = e.next_oid().0;
+    // A counter read from the state at the reference height (`--ref-next-oid`)
+    // is exact, unlike the books cut's max resting oid + 1.
+    if let Some(n) = arg("--ref-next-oid").and_then(|s| s.parse::<u64>().ok()) {
+        println!(
+            "  next_oid (read): ours {ours}, reference {n}: {}",
+            if ours == n {
+                "equal".to_owned()
+            } else {
+                format!("ours - reference = {}", i128::from(ours) - i128::from(n))
+            }
+        );
+    }
     match r.next_oid {
         Some(n) => println!(
             "  next_oid: ours {ours}, reference {n} (lower bound when inferred): ours {} it",
