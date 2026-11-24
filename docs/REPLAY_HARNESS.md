@@ -199,8 +199,10 @@ accepted is the core blamed.
 
 With `--host-facts`, the report warns (never stops) when the polling thread's
 core is the feeder or hot core, shares a physical core with either (the
-capture's `thread siblings` line), is outside `isolcpus`, or is on another
-NUMA node than the hot core. `nohz_full` and `rcu_nocbs` are not asked of it.
+capture's `thread siblings` line), or is on another NUMA node than the hot
+core (the two share the ring; the feeder's node is not compared). It is also
+checked against `isolcpus`, `nohz_full` and `rcu_nocbs` exactly as the feeder
+and hot cores are: the tick and RCU callbacks on its core delay submissions.
 A capture without that core's sibling line or without NUMA nodes gives no
 line for that check.
 

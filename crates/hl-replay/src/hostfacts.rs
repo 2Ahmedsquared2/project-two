@@ -345,9 +345,11 @@ impl HostFacts {
         }
     }
 
-    /// What a reader must weigh about the cores a run pinned to: a core
-    /// outside `isolcpus`, `nohz_full` or `rcu_nocbs`, a pinned CPU 0 that
-    /// `nohz_full` names, or a hot core that shares its physical core.
+    /// What a reader must weigh about the cores a run pinned to (feeder, hot
+    /// thread and the `compio-sqpoll` polling thread): a core outside
+    /// `isolcpus`, `nohz_full` or `rcu_nocbs`, a pinned CPU 0 that
+    /// `nohz_full` names, a hot core that shares its physical core, and
+    /// [`Self::sqpoll_warnings`].
     /// Warnings only; none of this stops a run.
     fn core_warnings(
         &self,
@@ -355,19 +357,19 @@ impl HostFacts {
         hot: Option<usize>,
         sqpoll: Option<usize>,
     ) -> Vec<String> {
-        let pinned: Vec<(&str, usize)> = [("feeder", feeder), ("hot", hot)]
+        let threads: Vec<(&str, usize)> = [("feeder", feeder), ("hot", hot)]
             .into_iter()
             .filter_map(|(role, core)| Some((role, core?)))
             .collect();
-        // Isolation is the one list asked of the polling thread's core: it is
-        // a kernel thread that spins, and what must not happen to it is
-        // another task being scheduled there.
-        let with_sqpoll: Vec<(&str, usize)> = pinned
+        // The polling thread's core is judged by the same three lists: it
+        // spins and picks up submissions, so another task, the tick or RCU
+        // callbacks there delay them as they delay the hot thread.
+        let pinned: Vec<(&str, usize)> = threads
             .iter()
             .copied()
             .chain(sqpoll.map(|core| ("sqpoll", core)))
             .collect();
-        let mut warnings = self.list_warnings("isolcpus", "isolated", &with_sqpoll);
+        let mut warnings = self.list_warnings("isolcpus", "isolated", &pinned);
         warnings.extend(self.list_warnings("nohz_full", "tickless", &pinned));
         let tickless = self.cpu_list("nohz_full");
         // "The boot CPU will be forced outside the range to maintain the
@@ -428,13 +430,13 @@ impl HostFacts {
             }
         }
         if let Some(sqpoll) = sqpoll {
-            warnings.extend(self.sqpoll_warnings(&pinned, sqpoll));
+            warnings.extend(self.sqpoll_warnings(&threads, sqpoll));
         }
         warnings
     }
 
     /// What a reader must weigh about the core given to the `compio-sqpoll`
-    /// arm's kernel polling thread, beside its isolation: the thread spins at
+    /// arm's kernel polling thread, beside the three lists: the thread spins at
     /// close to 100%, so it takes about half of whatever shares its physical
     /// core, and it works on the hot thread's ring, so another NUMA node puts
     /// that memory a node away from one of the two.
