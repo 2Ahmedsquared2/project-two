@@ -187,7 +187,7 @@ The report prints this table from the stage types themselves:
 | parser | real, mode `header scan` | `hl_latency::scan_node_header` (block time and height from the fixed prefix), falling back to the strict `parse_node_line` for a line it cannot scan |
 | book | stub | fixed 16-level arrays; prices derived from the block number, not from the line |
 | decision | stub | one ALO order per update |
-| signer | real | `HlOrderSigner`: `hl-order`'s `Signer::sign_l1` (msgpack into keccak-256, EIP-712 agent digest, k256 RFC 6979) + the SDK request body, testnet source, throwaway key. Real because `tests/real_signer.rs` signs all 12 `hl-order` golden vectors through it byte for byte. Build with `--features prototype-signer` to run the old `PrototypeSigner` (libsecp256k1, placeholder domain) for comparison; the report then says `signer=prototype` |
+| signer | real | `HlOrderSigner`: `hl-order`'s `Signer::sign_l1` (msgpack into keccak-256, EIP-712 agent digest, libsecp256k1 RFC 6979) + the SDK request body, testnet source, throwaway key. Real because `tests/real_signer.rs` signs all 12 `hl-order` golden vectors through it byte for byte. Build with `--features prototype-signer` to run the old `PrototypeSigner` (libsecp256k1, placeholder domain) for comparison; the report then says `signer=prototype` |
 | send | prototype | plain TCP write to loopback: no TLS, no WebSocket framing, no NIC |
 
 So `t2-t0` today is a header scan plus the real signing cost. It is not
