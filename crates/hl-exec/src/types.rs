@@ -164,7 +164,8 @@ pub enum RejectReason {
     ZeroPrice,
     /// More than 5 significant figures: native's "Price must be divisible by tick size."
     TickSize,
-    /// More decimals than the price grid allows: native's "Order has invalid price."
+    /// More decimals than the price grid allows, or a price of 0: native's
+    /// "Order has invalid price."
     InvalidPrice,
     /// More decimals than `szDecimals`: native's "Order has invalid size."
     LotSize,
