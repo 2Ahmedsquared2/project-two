@@ -1,6 +1,7 @@
 //! The host-facts file `scripts/capture-host.sh` writes, and the check that a
 //! run meant for a write-up carries one.
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use crate::ReplayError;
@@ -580,12 +581,14 @@ const MAX_CPUS: usize = 8192;
 /// One part of a CPU list: `first`, `first-last` or `first-last:used/group`
 /// (Linux v6.8 `Documentation/admin-guide/kernel-parameters.rst`, "cpu
 /// lists"). The range is split into groups of `group` CPUs and names the
-/// first `used` of each.
+/// first `used` of each. A group holds at least one CPU: the kernel refuses
+/// a group of 0, and the type cannot hold one, so [`CpuRange::contains`] has
+/// nothing to divide by zero.
 struct CpuRange {
     first: usize,
     last: usize,
     used: usize,
-    group: usize,
+    group: NonZeroUsize,
 }
 
 impl CpuRange {
@@ -636,7 +639,29 @@ impl Region {
     /// group of 0, `used > group` (-EINVAL) or a CPU at or past [`MAX_CPUS`]
     /// (-ERANGE).
     fn parse(part: &str) -> Self {
+        let (own, mut rest) = Self::parse_one(part);
+        if rest.is_empty() || matches!(own, Self::Refused) {
+            return own;
+        }
+        // What follows a stride starts the next region, with no comma
+        // needed. `bitmap_parselist` checks each region before it parses the
+        // next, so the first refusal stands whatever follows. The regions
+        // are read in a loop: a part may hold any number of them.
+        while !rest.is_empty() {
+            let (next, after) = Self::parse_one(rest);
+            if matches!(next, Self::Refused) {
+                return Self::Refused;
+            }
+            rest = after;
+        }
+        Self::HostDependent
+    }
+
+    /// Reads the one region `part` starts with, and gives what follows its
+    /// stride. Nothing follows a refused region or one with no stride.
+    fn parse_one(part: &str) -> (Self, &str) {
         use Num::{Is, LastCpu};
+        let refused = (Self::Refused, "");
         let (first, last, rest) = if part
             .get(..3)
             .is_some_and(|word| word.eq_ignore_ascii_case("all"))
@@ -644,40 +669,28 @@ impl Region {
             (Is(0), LastCpu, &part[3..])
         } else {
             let Some((first, rest)) = getnum(part) else {
-                return Self::Refused;
+                return refused;
             };
             match rest.strip_prefix('-') {
                 None if rest.is_empty() => (first, first, rest),
-                None => return Self::Refused,
+                None => return refused,
                 Some(rest) => match getnum(rest) {
                     Some((last, rest)) => (first, last, rest),
-                    None => return Self::Refused,
+                    None => return refused,
                 },
             }
         };
-        let (stride, rest) = if rest.is_empty() {
-            (None, rest)
-        } else {
-            let stride = rest.strip_prefix(':').and_then(|rest| {
-                let (used, rest) = getnum(rest)?;
-                let (group, rest) = getnum(rest.strip_prefix('/')?)?;
-                Some(((used, group), rest))
-            });
-            match stride {
-                Some((stride, rest)) => (Some(stride), rest),
-                None => return Self::Refused,
-            }
-        };
-        let own = Self::classify(first, last, stride);
         if rest.is_empty() {
-            return own;
+            return (Self::classify(first, last, None), rest);
         }
-        // What follows a stride starts the next region, with no comma
-        // needed. `bitmap_parselist` checks this region before it parses the
-        // next, so a refusal here stands whatever follows.
-        match (own, Self::parse(rest)) {
-            (Self::Refused, _) | (_, Self::Refused) => Self::Refused,
-            _ => Self::HostDependent,
+        let stride = rest.strip_prefix(':').and_then(|rest| {
+            let (used, rest) = getnum(rest)?;
+            let (group, rest) = getnum(rest.strip_prefix('/')?)?;
+            Some(((used, group), rest))
+        });
+        match stride {
+            Some((stride, rest)) => (Self::classify(first, last, Some(stride)), rest),
+            None => refused,
         }
     }
 
@@ -692,18 +705,15 @@ impl Region {
         // A plain range is one group, all of it used.
         match (first, last, stride.unwrap_or((Is(1), Is(1)))) {
             (Is(0), LastCpu, _) if stride.is_none() => Self::All,
-            (Is(first), Is(last), (Is(used), Is(group))) => {
-                if first <= last && last < MAX_CPUS {
-                    Self::Range(CpuRange {
-                        first,
-                        last,
-                        used,
-                        group,
-                    })
-                } else {
-                    Self::Refused
-                }
-            }
+            (Is(first), Is(last), (Is(used), Is(group))) => match NonZeroUsize::new(group) {
+                Some(group) if first <= last && last < MAX_CPUS => Self::Range(CpuRange {
+                    first,
+                    last,
+                    used,
+                    group,
+                }),
+                _ => Self::Refused,
+            },
             (Is(first), Is(last), _) if first > last || last >= MAX_CPUS => Self::Refused,
             _ => Self::HostDependent,
         }

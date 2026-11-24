@@ -1353,7 +1353,9 @@ fn a_stride_using_nothing_before_an_n_is_still_for_the_host_to_settle() {
 fn a_group_of_zero_is_refused_whatever_it_uses() {
     // bitmap_check_region: `group_len == 0` is -EINVAL on its own, also when
     // `off` is 0 and so not above it.
-    for raw in ["0-7:0/0", "2,0-7:0/0"] {
+    // The last CPU's number does not come into it: the kernel has put a
+    // number in place of `N` by then, and no number makes a group of 0 pass.
+    for raw in ["0-7:0/0", "2,0-7:0/0", "0-N:1/0", "all:0/0", "0-7:N/0"] {
         assert_eq!(
             list_warnings(
                 &format!("isolcpus: 2-3\nnohz_full: {raw}\nrcu_nocbs: all"),
