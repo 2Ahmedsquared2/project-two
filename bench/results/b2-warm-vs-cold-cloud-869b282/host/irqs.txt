@@ -1,0 +1,32 @@
+== /proc/interrupts
+           CPU0       CPU1       
+ 24:        680          0   IO-APIC  17-edge      ACPI:Ged
+ 25:          0        680   IO-APIC  18-edge      ACPI:Ged
+ 26:     154017          0   IO-APIC   5-edge      virtio0
+ 27:          0        620   IO-APIC   6-edge      virtio1
+ 28:    8890052          0   IO-APIC   7-edge      virtio2
+ 29:          0       4911   IO-APIC   8-edge      virtio3
+ 30:          0          0   IO-APIC   9-edge      virtio4
+ 31:          0          0   IO-APIC  10-edge      virtio5
+ 32:          0          0   IO-APIC  11-edge      virtio6
+ 33:          0          0   IO-APIC  12-edge      virtio7
+ 34:   10163676          0   IO-APIC  13-edge      virtio8
+ 35:          0     455430   IO-APIC  14-edge      virtio9
+ 36:          0       4153   IO-APIC  15-edge      virtio10
+ 37:        746          0   IO-APIC  16-edge      virtio11
+NMI:          0          0   Non-maskable interrupts
+LOC:   38473763   38519722   Local timer interrupts
+SPU:          0          0   Spurious interrupts
+PMI:          0          0   Performance monitoring interrupts
+IWI:         18        294   IRQ work interrupts
+RTR:          0          0   APIC ICR read retries
+RES:    6079959    7146242   Rescheduling interrupts
+CAL:   39897959   42334401   Function call interrupts
+TLB:    1907574    1885726   TLB shootdowns
+TRM:          0          0   Thermal event interrupts
+HYP:   16755573   16430596   Hypervisor callback interrupts
+ERR:          0
+MIS:          0
+PIN:          0          0   Posted-interrupt notification event
+NPI:          0          0   Nested posted-interrupt event
+PIW:          0          0   Posted-interrupt wakeup event
