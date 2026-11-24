@@ -12,6 +12,8 @@ use p2_node::engines::{EchoEngine, NullEngine};
 use p2_node::replay::{load_native_diffs, Replay, ReplayBlock, ReplayError};
 use p2_node::timing::{run_passes, Timed, TimingConfig};
 
+mod wallet_rule;
+
 const USAGE: &str = "usage:
   p2-node replay --blocks <replica_cmds file> --diffs <node_raw_book_diffs batch file> --snapshot-height <H>
                  [--engine null|echo|hlexec --seed resting_<H>.jsonl|l4so_<H>.json
@@ -42,6 +44,10 @@ decide the verdict), and whether our oid counter reaches the seed's next_oid (a 
 --reduce-only-as-plain (hlexec, off by default; an APPROXIMATION, labelled in the report):
 reduce-only Gtc/Alo/Ioc legs go to the engine as plain orders, no position check; trigger and
 FrontendMarket legs stay unsupported. --ro-legs-out F writes those legs' native and our status.
+--signers FILE (hlexec, off by default): lane 1's unknown-wallet rule as on PR #11 4154560, fed by
+the same file (one address per line, .gz allowed): an L1 action whose recovered signer is not in
+the set is a noop answered \"User or API Wallet <signer> does not exist.\" (evmRawTx, multiSig,
+user-signed and expired actions not ruled; accepted approveAgent adds its agent). Labelled when on.
 exit: 0 ok, 1 run error, 2 usage";
 
 struct Args(Vec<String>);
@@ -641,13 +647,40 @@ fn compare_only(
         Err(e) => return fail(e),
     };
     let mut line_no = 0u64;
+    let decisions: wallet_rule::Decisions = std::rc::Rc::default();
+    let mut rule = match args.get("--signers") {
+        Some(_) if engine != "hlexec" => return fail("--signers needs --engine hlexec".into()),
+        Some(p) => match open_input(p) {
+            Ok(r) => {
+                let w = wallet_rule::WalletRule::new(r, decisions.clone());
+                eprintln!("signers: {} addresses from {p}", w.len());
+                Some(w)
+            }
+            Err(e) => return fail(e),
+        },
+        None => None,
+    };
     let stream = lines.map(|l| {
         line_no += 1;
         let height = nth_height(snapshot, line_no)?;
         let line = l?;
         let block = hl_block::decode_block(&line).map_err(|e| format!("{bpath}:{line_no}: {e}"))?;
-        ReplayBlock::new(height, block, diffs.remove(&height)).map_err(|e| e.to_string())
+        let rb =
+            ReplayBlock::new(height, block, diffs.remove(&height)).map_err(|e| e.to_string())?;
+        if let Some(r) = rule.as_mut() {
+            r.decide(
+                &line,
+                &rb.user_actions(),
+                rb.native_responses(),
+                rb.block().time_ns,
+            )
+            .map_err(|e| format!("{bpath}:{line_no}: {e}"))?;
+        }
+        Ok::<_, String>(rb)
     });
+    let ruled = args.get("--signers").is_some();
+    // Unknown-wallet tally over every action (both absent, native only, ours only).
+    let mut uw = (0u64, 0u64, 0u64);
     let mut unseeded = std::collections::HashSet::new();
     let no_placed = std::collections::HashSet::new();
     let mut classes: HashMap<u64, Vec<String>> = HashMap::new();
@@ -661,6 +694,22 @@ fn compare_only(
     };
     let mut ro_err: Option<String> = None;
     let each = |blk: &ReplayBlock, out: &p2_node::engine::BlockOutcome, reproduced: bool| {
+        if ruled {
+            for (i, n) in blk.native_responses().iter().enumerate() {
+                let ours = match out.results.get(i) {
+                    Some(p2_node::engine::ActionResult::Response(v)) => {
+                        wallet_rule::is_unknown_wallet(v)
+                    }
+                    _ => false,
+                };
+                match (wallet_rule::is_unknown_wallet(n), ours) {
+                    (true, true) => uw.0 += 1,
+                    (true, false) => uw.1 += 1,
+                    (false, true) => uw.2 += 1,
+                    (false, false) => {}
+                }
+            }
+        }
         if let Some(w) = ro_legs.as_mut() {
             if let Err(e) = write_ro_legs(w, blk, out) {
                 ro_err.get_or_insert(e.to_string());
@@ -691,6 +740,15 @@ fn compare_only(
             .with_reduce_only_as_plain(ro_plain)
     });
     let run = match (engine, hl_engine.as_mut()) {
+        ("hlexec", Some(eng)) if ruled => Replay::run_stream(
+            &mut wallet_rule::RuledEngine {
+                inner: eng,
+                decisions: decisions.clone(),
+            },
+            stream,
+            snapshot,
+            each,
+        ),
         ("hlexec", Some(eng)) => Replay::run_stream(eng, stream, snapshot, each),
         ("echo", _) => Replay::run_stream(&mut EchoEngine::new(native), stream, snapshot, each),
         _ => Replay::run_stream(&mut NullEngine, stream, snapshot, each),
@@ -730,12 +788,21 @@ fn compare_only(
         }
     }
     let mut report = String::new();
-    let flag = if ro_plain {
+    let mut flag = String::new();
+    if ro_plain {
         let _ = writeln!(report, "{RO_PLAIN_NOTE}");
-        "[--reduce-only-as-plain, approximation] "
-    } else {
-        ""
-    };
+        flag.push_str("[--reduce-only-as-plain, approximation] ");
+    }
+    if let Some(r) = &rule {
+        let _ = writeln!(
+            report,
+            "flag --signers: lane 1's unknown-wallet rule (PR #11 4154560). Actions ruled absent {}; \
+             unknown-wallet (all actions): both {}, native only {}, ours only {}; L1 signatures not \
+             recovered {}; agents added {}; set now {}",
+            r.absent, uw.0, uw.1, uw.2, r.not_recovered, r.agents_added, r.len()
+        );
+        flag.push_str("[--signers] ");
+    }
     let _ = writeln!(
         report,
         "engine {engine}  blocks {}  compare-only: nothing timed",

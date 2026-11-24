@@ -1296,8 +1296,10 @@ dependencies = [
  "hl-exec",
  "hl-node-convert",
  "hl-warm",
+ "secp256k1",
  "serde",
  "serde_json",
+ "sha3",
  "thiserror",
 ]
 
