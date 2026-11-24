@@ -510,3 +510,38 @@ fn unsupported_marks_the_block() {
     assert!(out.responses[1].unsupported);
     assert_eq!(e.outcome().diffs, []);
 }
+
+/// "Action already expired": `expiresAfter < block time` rejects the whole
+/// action, takes no oid and touches nothing; `expiresAfter == block time`
+/// runs (our node, blocks 1232430001..=1232432000: 338/338 and 12 equal-time
+/// actions not expired).
+#[test]
+fn expired_actions_are_rejected_without_an_oid() {
+    let mut e = engine();
+    let legs = [req(true, 100, 5, Tif::Alo, None)];
+    let acts = [
+        UserAction::Order {
+            user: user(1),
+            orders: &legs,
+        },
+        UserAction::Order {
+            user: user(1),
+            orders: &legs,
+        },
+    ];
+    let out = e.execute_block_with_expiry(1000, &acts, &[Some(999), Some(1000)]);
+    assert!(out.responses[0].expired);
+    assert_eq!(out.statuses_of(0), &[]);
+    assert!(!out.responses[1].expired);
+    assert_eq!(
+        out.statuses_of(1),
+        &[OrderStatus::Placed {
+            oid: Oid(1),
+            filled: Sz(0),
+            notional: 0,
+            rested: Sz(5)
+        }]
+    );
+    assert!(!out.has_unsupported);
+    assert_eq!(e.next_oid(), Oid(2));
+}

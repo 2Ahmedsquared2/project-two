@@ -265,11 +265,28 @@ impl Engine {
     }
 
     /// Execute one block's actions in order. Zero heap allocation once the
-    /// buffers and indexes have reached their working size.
+    /// buffers and indexes have reached their working size. No expiry check:
+    /// see [`Engine::execute_block_with_expiry`].
     pub fn execute_block(
         &mut self,
         block_time_ms: u64,
         actions: &[UserAction<'_>],
+    ) -> &BlockOutcome {
+        self.execute_block_with_expiry(block_time_ms, actions, &[])
+    }
+
+    /// [`Engine::execute_block`] with each action's `expiresAfter` (ms;
+    /// `expires_after[i]` for `actions[i]`, missing or `None` = no expiry).
+    /// An action with `expiresAfter < block_time_ms` is answered `expired`
+    /// (native "Action already expired"), takes no oid and changes nothing.
+    /// Checked on our node's blocks 1232430001..=1232432000: 338/338 expired
+    /// actions have `expiresAfter` < block time, 0/742,965 others do; an
+    /// expired order takes no oid (gap 0 in all 141 measurable cases).
+    pub fn execute_block_with_expiry(
+        &mut self,
+        block_time_ms: u64,
+        actions: &[UserAction<'_>],
+        expires_after: &[Option<u64>],
     ) -> &BlockOutcome {
         for &b in &self.touched {
             self.touched_mark[ix(b)] = false;
@@ -277,9 +294,23 @@ impl Engine {
         self.touched.clear();
         self.block_start_oid = self.next_oid;
         self.out.clear(block_time_ms);
-        for a in actions {
+        for (i, a) in actions.iter().enumerate() {
             let start = status_idx(&self.out.statuses);
             let mut unsupported = false;
+            if expires_after
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|ea| ea < block_time_ms)
+            {
+                self.out.responses.push(ActionResponse {
+                    start,
+                    end: start,
+                    unsupported: false,
+                    expired: true,
+                });
+                continue;
+            }
             match *a {
                 UserAction::Order { user, orders } => {
                     for o in orders {
@@ -310,6 +341,7 @@ impl Engine {
                 start,
                 end,
                 unsupported,
+                expired: false,
             });
         }
         &self.out

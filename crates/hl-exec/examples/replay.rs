@@ -229,6 +229,7 @@ struct Block {
     acts: Vec<(u8, usize)>,
     types: Vec<String>,
     native: Vec<Value>,
+    expires: Vec<Option<u64>>,
 }
 
 impl Block {
@@ -443,7 +444,10 @@ fn leg_json(meta: &Meta, asset: Asset, cl: Option<Cloid>, s: OrderStatus) -> Val
 }
 
 /// Our response for action `i` in native's shape.
-fn response_json(meta: &Meta, b: &Block, i: usize, st: &[OrderStatus]) -> Value {
+fn response_json(meta: &Meta, b: &Block, i: usize, st: &[OrderStatus], expired: bool) -> Value {
+    if expired {
+        return serde_json::json!({"status":"err","response":"Action already expired"});
+    }
     let (k, j) = b.acts[i];
     match k {
         0 => {
@@ -671,7 +675,7 @@ fn main() {
     for b in &blocks {
         let acts = b.actions();
         let t0 = Instant::now();
-        let out = e.execute_block(b.time_ms, &acts);
+        let out = e.execute_block_with_expiry(b.time_ms, &acts, &b.expires);
         let ns = t0.elapsed().as_nanos() as u64;
         times_ns.push(ns);
         let mut why: Vec<String> = Vec::new();
@@ -695,10 +699,11 @@ fn main() {
         }
         let mut resp_bad = None;
         for i in 0..b.acts.len() {
-            if b.acts[i].0 == 4 {
+            let expired = out.responses[i].expired;
+            if b.acts[i].0 == 4 && !expired {
                 continue;
             }
-            let ours = response_json(&meta, b, i, out.statuses_of(i));
+            let ours = response_json(&meta, b, i, out.statuses_of(i), expired);
             if ours != b.native[i] {
                 resp_bad = Some(format!(
                     "h{} act{i} {}: ours {} native {}",

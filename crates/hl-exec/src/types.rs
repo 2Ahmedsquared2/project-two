@@ -226,6 +226,9 @@ pub struct ActionResponse {
     pub end: u32,
     /// The whole action was unsupported (status range empty).
     pub unsupported: bool,
+    /// Rejected whole as "Action already expired" (`expiresAfter` < block
+    /// time); status range empty, no oid taken, nothing changed.
+    pub expired: bool,
 }
 
 /// What a book diff did, mirroring hl-node `raw_book_diff`.
