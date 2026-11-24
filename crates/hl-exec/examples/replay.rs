@@ -695,6 +695,132 @@ fn load_seed(meta: &mut Meta, path: &str) -> Seed {
     }
 }
 
+/// Book kind of an internal asset id, as `load_meta` and `add_outcome` assign
+/// them: perp 0..10000 and 100000.., spot 10000..100000, outcome 1e8 + E.
+fn kind(a: Asset) -> &'static str {
+    if a >= OUTCOME_ASSET_BASE {
+        "outcome"
+    } else if (10_000..100_000).contains(&a) {
+        "spot"
+    } else {
+        "perp"
+    }
+}
+
+/// One resting order as compared at the end: (px, oid, user, sz).
+type Leg = (Px, Oid, User, Sz);
+
+/// Compare the engine's books after the last replayed block with an l4so
+/// reference taken at that height. Covers only books both sides hold (the
+/// seed's set); `next_oid` in a reference built from a books cut is max
+/// resting oid + 1, a lower bound, so only `>=` is reported. Per side, legs
+/// are compared in queue order (levels best first, the reference's file
+/// order within a level) and, separately, as a set.
+fn end_state_check(e: &Engine, meta_dir: &str, path: &str, last_seen: u64) {
+    let mut meta = load_meta(meta_dir);
+    let r = load_seed(&mut meta, path);
+    if r.height != last_seen {
+        println!(
+            "end-state check NOT RUN: replay ended at height {last_seen}, reference {path} is at {}",
+            r.height
+        );
+        return;
+    }
+    let mut want: BTreeMap<Asset, [Vec<Leg>; 2]> = BTreeMap::new();
+    for a in &r.seeded {
+        want.entry(*a).or_default();
+    }
+    for o in &r.orders {
+        let si = usize::from(o.side == Side::Ask);
+        want.entry(o.asset).or_default()[si].push((o.px, o.oid, o.user, o.sz));
+    }
+    for v in want.values_mut() {
+        // Best first; a stable sort keeps the file's order within a level.
+        v[0].sort_by_key(|l| std::cmp::Reverse(l.0));
+        v[1].sort_by_key(|l| l.0);
+    }
+    // Coins whose book mapping is carried over, not confirmed by a surviving
+    // oid (`--unconfirmed "#E,#E,.."`): tallied apart, since a difference
+    // there may be the map, not the engine.
+    let unconfirmed: std::collections::HashSet<Asset> = arg("--unconfirmed")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|c| meta.by_name.get(c.trim()).copied())
+        .collect();
+    let label = |a: Asset| {
+        if unconfirmed.contains(&a) {
+            "outcome (map unconfirmed)"
+        } else {
+            kind(a)
+        }
+    };
+    println!("end-state check at height {last_seen} against {path} (books both sides hold only):");
+    let mut tally: BTreeMap<&str, [usize; 4]> = BTreeMap::new();
+    let mut shown = 0usize;
+    for (a, w) in &want {
+        let t = tally.entry(label(*a)).or_default();
+        let Some(b) = e.book(*a) else {
+            t[3] += 1;
+            continue;
+        };
+        let mut equal = true;
+        let mut same_set = true;
+        for (si, side) in [(0usize, Side::Bid), (1, Side::Ask)] {
+            let got: Vec<Leg> = b
+                .levels(side)
+                .flat_map(|px| b.queue(side, px).map(|n| (n.px, n.oid, n.user, n.sz)))
+                .collect();
+            if got == w[si] {
+                continue;
+            }
+            equal = false;
+            let key = |l: &Leg| (l.1, l.0, l.3);
+            let mut g: Vec<_> = got.iter().map(key).collect();
+            let mut x: Vec<_> = w[si].iter().map(key).collect();
+            g.sort_unstable();
+            x.sort_unstable();
+            same_set &= g == x;
+            if shown < 20 {
+                shown += 1;
+                let i = got
+                    .iter()
+                    .zip(&w[si])
+                    .position(|(p, q)| p != q)
+                    .unwrap_or(got.len().min(w[si].len()));
+                println!(
+                    "  differs {} asset {a} {side:?}: ours {} legs, reference {}; first differing #{i}: ours {:?} reference {:?}",
+                    label(*a),
+                    got.len(),
+                    w[si].len(),
+                    got.get(i),
+                    w[si].get(i)
+                );
+            }
+        }
+        if equal {
+            t[0] += 1;
+        } else if same_set {
+            t[1] += 1;
+        } else {
+            t[2] += 1;
+        }
+    }
+    for (k, t) in &tally {
+        println!(
+            "  {k}: {} equal, {} same orders in another queue order, {} differing, {} missing from the engine",
+            t[0], t[1], t[2], t[3]
+        );
+    }
+    let ours = e.next_oid().0;
+    match r.next_oid {
+        Some(n) => println!(
+            "  next_oid: ours {ours}, reference {n} (lower bound when inferred): ours {} it",
+            if ours >= n { ">=" } else { "<" }
+        ),
+        None => println!("  next_oid: ours {ours}, reference has none"),
+    }
+}
+
 fn arg(name: &str) -> Option<String> {
     let a: Vec<String> = std::env::args().collect();
     a.iter()
@@ -983,6 +1109,9 @@ fn main() {
     println!(
         "held books only: k={k} of N={n_held}; and no unsupported action: k={k} of N={n_held_modelled}"
     );
+    if let Some(p) = arg("--end-state") {
+        end_state_check(&e, &arg("--meta").expect("--meta"), &p, last_seen);
+    }
     if let Some(p) = arg("--heights-out") {
         let body = verdicts
             .iter()
