@@ -922,6 +922,7 @@ dependencies = [
  "k256",
  "proptest",
  "rmp",
+ "secp256k1",
  "serde_json",
  "sha3",
  "thiserror",

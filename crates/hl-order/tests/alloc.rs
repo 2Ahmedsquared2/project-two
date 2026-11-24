@@ -90,11 +90,11 @@ fn gate_sign_and_request_body() {
     assert_no_alloc_after_warmup("hl-order: sign_l1 + request_body", WARMUP, TICKS, |i| {
         let nonce = 1_700_000_000_000 + i;
         let action = order(i);
-        let signed = signer
+        let got = signer
             .sign_l1(Network::Testnet, &action, nonce, None, None)
             .expect("sign");
         body.clear();
-        request_body(&mut body, &action, nonce, &signed.signature, None, None);
+        request_body(&mut body, &action, nonce, &got.signature, None, None);
         black_box(body.len());
     });
 }

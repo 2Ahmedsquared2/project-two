@@ -32,7 +32,7 @@ fn main() {
         cloid: None,
     });
     let mut nonce = 1_700_000_000_000u64;
-    let mut sign = |nonce: u64| {
+    let sign = |nonce: u64| {
         black_box(
             signer
                 .sign_l1(Network::Testnet, black_box(&action), nonce, None, None)

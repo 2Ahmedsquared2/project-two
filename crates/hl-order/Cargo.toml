@@ -9,9 +9,12 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-# RustCrypto secp256k1: pure Rust, RFC 6979 deterministic nonces, low-s normalised,
-# recoverable signatures. Same family as sha3, no C toolchain needed.
-k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std", "precomputed-tables"] }
+# libsecp256k1 (Bitcoin Core's C library) through the `secp256k1` bindings:
+# RFC 6979 deterministic nonces, low-s normalised, recoverable signatures.
+# Chosen over pure-Rust k256 for signing latency (numbers in docs/ORDER_CLIENT.md).
+# The cost: `secp256k1-sys` compiles vendored C, so building this crate needs a
+# C compiler for the target, and the C code is outside `unsafe_code = "forbid"`.
+secp256k1 = { version = "0.29", features = ["recovery"] }
 # Keccak-256 (the pre-NIST padding Ethereum uses). Implements io::Write so the
 # msgpack encoder can stream straight into the hasher without a buffer.
 sha3 = "0.10"
@@ -21,6 +24,10 @@ rmp = "0.8"
 thiserror = { workspace = true }
 
 [dev-dependencies]
+# Test oracle only: the backend before the swap. The byte-identity proptests
+# compare every signature with it; tests/backend_policy.rs keeps it out of
+# [dependencies].
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 proptest = { workspace = true }
 serde_json = { workspace = true }
 criterion = { version = "0.5", default-features = false }
