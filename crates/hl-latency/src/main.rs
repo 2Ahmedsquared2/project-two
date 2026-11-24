@@ -106,6 +106,12 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
+    if strict.strict_fallback_lines_unchecked {
+        eprintln!(
+            "note: hl-strict-pass lists {} failures the scan did not accept, and these observations carry no line_offset, so a stamped one cannot be found and its stamp stays in this summary",
+            strict.strict_fallback_failures_listed
+        );
+    }
     if strict.strict_drop_incomplete {
         eprintln!(
             "warning: hl-strict-pass left {} failures out of its list, so torn stamps may remain in this summary; rerun it with a larger --max-failures",

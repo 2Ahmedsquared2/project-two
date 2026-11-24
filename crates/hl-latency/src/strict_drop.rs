@@ -23,6 +23,12 @@
 //!   observation with the listed height and block time, and every
 //!   public-`WebSocket` observation with that block time.
 //!
+//! A failure the scan did not accept (`scan_accepted` false) has no height
+//! or block time. It is either a line hl-capture stamped after its strict
+//! parse accepted it (`scan_fallbacks`) or a line it never stamped. By line,
+//! the observation at that line, if any, goes under the same block rules and
+//! is counted apart; by block it cannot be found and stays.
+//!
 //! Decided with the Latency Reason: a torn stamp in the percentiles is worse
 //! than losing a line or a block. [`StrictFailures::drop_from`] picks the
 //! mode and refuses a file that mixes the two.
@@ -82,12 +88,13 @@ enum Line {
     Total(TotalLine),
 }
 
-/// One scan-accepted failure: where its line is and what the scan read.
+/// One listed failure: where its line is and, when the scan accepted the
+/// line, the height and block time it read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ListedLine {
     path: String,
     offset: u64,
-    key: (u64, u64),
+    key: Option<(u64, u64)>,
 }
 
 /// The scan-accepted failures of one `hl-strict-pass` run.
@@ -95,8 +102,10 @@ struct ListedLine {
 pub struct StrictFailures {
     /// `(block_number, block_time_ms)` of every scan-accepted failure.
     keys: BTreeSet<(u64, u64)>,
-    /// Every scan-accepted failure, in the order listed.
+    /// Every failure, in the order listed.
     lines: Vec<ListedLine>,
+    /// Failures the scan did not accept.
+    fallback_listed: u64,
     /// The path of every `file` line that has one.
     files: Vec<String>,
     listed: u64,
@@ -105,13 +114,12 @@ pub struct StrictFailures {
 
 impl StrictFailures {
     /// Reads the JSON Lines `hl-strict-pass` writes to stdout (blank lines
-    /// skipped). A failure the scan did not accept is ignored: hl-capture
-    /// never stamped it.
+    /// skipped).
     ///
     /// # Errors
-    /// A line that is not a strict-pass line, a scan-accepted failure without
-    /// its height, block time, path or offset, anything after the `total` line, or no
-    /// `total` line at all.
+    /// A line that is not a strict-pass line, a failure without its path or
+    /// offset, a scan-accepted failure without its height or block time,
+    /// anything after the `total` line, or no `total` line at all.
     pub fn read<R: std::io::BufRead>(r: R) -> Result<Self, StrictReadError> {
         let mut out = Self::default();
         let mut total = false;
@@ -125,27 +133,29 @@ impl StrictFailures {
                 return Err(bad("a line after the total line".to_owned()));
             }
             match serde_json::from_str(&line).map_err(|e| bad(e.to_string()))? {
-                Line::Failure(f) if f.scan_accepted => {
-                    let (Some(height), Some(time)) = (f.block_number, f.block_time_ms) else {
-                        return Err(bad(
-                            "a scan-accepted failure without block_number and block_time_ms"
-                                .to_owned(),
-                        ));
+                Line::Failure(f) => {
+                    let key = if f.scan_accepted {
+                        let (Some(height), Some(time)) = (f.block_number, f.block_time_ms) else {
+                            return Err(bad(
+                                "a scan-accepted failure without block_number and block_time_ms"
+                                    .to_owned(),
+                            ));
+                        };
+                        Some((height, time))
+                    } else {
+                        None
                     };
                     let (Some(path), Some(offset)) = (f.path, f.offset) else {
-                        return Err(bad(
-                            "a scan-accepted failure without path and offset".to_owned()
-                        ));
+                        return Err(bad("a failure without path and offset".to_owned()));
                     };
-                    out.keys.insert((height, time));
-                    out.lines.push(ListedLine {
-                        path,
-                        offset,
-                        key: (height, time),
-                    });
-                    out.listed += 1;
+                    if let Some(key) = key {
+                        out.keys.insert(key);
+                        out.listed += 1;
+                    } else {
+                        out.fallback_listed += 1;
+                    }
+                    out.lines.push(ListedLine { path, offset, key });
                 }
-                Line::Failure(_) => {}
                 Line::File(f) => out.files.extend(f.path),
                 Line::Total(t) => {
                     out.omitted = t.failures_omitted;
@@ -166,8 +176,11 @@ impl StrictFailures {
     ///
     /// By line, a listed failure names one line by its path's `{date}/{hour}`
     /// and its offset. The node observation of that line is removed, after
-    /// checking that it is the block the failure names. A listed line with
-    /// no observation is counted in `strict_failures_unmatched`.
+    /// checking that it is the block the failure names when the failure
+    /// names one (a scan-accepted failure). A listed line with no
+    /// observation is counted in `strict_failures_unmatched`, or in
+    /// `strict_fallback_failures_unmatched` when the scan did not accept
+    /// it.
     ///
     /// # Errors
     /// Node observations with and without the three fields in one file, or
@@ -260,27 +273,48 @@ impl StrictFailures {
     ) -> Result<(Vec<Observation>, StrictDrop), StrictDropError> {
         let listed = self.located_lines()?;
 
+        // Observations to remove: `torn` for scan-accepted failures,
+        // `fallback` for the rest. A failure the scan did not accept gives
+        // no height or block time, so there is no key to check: the
+        // observation at its line, if hl-capture stamped one, goes.
         let mut torn: BTreeSet<usize> = BTreeSet::new();
+        let mut fallback: BTreeSet<usize> = BTreeSet::new();
         let mut unmatched: BTreeSet<FileLineKey> = BTreeSet::new();
+        let mut fallback_unmatched: BTreeSet<FileLineKey> = BTreeSet::new();
         for ((date, hour), l) in listed {
             let line = (date, hour, l.offset);
-            let Some(&i) = by_line.get(&line) else {
-                unmatched.insert(line);
-                continue;
-            };
-            let o = &obs[i];
-            if node_key(o) != Some(l.key) {
-                return Err(StrictDropError::KeyMismatch {
-                    path: l.path.clone(),
-                    offset: l.offset,
-                    listed_number: l.key.0,
-                    listed_time_ms: l.key.1,
-                    observed_number: o.block_number,
-                    observed_time_ms: o.block_time_ms,
-                });
+            let found = by_line.get(&line).copied();
+            match (l.key, found) {
+                (Some(_), None) => {
+                    unmatched.insert(line);
+                }
+                (None, None) => {
+                    fallback_unmatched.insert(line);
+                }
+                (Some(key), Some(i)) => {
+                    let o = &obs[i];
+                    if node_key(o) != Some(key) {
+                        return Err(StrictDropError::KeyMismatch {
+                            path: l.path.clone(),
+                            offset: l.offset,
+                            listed_number: key.0,
+                            listed_time_ms: key.1,
+                            observed_number: o.block_number,
+                            observed_time_ms: o.block_time_ms,
+                        });
+                    }
+                    torn.insert(i);
+                }
+                (None, Some(i)) => {
+                    fallback.insert(i);
+                }
             }
-            torn.insert(i);
         }
+        // A line listed both ways counts once, as scan-accepted.
+        fallback.retain(|i| !torn.contains(i));
+        let dropped_fallback = count(fallback.len());
+        let dropped_torn = count(torn.len());
+        torn.append(&mut fallback);
 
         // Every block that lost a line: its earliest stamp before the drop
         // and its earliest stamp left, if any.
@@ -303,7 +337,10 @@ impl StrictFailures {
             .collect();
         let mut report = StrictDrop {
             strict_pass_applied: true,
-            strict_dropped_observations: count(torn.len()),
+            strict_dropped_observations: dropped_torn,
+            strict_dropped_fallback_lines: dropped_fallback,
+            strict_fallback_failures_listed: self.fallback_listed,
+            strict_fallback_failures_unmatched: count(fallback_unmatched.len()),
             strict_dropped_blocks: count(blocks.values().filter(|b| b.1.is_none()).count()),
             strict_failures_listed: self.listed,
             strict_failures_unmatched: count(unmatched.len()),
@@ -357,6 +394,8 @@ impl StrictFailures {
             strict_failures_unmatched: count(hits.values().filter(|&&n| n == 0).count()),
             strict_failures_omitted: self.omitted,
             strict_drop_incomplete: self.omitted > 0,
+            strict_fallback_failures_listed: self.fallback_listed,
+            strict_fallback_lines_unchecked: self.fallback_listed > 0,
             ..StrictDrop::default()
         };
         let kept = obs
@@ -426,6 +465,9 @@ fn count(n: usize) -> u64 {
 }
 
 /// What [`StrictFailures::drop_from`] left out; printed beside the summary.
+// Four independent yes/no facts of a flat JSON summary, each printed under
+// its own name; they are not states of one machine, so an enum would not fit.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct StrictDrop {
     /// Whether strict-pass output was given at all. `false` means nothing
@@ -442,7 +484,7 @@ pub struct StrictDrop {
     pub strict_dropped_ws_arrivals: u64,
     /// Scan-accepted failure lines read.
     pub strict_failures_listed: u64,
-    /// Listed failures the capture has no observation for (for example a
+    /// Scan-accepted failures the capture has no observation for (for example a
     /// file it did not cover): distinct blocks when dropping by block,
     /// distinct lines when dropping by line.
     pub strict_failures_unmatched: u64,
@@ -457,6 +499,25 @@ pub struct StrictDrop {
     /// Blocks that lost their earliest node line to the drop and kept a
     /// later one, so they pair on a later stamp. By-line drop only.
     pub strict_shifted_first_arrival: u64,
+    /// Failure lines read that the scan did not accept. Each is either a
+    /// line hl-capture stamped after its strict parse accepted it (its
+    /// `scan_fallbacks`) or a line it never stamped (its `bad_lines`); the
+    /// strict pass does not say which.
+    pub strict_fallback_failures_listed: u64,
+    /// Of those, the distinct lines with no node observation: lines
+    /// hl-capture did not stamp. Over the files a capture covered this is
+    /// expected to equal its `bad_lines` plus `oversized_lines`; a
+    /// difference is worth a look, and is not an error (the two can cover
+    /// different spans). By-line drop only.
+    pub strict_fallback_failures_unmatched: u64,
+    /// Node observations removed because the strict pass failed their line
+    /// and the scan had not accepted it: stamped scan-fallback lines. Not in
+    /// `strict_dropped_observations`. By-line drop only.
+    pub strict_dropped_fallback_lines: u64,
+    /// The drop was by block and the strict pass listed failures the scan
+    /// did not accept: a stamped one cannot be found without its offset, so
+    /// its stamp may still be in the distribution.
+    pub strict_fallback_lines_unchecked: bool,
 }
 
 /// Why observations and `hl-strict-pass` output cannot be matched by line.

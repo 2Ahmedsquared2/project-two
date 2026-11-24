@@ -83,6 +83,7 @@ fn a_block_written_as_several_lines_is_dropped_whole() {
             strict_drop_incomplete: false,
             strict_drop_by_line: false,
             strict_shifted_first_arrival: 0,
+            ..StrictDrop::default()
         }
     );
     let s = summarize(&pair(kept));
