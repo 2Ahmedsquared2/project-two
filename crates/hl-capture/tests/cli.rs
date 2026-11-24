@@ -69,7 +69,14 @@ fn duration_bounds_the_run_even_with_a_long_poll() {
         .arg(t.path())
         .arg("--out")
         .arg(t.path().join("obs.jsonl"))
-        .args(["--duration-s", "1", "--poll-us", "3000000"])
+        .args([
+            "--duration-s",
+            "1",
+            "--detect",
+            "poll",
+            "--poll-us",
+            "3000000",
+        ])
         .status()
         .unwrap();
     let took = start.elapsed();
@@ -265,4 +272,113 @@ fn ring_and_rescan_flags_reject_zero() {
             .status;
         assert_eq!(status.code(), Some(2), "{flag} 0");
     }
+}
+
+// ---- detect modes -------------------------------------------------------------
+
+/// The `{"detect":...}` line the binary prints on stderr at start.
+fn detect_line(stderr: &[u8]) -> serde_json::Value {
+    let text = String::from_utf8_lossy(stderr);
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("{\"detect\""))
+        .unwrap_or_else(|| panic!("no detect line in: {text}"));
+    serde_json::from_str::<serde_json::Value>(line).unwrap()["detect"].clone()
+}
+
+/// Runs the binary for a second in `mode` (`None`: no `--detect` flag)
+/// against a file that gets three lines, and returns its stderr.
+fn run_detect(mode: Option<&str>) -> Vec<u8> {
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("node_raw_book_diffs");
+    let dir = root.join("hourly").join("20261119");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("8"), "").unwrap();
+    let out = t.path().join("obs.jsonl");
+    let mut cmd = bin();
+    cmd.arg("node").arg(&root).arg("--out").arg(&out);
+    cmd.args(["--duration-s", "1"]);
+    if let Some(mode) = mode {
+        cmd.args(["--detect", mode]);
+    }
+    let child = cmd.stderr(std::process::Stdio::piped()).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("8"))
+        .unwrap();
+    std::io::Write::write_all(&mut f, burst(3).as_bytes()).unwrap();
+    // A new hourly file mid-run: every mode must find it.
+    std::thread::sleep(Duration::from_millis(100));
+    fs::write(dir.join("9"), burst(2)).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{mode:?}");
+    let c = counters(&output.stderr);
+    assert_eq!(
+        (c["lines"].as_u64(), c["written"].as_u64()),
+        (Some(5), Some(5)),
+        "{mode:?}: {c}"
+    );
+    assert_eq!(c["rotations"], 1, "{mode:?}: {c}");
+    let obs = read_observations(std::io::BufReader::new(fs::File::open(&out).unwrap())).unwrap();
+    let heights: Vec<_> = obs.iter().map(|o| o.block_number.unwrap()).collect();
+    assert_eq!(heights, vec![0, 1, 2, 0, 1], "{mode:?}");
+    output.stderr
+}
+
+fn cpus() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+}
+
+#[test]
+fn busy_poll_is_the_default_and_the_live_mode_is_announced() {
+    let d = detect_line(&run_detect(None));
+    assert_eq!(d["requested"], "busy-poll");
+    // One CPU cannot spin and write: the documented fallback is `poll`.
+    let live = if cpus() >= 2 { "busy-poll" } else { "poll" };
+    assert_eq!(d["live"], live, "{d}");
+    assert_eq!(d["fallback"].is_null(), cpus() >= 2, "{d}");
+}
+
+#[test]
+fn poll_mode_is_announced() {
+    let d = detect_line(&run_detect(Some("poll")));
+    assert_eq!(
+        (&d["requested"], &d["live"]),
+        (&"poll".into(), &"poll".into())
+    );
+    assert!(d["fallback"].is_null(), "{d}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn inotify_mode_is_live_on_linux() {
+    let d = detect_line(&run_detect(Some("inotify")));
+    assert_eq!(
+        (&d["requested"], &d["live"]),
+        (&"inotify".into(), &"inotify".into())
+    );
+    assert!(d["fallback"].is_null(), "{d}");
+}
+
+/// Off Linux there is no inotify: the run falls back to `poll` and says so.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn inotify_mode_falls_back_to_poll_off_linux() {
+    let d = detect_line(&run_detect(Some("inotify")));
+    assert_eq!(
+        (&d["requested"], &d["live"]),
+        (&"inotify".into(), &"poll".into())
+    );
+    assert!(d["fallback"].as_str().unwrap().contains("Linux"), "{d}");
+}
+
+#[test]
+fn an_unknown_detect_mode_is_a_usage_error() {
+    let status = bin()
+        .args(["node", "/tmp", "--out", "/dev/null", "--detect", "epoll"])
+        .output()
+        .unwrap()
+        .status;
+    assert_eq!(status.code(), Some(2));
 }
