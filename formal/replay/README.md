@@ -5,7 +5,8 @@
 `5dc691fa1fa0d5bf81305177531c68ff5c3e7479`, which holds lane 3's fixes for
 F1 and F2. The configs with `VALIDATE = FALSE` keep the earlier code at
 `dc993fc1eb6d1510c2415a478093e4f2dc0452e2`, as the record of the findings.
-The model is checked with TLC on small finite instances.
+`ReplayCli.tla` models how the CLI turns a replica file into that slice. Both
+are checked with TLC on small finite instances.
 
 This is a correctness model of our driver only. It says nothing about speed and
 nothing about equivalence to native `hl-node`. A pass means the property holds
@@ -23,7 +24,8 @@ release (v1.8.0 is a prerelease), and checks its sha256,
 runs every config listed in `expected.txt` and checks that each one ends as
 listed there, `pass` or `violated`. It exits non-zero if any run ends
 differently. Set `TLA2TOOLS_JAR` to reuse a jar, or `TLC_LOG_DIR` to keep the
-TLC logs. The 43 configs take about 90 s on a small cloud machine; the largest
+TLC logs. Each line of `expected.txt` names a config, its expected outcome and,
+optionally, the module (default `ReplayDriver`). The 50 configs take about 90 s on a small cloud machine; the largest
 has 2.84 M distinct states.
 
 The repo has no `proofs/manifest.toml`, so the run command lives here.
@@ -166,6 +168,61 @@ compare cannot see (emitted diffs that disagree with the engine's own book, or
 a book field `BookDiff` does not carry) and that a later block erases before
 the window ends.
 
+## CLI path: replica file to slice (`ReplayCli.tla`)
+
+The driver results above assume `input[j]` is native's block at height
+`snapshot + j` (A1). `ReplayCli.tla` checks how the CLI earns that.
+
+How the CLI at 5dc691f builds the slice:
+
+- Line i of the replica file gets height `snapshot + 1 + i` by position
+  (`main.rs:165`), so `validate`'s height check holds by construction.
+- `ReplayBlock::new(h, block, diffs.get(&h))` (`main.rs:173`) refuses the load
+  (`Misaligned`, exit 1) when the line's block time in ms differs from the
+  block time of native's diffs entry for height h (`replay.rs:60-67`). Native's
+  diffs are keyed by native's own block number (`replay.rs:15-24`).
+- `validate` refuses a height with no diffs (`replay.rs:161-163`).
+
+The model takes any replica file of 1..4 lines over heights 1..4 (gaps,
+repeats, swaps, stale lines), any snapshot 0..3, and any nondecreasing
+native block times. The property is
+`CLI1_AcceptedLinesAreTheirHeights`: if the load is accepted, every line is
+native's block at its assumed height.
+
+| Config | Times | Expected | Result |
+|---|---|---|---|
+| `cli_strict_times` | strictly increasing (A7) | pass | pass (20,400 states) |
+| `cli_equal_ms_times` | two heights may share a ms time | violated | violated |
+| `mut_cli_no_alignment` | mutant: no block-time check | violated | violated |
+| `mut_cli_align_first_line_only` | mutant: time checked on the first line only | violated | violated |
+| `probe_cli_*` | | violated | violated (accepted and refused loads both reached, including multi-line loads after a snapshot) |
+
+So **on the CLI path, P1 and P2 hold for any replica file if and only if
+native's block times strictly increase at ms resolution (A7)**. Shortest
+counterexample without A7 (`cli_equal_ms_times`): genesis start, the file's
+first line is block 2 (block 1 was dropped), and native's blocks 1 and 2 share a
+ms block time. Line 0 is labelled height 1, its block time equals the time of
+diffs entry 1, the load is accepted, and block 2 runs as block 1. A repeated
+or swapped line goes through the same way.
+
+**A7 against the data** (aggregate statistics only, nothing copied into the
+model):
+
+- `crates/p2-node/tests/data/diffs_1000.jsonl` (native diffs, 3 heights):
+  times strictly increase, gaps 73 and 80 ms. This is the only native diffs
+  sample in the repo.
+- `bench/results/native-apply-duration-our-node-1232430001-1232432000/node_fast_block_times_first2000.jsonl`
+  on lane 3's branch (d700242; sha256 in its `INPUT.txt`). It is not a diffs
+  file, but it carries the same per-height `block_time`. Across 2,000
+  contiguous heights, times strictly increase: no equal-ms neighbours, gaps
+  36 to 154 ms, median 67 ms.
+- `golden/node/node_raw_book_diffs` is a synthetic converter fixture (not
+  contiguous, with one equal-ms pair). It is not native data and not
+  evidence either way.
+
+The samples support A7, but they do not prove it for every height. A7 is a
+property of native's chain, and it can't be checked from these files alone.
+
 ## Mutations (each property seen failing)
 
 Each mutation is one model step changed to mirror a plausible code bug. Every
@@ -179,6 +236,8 @@ one is in `expected.txt` as `violated` and fails with the named property.
 | `no_line_check` | `one_pass` without the line == compared-block check (`timing.rs:176-183` removed) | P1 |
 | `end_skip_when_all_counted` | end check skipped (reported pass) when k = N | E1 |
 | `end_check_before_last_block` | end check compares the book as it was before the last block | E1 |
+| `no_alignment` (`ReplayCli`) | `ReplayBlock::new` without its block-time check | CLI1 |
+| `align_first_line_only` (`ReplayCli`) | block time checked on the first line only | CLI1 |
 | `guard_gt` | (first proposed fix) height guard written as `h > last`, so gaps pass | P1 |
 | `guard_ge` | (first proposed fix) off by one, `h >= last`, so duplicates pass | P1 |
 | `stop_on_mismatch` | `return` on the first mismatch instead of resync | P1 liveness |
@@ -207,13 +266,12 @@ check can both fail and pass after a resync.
   - earlier, at dc993fc: `code_wellformed` and `fix_live` at 7/7,
     `code_missing_diffs_P4a` at 6/6, and `fix_safety` at 5/5.
 - A1. Heights are block identities: a `ReplayBlock`'s height matches its
-  content. At 5dc691f the CLI assigns height `snapshot + 1 + i` to line i
-  (`main.rs:165`), so `validate`'s height check holds by construction for CLI
-  input. What ties line i to native's block at that height is the block-time
-  check against native's diffs, which are keyed by native's block number
-  (`replay.rs:60-67`), together with `validate` requiring diffs for every block.
-  That catches a skipped, repeated or swapped replica line unless two of
-  native's blocks share a block time at ms resolution.
+  content. On the CLI path this is checked, not assumed: `ReplayCli.tla` shows
+  that it follows from A7.
+- A7. Native's block times strictly increase with height at ms resolution, so
+  no two heights share a ms block time. See "A7 against the data" above.
+- `ReplayCli`: heights 1..4, replica files of 1..4 lines, snapshot 0..3,
+  block times in 1..6 ms, all nondecreasing time functions.
 - A2. `engine.resync(h, d)`, given native's complete diffs for block h and a book
   that equalled native's before h, leaves our book equal to native's after h.
   This is the engine's contract (`engine.rs:53-56`); the model assumes it.
@@ -234,11 +292,17 @@ check can both fail and pass after a resync.
   compare the actions. In the CLI both come from the same line (`main.rs:166`),
   so they are equal by construction there.
 - Liveness uses weak fairness on every driver step.
+- Lane 3's later head d700242 only refactors how `UserAction` is built
+  (`UserAction::from_signed`) and shifts line numbers. It does not change the
+  modelled behaviour, and the sync commit stays 5dc691f.
 
 ## Not covered
 
 - The engine itself (lane 1's `hl-exec`), `compare`'s field-by-field logic, JSON
   equality, and `hl-block` decoding.
+- Native diffs files with a repeated `block_number` (`load_native_diffs` keeps
+  the last one, `replay.rs:21`), and a replica file from a different chain or
+  fork.
 - Loading the snapshot into the engine, and the translation of native's state
   for the end check (A5): neither exists in code yet.
 - Which book fields `BookDiff` leaves out, and whether lane 1's engine can emit
