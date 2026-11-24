@@ -234,6 +234,8 @@ struct Block {
     assets: Vec<Asset>,
     /// Actions per signed-action bundle (native's in-block order is per bundle).
     bundle_lens: Vec<u32>,
+    /// Per action, its range in `assets`.
+    act_assets: Vec<(usize, usize)>,
 }
 
 impl Block {
@@ -308,6 +310,7 @@ fn decode_block(meta: &Meta, line: &str) -> Block {
             b.native.push(r["res"].clone());
             let expired = sa["expiresAfter"].as_u64().is_some_and(|e| e < b.time_ms);
             let mut unsupported = expired;
+            let a0 = b.assets.len();
             let kind = match t.as_str() {
                 "order" => {
                     let prio = a["grouping"]["p"].as_u64().unwrap_or(0);
@@ -366,6 +369,7 @@ fn decode_block(meta: &Meta, line: &str) -> Block {
                 _ => 4,
             };
             let kind = if unsupported { 4 } else { kind };
+            b.act_assets.push((a0, b.assets.len()));
             b.acts.push((
                 kind,
                 match kind {
@@ -588,6 +592,21 @@ fn parse_diffs(meta: &Meta, line: &str) -> (u64, Vec<BookDiff>, usize) {
     (h, out, unknown)
 }
 
+/// Native raw book diffs carry no cloid; give each `New` the cloid native's
+/// order statuses report for that oid, so an order adopted by `resync` can
+/// still be cancelled or modified by cloid.
+fn attach_cloids(nd: &[BookDiff], by_oid: &HashMap<u64, Cloid>) -> Vec<BookDiff> {
+    nd.iter()
+        .map(|d| match d.kind {
+            DiffKind::New { .. } => BookDiff {
+                cloid: by_oid.get(&d.oid.0).copied(),
+                ..*d
+            },
+            _ => *d,
+        })
+        .collect()
+}
+
 struct Seed {
     height: u64,
     orders: Vec<RestingOrder>,
@@ -677,24 +696,17 @@ fn main() {
     )
     .expect("seed loads");
     assert!(e.check_invariants());
-    // Decode everything first so timing covers execute_block only.
+    // Blocks are decoded one at a time inside the loop (2,000 decoded blocks
+    // hold ~8 GB of native responses); only execute_block is timed.
     let rep = BufReader::new(File::open(arg("--replica").expect("--replica")).unwrap());
-    let mut blocks = Vec::new();
-    for line in rep.lines() {
-        let line = line.unwrap();
-        let b = decode_block(&meta, &line);
-        if b.height <= seed_h {
-            continue;
-        }
-        blocks.push(b);
-        if blocks.len() >= max {
-            break;
-        }
-    }
+    let first = seed_h + 1;
+    let last = if max == usize::MAX {
+        u64::MAX
+    } else {
+        seed_h + max as u64
+    };
     let mut native_diffs: BTreeMap<u64, (Vec<BookDiff>, usize)> = BTreeMap::new();
     let mut unseeded_diffs: HashMap<u64, usize> = HashMap::new();
-    let first = blocks.first().map_or(0, |b| b.height);
-    let last = blocks.last().map_or(0, |b| b.height);
     for line in BufReader::new(File::open(arg("--diffs").expect("--diffs")).unwrap()).lines() {
         let line = line.unwrap();
         let (h, d, unk) = parse_diffs(&meta, &line);
@@ -714,6 +726,8 @@ fn main() {
     }
     // Native next-oid per block from statuses (resync path only).
     let mut status_max: HashMap<u64, u64> = HashMap::new();
+    // Native cloid per oid from statuses (raw book diffs carry none).
+    let mut status_cloids: HashMap<u64, Cloid> = HashMap::new();
     if let Some(p) = arg("--statuses") {
         for line in BufReader::new(File::open(p).unwrap()).lines() {
             let v: Value = serde_json::from_str(&line.unwrap()).unwrap();
@@ -721,9 +735,15 @@ fn main() {
             if h < first || h > last {
                 continue;
             }
-            let m = v["events"]
-                .as_array()
-                .unwrap()
+            let evs = v["events"].as_array().unwrap();
+            for s in evs {
+                if let (Some(o), Some(c)) =
+                    (s["order"]["oid"].as_u64(), cloid(&s["order"]["cloid"]))
+                {
+                    status_cloids.insert(o, c);
+                }
+            }
+            let m = evs
                 .iter()
                 .filter_map(|s| s["order"]["oid"].as_u64())
                 .max()
@@ -735,11 +755,24 @@ fn main() {
     let mut k = 0usize;
     let mut classes: BTreeMap<String, usize> = BTreeMap::new();
     let mut examples: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut times_ns: Vec<u64> = Vec::with_capacity(blocks.len());
+    let mut times_ns: Vec<u64> = Vec::new();
     let mut counted_ns: Vec<u64> = Vec::new();
     let mut global_max_oid = max_oid;
     let empty = (Vec::new(), 0usize);
-    for b in &blocks {
+    let (mut n, mut first_seen, mut last_seen) = (0usize, 0u64, 0u64);
+    for line in rep.lines() {
+        if n >= max {
+            break;
+        }
+        let b = &decode_block(&meta, &line.unwrap());
+        if b.height <= seed_h {
+            continue;
+        }
+        if n == 0 {
+            first_seen = b.height;
+        }
+        last_seen = b.height;
+        n += 1;
         let acts = b.actions();
         let t0 = Instant::now();
         let out = e.execute_block_bundled(b.time_ms, &acts, &b.expires, &b.bundle_lens);
@@ -772,6 +805,12 @@ fn main() {
         for i in 0..b.acts.len() {
             let expired = out.responses[i].expired;
             if b.acts[i].0 == 4 && !expired {
+                continue;
+            }
+            // An action on a book the seed lacks cannot match (the block is
+            // already unseeded-book); classify the next one instead.
+            let (a0, a1) = b.act_assets[i];
+            if b.assets[a0..a1].iter().any(|a| !seeded.contains(a)) {
                 continue;
             }
             let ours = response_json(&meta, b, i, out.statuses_of(i), expired);
@@ -866,15 +905,14 @@ fn main() {
                 *classes.entry(w.clone()).or_default() += 1;
             }
             // Adopt native's book and counter (non-reproduced block only).
-            if let Err(err) = e.resync(nd) {
+            if let Err(err) = e.resync(&attach_cloids(nd, &status_cloids)) {
                 eprintln!("h{}: resync failed: {err:?}; stopping", b.height);
                 break;
             }
             e.set_next_oid(Oid(global_max_oid + 1));
         }
     }
-    let n = blocks.len();
-    println!("blocks N={n} heights {first}..={last}  reproduced k={k}");
+    println!("blocks N={n} heights {first_seen}..={last_seen}  reproduced k={k}");
     println!("non-reproduced blocks by class (a block can be in several):");
     let mut cl: Vec<_> = classes.into_iter().collect();
     cl.sort_by_key(|c| std::cmp::Reverse(c.1));
@@ -907,4 +945,42 @@ fn main() {
     stat(&mut times_ns, "all blocks");
     stat(&mut counted_ns, "reproduced blocks");
     assert!(e.check_invariants(), "engine invariants after replay");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn diff(oid: u64, kind: DiffKind) -> BookDiff {
+        BookDiff {
+            asset: 0,
+            user: User([7; 20]),
+            oid: Oid(oid),
+            side: Side::Bid,
+            px: Px(100),
+            kind,
+            cloid: None,
+        }
+    }
+
+    /// Native raw book diffs carry no cloid. An order adopted by resync must
+    /// get its cloid from native's order statuses, or a later cancelByCloid
+    /// of it is answered "never placed" (1,507 of 2,000 blocks before).
+    #[test]
+    fn resync_diffs_get_cloids_from_native_statuses() {
+        let new = DiffKind::New {
+            sz: Sz(5),
+            insert_before: None,
+        };
+        let nd = [diff(5, new), diff(6, new), diff(5, DiffKind::Remove)];
+        let by_oid = HashMap::from([(5u64, Cloid(42))]);
+        let out = attach_cloids(&nd, &by_oid);
+        assert_eq!(out[0].cloid, Some(Cloid(42)));
+        assert_eq!(out[1].cloid, None, "no status cloid: stays None");
+        assert_eq!(out[2].cloid, None, "only New diffs rest an order");
+        assert_eq!(
+            out.iter().map(|d| (d.oid, d.kind)).collect::<Vec<_>>(),
+            nd.iter().map(|d| (d.oid, d.kind)).collect::<Vec<_>>()
+        );
+    }
 }
