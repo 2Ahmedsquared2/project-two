@@ -231,7 +231,13 @@ fn check_host_facts(
         Some(path) => {
             let facts = HostFacts::load(path)?;
             facts.check_kernel(&host.kernel)?;
-            let note = HostFactsNote::captured(path, &facts, args.feeder_core, args.hot_core);
+            let note = HostFactsNote::captured_with_sqpoll(
+                path,
+                &facts,
+                args.feeder_core,
+                args.hot_core,
+                args.sqpoll_core,
+            );
             Ok((note, Some(facts)))
         }
         None if args.allow_missing_host_facts => Ok((HostFactsNote::Waived, None)),
