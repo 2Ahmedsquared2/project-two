@@ -2,9 +2,10 @@
 (***************************************************************************)
 (* Model of the p2-node replay driver: Replay::run / Replay::record and     *)
 (* the timed loop one_pass (crates/p2-node/src/{replay,timing}.rs, lane 3,  *)
-(* draft PR #10, modelled at commit dc993fc). README.md maps every action   *)
-(* below to file:line, lists bounds and assumptions, and what is NOT        *)
-(* covered.                                                                 *)
+(* draft PR #10). Sync commit 5dc691f (VALIDATE = TRUE); the configs with   *)
+(* VALIDATE = FALSE keep the earlier code at dc993fc and its findings F1,   *)
+(* F2. README.md maps every action below to file:line, lists bounds and    *)
+(* assumptions, and what is NOT covered.                                    *)
 (*                                                                         *)
 (* The driver walks a slice of blocks in slice order. Per block it calls    *)
 (* engine.execute_block, then record(): blocks += 1, compare(b, out) (our   *)
@@ -18,9 +19,12 @@
 (* outputs may still equal native's (the difference sits where the block    *)
 (* does not touch: free choice `lucky`), but our book stays different.      *)
 (*                                                                         *)
-(* FIX = FALSE models the code as written. FIX = TRUE models the proposed   *)
-(* fix sent to lane 3: refuse a block whose height is not last+1, and stop  *)
-(* when native's diffs for a block are missing. MUTANT selects one          *)
+(* FIX = FALSE, VALIDATE = FALSE: code at dc993fc. VALIDATE = TRUE: code   *)
+(* at 5dc691f. Silent divergence, healing and the end-of-window check are   *)
+(* the extension for the k/N headline gate (E1-E3).                         *)
+(* FIX = TRUE models the fix first proposed to lane 3: refuse a block whose *)
+(* height is not last+1, stop when native's diffs are missing. MUTANT       *)
+(* selects one                                                              *)
 (* deliberate bug used to show each property can fail ("none" = no bug).    *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
@@ -33,7 +37,20 @@ CONSTANTS
                        \* FALSE: slice is exactly snapH+1, snapH+2, ..., MaxH
     DiffsMayBeMissing, \* TRUE: native's book diffs may be absent for any block
     FIX,               \* FALSE: code at dc993fc; TRUE: proposed fix
-    MUTANT             \* "none" or a mutation name from the README
+    MUTANT,            \* "none" or a mutation name from the README
+    SilentDiverge,     \* TRUE: a wrong execution may leave our book different
+                       \*   from native's while the block's compared outputs
+                       \*   (responses + book diffs) still equal native's
+    MayHeal,           \* TRUE: a later block may erase an earlier difference,
+                       \*   so our book equals native's again
+    VALIDATE,          \* TRUE: lane 3's fix at 5dc691f: validate() refuses the whole
+                       \*   slice up front unless heights are snapH+1, snapH+2, ...
+                       \*   and every block has native diffs; one_pass refuses a raw
+                       \*   line that is not the compared block
+    LinesMayDiffer,    \* TRUE: timed pass (one_pass) whose raw line j may decode to a
+                       \*   different block than the compared block j
+    EndExact           \* TRUE: the end-of-window check sees every difference
+                       \*   between our book and native's translated state
 
 Heights == 1..MaxH
 Idx == 1..MaxLen
@@ -42,6 +59,7 @@ Verdicts == {"none", "match", "mismatch"}
 VARIABLES
     snapH,      \* height of native's snapshot the engine was built from (0 = genesis)
     input,      \* the slice: input[j] = height of the j-th ReplayBlock
+    lines,      \* lines[j] = height of the block raw line j decodes to (one_pass)
     hasDiffs,   \* hasDiffs[j]: native's book diffs present for the j-th block
     i,          \* index of the block the loop is on
     pc,         \* "idle" | "executed" | "compared" | "resyncedEarly" | "halted"
@@ -56,22 +74,34 @@ VARIABLES
     n,          \* Replay.blocks
     counted,    \* ghost: indices that incremented `reproduced`
     resynced,   \* ghost: indices passed to engine.resync
-    log         \* ghost: <<[kind |-> "snap"|"apply"|"resync", h |-> height]>>
+    log,        \* ghost: <<[kind |-> "snap"|"apply"|"resync", h |-> height]>>
+    endState    \* end-of-window check: "none" (not run) | "pass" | "fail"
 
-vars == <<snapH, input, hasDiffs, i, pc, last, synced, pre, outMatch, verdict,
-          tOut, tState, k, n, counted, resynced, log>>
+vars == <<snapH, input, lines, hasDiffs, i, pc, last, synced, pre, outMatch, verdict,
+          tOut, tState, k, n, counted, resynced, log, endState>>
+
+Choice(flag) == IF flag THEN BOOLEAN ELSE {FALSE}
 
 Ev(kind, h) == [kind |-> kind, h |-> h]
 
 AnySlices == UNION {[1..len -> Heights] : len \in 1..MaxLen}
 Slices(s) == IF AnyInput THEN AnySlices ELSE {[j \in 1..(MaxH - s) |-> s + j]}
 
+(* validate(blocks, snapshot), replay.rs:150-166, with its mutations. *)
+ValidHeight(j) ==
+    CASE MUTANT = "validate_no_height_check"  -> TRUE
+      [] MUTANT = "validate_ignores_snapshot" -> input[j] = j
+      [] OTHER                                -> input[j] = snapH + j
+ValidDiffs(j) == MUTANT = "validate_no_diffs_check" \/ hasDiffs[j]
+Valid == \A j \in 1..Len(input) : ValidHeight(j) /\ ValidDiffs(j)
+
 Init ==
     /\ snapH \in 0..(MaxH - 1)
     /\ input \in Slices(snapH)
+    /\ lines \in IF LinesMayDiffer THEN [1..Len(input) -> Heights] ELSE {input}
     /\ hasDiffs \in IF DiffsMayBeMissing THEN [Idx -> BOOLEAN] ELSE {[j \in Idx |-> TRUE]}
     /\ i = 1
-    /\ pc = "idle"
+    /\ pc = IF VALIDATE /\ ~Valid THEN "refused" ELSE "idle"   \* Err(ReplayError) before any block
     /\ last = IF MUTANT = "cursor_ignores_snapshot" THEN 0 ELSE snapH
     /\ synced = TRUE               \* engine built from native's state at snapH
     /\ pre = TRUE
@@ -82,6 +112,7 @@ Init ==
     /\ k = 0 /\ n = 0
     /\ counted = {} /\ resynced = {}
     /\ log = IF snapH > 0 THEN <<Ev("snap", snapH)>> ELSE <<>>
+    /\ endState = "none"
 
 (* Proposed fix: height guard. Mutations weaken it. *)
 HeightOK(h) ==
@@ -90,20 +121,27 @@ HeightOK(h) ==
       [] OTHER              -> h = last + 1
 
 (* for b in blocks { let out = engine.execute_block(..) } *)
+LineCheck == VALIDATE /\ MUTANT # "no_line_check"
+
 Execute ==
     /\ pc = "idle"
     /\ i <= Len(input)
     /\ FIX => HeightOK(input[i])
-    /\ \E ok, lucky \in BOOLEAN :
-          /\ pre' = synced
-          /\ synced' = (synced /\ ok)
-          /\ outMatch' = (ok /\ (synced \/ lucky))
-          /\ tOut' = [tOut EXCEPT ![i] = ok /\ (synced \/ lucky)]
-          /\ tState' = [tState EXCEPT ![i] = synced /\ ok]
-    /\ last' = input[i]
-    /\ log' = Append(log, Ev("apply", input[i]))
+    /\ LineCheck => lines[i] = input[i]
+    /\ \E ok, lucky \in BOOLEAN, silent \in Choice(SilentDiverge), heal \in Choice(MayHeal) :
+          LET hidden == silent /\ ~ok          \* wrong, but outputs equal native's
+              healed == heal /\ ~synced /\ ok  \* block overwrites the earlier difference
+              outs   == (ok /\ (synced \/ lucky)) \/ hidden
+              post   == (synced /\ ok) \/ healed
+          IN /\ pre' = synced
+             /\ synced' = post
+             /\ outMatch' = outs
+             /\ tOut' = [tOut EXCEPT ![i] = outs]
+             /\ tState' = [tState EXCEPT ![i] = post]
+    /\ last' = lines[i]
+    /\ log' = Append(log, Ev("apply", lines[i]))   \* the block actually executed
     /\ pc' = IF MUTANT = "resync_before_compare" THEN "resyncedEarly" ELSE "executed"
-    /\ UNCHANGED <<snapH, input, hasDiffs, i, verdict, k, n, counted, resynced>>
+    /\ UNCHANGED <<snapH, input, lines, hasDiffs, i, verdict, k, n, counted, resynced, endState>>
 
 (* Proposed fix only: a block whose height is not last+1 stops the run with an error. *)
 RejectHeight ==
@@ -112,21 +150,37 @@ RejectHeight ==
     /\ i <= Len(input)
     /\ ~HeightOK(input[i])
     /\ pc' = "halted"
-    /\ UNCHANGED <<snapH, input, hasDiffs, i, last, synced, pre, outMatch, verdict,
-                   tOut, tState, k, n, counted, resynced, log>>
+    /\ UNCHANGED <<snapH, input, lines, hasDiffs, i, last, synced, pre, outMatch, verdict,
+                   tOut, tState, k, n, counted, resynced, log, endState>>
 
-(* record(): blocks += 1; match compare(b, out) { None => reproduced += 1, .. } *)
+(* one_pass at 5dc691f: the decoded raw line's time and round must equal the
+   compared block's, else Err(TimingError::Mismatch) (timing.rs:176-183). *)
+LineMismatch ==
+    /\ LineCheck
+    /\ pc = "idle"
+    /\ i <= Len(input)
+    /\ lines[i] # input[i]
+    /\ pc' = "halted"
+    /\ UNCHANGED <<snapH, input, lines, hasDiffs, i, last, synced, pre, outMatch, verdict,
+                   tOut, tState, k, n, counted, resynced, log, endState>>
+
+(* record(): blocks += 1; match compare(b, out) { None => reproduced += 1, .. }
+   At dc993fc absent native diffs give Cause::NoNativeDiffs. At 5dc691f compare
+   uses native_diffs() = &[] when absent (replay.rs:278), so an absent entry
+   matches when our diffs are empty (`looksEmpty`); validate() keeps that
+   unreachable unless its diffs check is removed. *)
 Compare ==
     /\ pc = "executed"
-    /\ LET v == IF hasDiffs[i] /\ outMatch THEN "match" ELSE "mismatch" IN
+    /\ \E looksEmpty \in Choice(VALIDATE /\ ~hasDiffs[i]) :
+       LET v == IF (hasDiffs[i] /\ outMatch) \/ looksEmpty THEN "match" ELSE "mismatch" IN
        /\ verdict' = [verdict EXCEPT ![i] = v]
        /\ n' = n + 1
        /\ IF v = "match" \/ MUTANT = "count_every_block"
              THEN k' = k + 1 /\ counted' = counted \cup {i}
              ELSE UNCHANGED <<k, counted>>
     /\ pc' = "compared"
-    /\ UNCHANGED <<snapH, input, hasDiffs, i, last, synced, pre, outMatch, tOut, tState,
-                   resynced, log>>
+    /\ UNCHANGED <<snapH, input, lines, hasDiffs, i, last, synced, pre, outMatch, tOut, tState,
+                   resynced, log, endState>>
 
 Advance == /\ i' = i + 1 /\ pc' = "idle"
 
@@ -135,8 +189,8 @@ Reproduced ==
     /\ pc = "compared"
     /\ verdict[i] = "match"
     /\ Advance
-    /\ UNCHANGED <<snapH, input, hasDiffs, last, synced, pre, outMatch, verdict, tOut,
-                   tState, k, n, counted, resynced, log>>
+    /\ UNCHANGED <<snapH, input, lines, hasDiffs, last, synced, pre, outMatch, verdict, tOut,
+                   tState, k, n, counted, resynced, log, endState>>
 
 (* Some(m) arm: engine.resync(b.height, b.native_diffs()). With native's diffs
    for this block and our book equal to native's before the block, resync
@@ -155,7 +209,7 @@ Resync ==
     /\ IF MUTANT = "recompare_after_resync"
           THEN pc' = "executed" /\ outMatch' = TRUE /\ UNCHANGED i
           ELSE Advance /\ UNCHANGED outMatch
-    /\ UNCHANGED <<snapH, input, hasDiffs, last, pre, verdict, tOut, tState, k, n, counted>>
+    /\ UNCHANGED <<snapH, input, lines, hasDiffs, last, pre, verdict, tOut, tState, k, n, counted, endState>>
 
 (* Proposed fix only: native diffs missing -> stop with an error instead of resync(&[]). *)
 HaltNoDiffs ==
@@ -164,8 +218,8 @@ HaltNoDiffs ==
     /\ verdict[i] = "mismatch"
     /\ ~hasDiffs[i]
     /\ pc' = "halted"
-    /\ UNCHANGED <<snapH, input, hasDiffs, i, last, synced, pre, outMatch, verdict,
-                   tOut, tState, k, n, counted, resynced, log>>
+    /\ UNCHANGED <<snapH, input, lines, hasDiffs, i, last, synced, pre, outMatch, verdict,
+                   tOut, tState, k, n, counted, resynced, log, endState>>
 
 (* MUTANT resync_before_compare: resync (to native, unconditionally) runs before
    the verdict, and the verdict then compares the resynced book. *)
@@ -176,7 +230,7 @@ ResyncEarly ==
     /\ resynced' = resynced \cup {i}
     /\ log' = Append(log, Ev("resync", input[i]))
     /\ pc' = "executed"
-    /\ UNCHANGED <<snapH, input, hasDiffs, i, last, pre, verdict, tOut, tState, k, n, counted>>
+    /\ UNCHANGED <<snapH, input, lines, hasDiffs, i, last, pre, verdict, tOut, tState, k, n, counted, endState>>
 
 (* MUTANT stop_on_mismatch: `return` on the first mismatch instead of resync. *)
 StopOnMismatch ==
@@ -184,15 +238,34 @@ StopOnMismatch ==
     /\ pc = "compared"
     /\ verdict[i] = "mismatch"
     /\ pc' = "halted"
-    /\ UNCHANGED <<snapH, input, hasDiffs, i, last, synced, pre, outMatch, verdict,
+    /\ UNCHANGED <<snapH, input, lines, hasDiffs, i, last, synced, pre, outMatch, verdict,
+                   tOut, tState, k, n, counted, resynced, log, endState>>
+
+Done == pc = "idle" /\ i > Len(input)
+
+(* End-of-window check (proposed, task 2 of the headline gate): after the last
+   block, compare our final book with native's state at the last height,
+   translated into our book's shape. With EndExact the check fails exactly when
+   the books differ (assumption A5); without it, a difference may sit in a part
+   the translation drops (`blind`). Mutations: end_skip_when_all_counted skips
+   the check (reports pass) when every block was counted; end_check_before_last_block
+   compares the book as it was before the last block. *)
+EndCheck ==
+    /\ Done
+    /\ \E blind \in Choice(~EndExact) :
+          LET agree  == IF MUTANT = "end_check_before_last_block" THEN pre ELSE synced
+              passes == IF MUTANT = "end_skip_when_all_counted" /\ k = n
+                           THEN TRUE ELSE agree \/ blind
+          IN endState' = IF passes THEN "pass" ELSE "fail"
+    /\ pc' = "ended"
+    /\ UNCHANGED <<snapH, input, lines, hasDiffs, i, last, synced, pre, outMatch, verdict,
                    tOut, tState, k, n, counted, resynced, log>>
 
 DriverNext ==
     IF MUTANT = "stop_on_mismatch"
     THEN Execute \/ Compare \/ Reproduced \/ StopOnMismatch
-    ELSE Execute \/ RejectHeight \/ Compare \/ Reproduced \/ Resync \/ HaltNoDiffs \/ ResyncEarly
-
-Done == pc = "idle" /\ i > Len(input)
+    ELSE Execute \/ LineMismatch \/ RejectHeight \/ Compare \/ Reproduced \/ Resync \/ HaltNoDiffs \/ ResyncEarly
+         \/ EndCheck
 
 Spec == Init /\ [][DriverNext]_vars
 
@@ -209,7 +282,8 @@ LogBound == Len(log) <= 2 * MaxLen + 2
 
 TypeOK ==
     /\ snapH \in 0..MaxH /\ i \in 1..(MaxLen + 1) /\ last \in 0..MaxH
-    /\ pc \in {"idle", "executed", "compared", "resyncedEarly", "halted"}
+    /\ pc \in {"idle", "executed", "compared", "resyncedEarly", "halted", "ended", "refused"}
+    /\ endState \in {"none", "pass", "fail"}
     /\ synced \in BOOLEAN /\ pre \in BOOLEAN /\ outMatch \in BOOLEAN
     /\ verdict \in [Idx -> Verdicts]
     /\ k \in Nat /\ n \in Nat /\ counted \subseteq Idx /\ resynced \subseteq Idx
@@ -253,10 +327,26 @@ P4a_OutputMismatchNeverCounted ==
 P4b_CountedImpliesStateIdentical ==
     \A j \in counted : tState[j]
 
+(* E1. A passing end-of-window check means our final book equals native's. *)
+E1_EndPassImpliesFinalBooksAgree == endState = "pass" => synced
+
+(* E2. Headline N/N: every block counted (k = N) and the end check passes
+   implies our book equalled native's after every block of the window. *)
+E2_AllCountedAndEndPassImpliesAgreedThroughout ==
+    (endState = "pass" /\ k = n) => \A j \in 1..Len(input) : tState[j]
+
+(* E3. Partial k/N: if the end check passes, every block counted as reproduced
+   left our book equal to native's (P4b, backed by the end check). *)
+E3_EndPassImpliesCountedStateIdentical ==
+    endState = "pass" => \A j \in counted : tState[j]
+
 (* Vacuity probes: each must be VIOLATED, showing the run reaches these states. *)
 Probe_NoResync == resynced = {}
 Probe_NoSnapThenApply ==
     ~\E p, q \in 1..Len(log) : p < q /\ log[p].kind = "snap" /\ log[q].kind = "apply"
 Probe_NeverDoneAfterMismatch == ~(Done /\ resynced # {} /\ k > 0)
 Probe_NoMismatchCounted == n = k
+Probe_NeverRefused == pc # "refused"
+Probe_EndNeverFails == endState # "fail"
+Probe_EndNeverPassesAfterResync == ~(endState = "pass" /\ resynced # {})
 =============================================================================
