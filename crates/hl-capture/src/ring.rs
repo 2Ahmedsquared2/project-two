@@ -23,6 +23,10 @@ use crate::tail::ObservationSink;
 /// Default ring size, in records (32 bytes each: 2 MiB).
 pub const DEFAULT_RING_RECORDS: usize = 65_536;
 
+/// Most records the writer thread writes before it calls its hook again
+/// (see [`RingSource::run_with`]).
+pub const WRITE_CHUNK: usize = 1024;
+
 /// The reader's end of the ring.
 #[derive(Debug)]
 pub struct RingSink {
@@ -77,8 +81,16 @@ impl RingSource {
     /// Writes every record now in the ring to `out` as JSON lines and
     /// flushes if it wrote any. Returns how many it wrote.
     pub fn write_available<W: Write>(&mut self, out: &mut W) -> std::io::Result<u64> {
+        self.write_up_to(out, usize::MAX)
+    }
+
+    /// Like [`Self::write_available`], stopping after `max` records.
+    pub fn write_up_to<W: Write>(&mut self, out: &mut W, max: usize) -> std::io::Result<u64> {
         let mut n = 0;
-        while let Some(obs) = self.pop() {
+        let mut left = max;
+        while left > 0 {
+            let Some(obs) = self.pop() else { break };
+            left -= 1;
             serde_json::to_writer(&mut *out, &obs)?;
             out.write_all(b"\n")?;
             n += 1;
@@ -96,9 +108,25 @@ impl RingSource {
     /// is dropped and the ring is empty. Returns how many records it wrote.
     /// On a write error it returns at once, which drops this end and shows
     /// the reader [`RingSink::abandoned`].
-    pub fn run<W: Write>(mut self, mut out: W, idle: Duration) -> std::io::Result<u64> {
+    pub fn run<W: Write>(self, out: W, idle: Duration) -> std::io::Result<u64> {
+        self.run_with(out, idle, || Ok(()))
+    }
+
+    /// [`Self::run`], calling `between` before every chunk of at most
+    /// [`WRITE_CHUNK`] records and before every idle sleep, so other work
+    /// that belongs on this thread (the look for a newer hourly file) waits
+    /// for one chunk's write at most, not for a whole backlog. An error
+    /// from `between` ends the loop like a write error.
+    pub fn run_with<W: Write>(
+        mut self,
+        mut out: W,
+        idle: Duration,
+        mut between: impl FnMut() -> std::io::Result<()>,
+    ) -> std::io::Result<u64> {
         let mut total = 0;
         loop {
+            // Not implemented yet (red): the hook is never called.
+            let _ = &mut between;
             let n = self.write_available(&mut out)?;
             total += n;
             if n > 0 {

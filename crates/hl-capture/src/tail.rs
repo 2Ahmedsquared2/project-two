@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use hl_latency::{parse_node_line, scan_node_header, CompleteLine, Observation, Source};
 
 use crate::lines::{LineSink, LineSplitter};
+use crate::scout::Arrivals;
 
 /// Sort key of an hourly file path `.../{YYYYMMDD}/{H}`: `(date, hour)`.
 /// `None` when the last two components are not a date and an hour 0..=23.
@@ -202,6 +203,21 @@ pub struct NodeTailer {
     rescan_due: bool,
     last_height: Option<u64>,
     switch: SwitchState,
+    /// When set, a [`crate::Scout`] on another thread looks for newer files
+    /// and this tailer only takes what it found.
+    arrivals: Option<Arrivals>,
+    /// A newer file taken from the scout whose switch waits for the old
+    /// file's backlog.
+    held: Option<Candidate>,
+}
+
+/// A file newer than the current one may be.
+#[derive(Debug)]
+struct Candidate {
+    path: PathBuf,
+    key: Option<(u32, u8)>,
+    /// Already open when the scout found it.
+    file: Option<File>,
 }
 
 /// Where the report of the latest switch stands.
@@ -239,7 +255,32 @@ impl NodeTailer {
             rescan_due: true,
             last_height: None,
             switch: SwitchState::None,
+            arrivals: None,
+            held: None,
         }
+    }
+
+    /// Like [`Self::with_max_line`], with the look for newer files done by
+    /// a [`crate::Scout`] on another thread. Only the first poll walks the
+    /// directory itself (nothing is being read yet, so that costs no stamp
+    /// accuracy). After it, a poll that reaches the end of the current file
+    /// takes what the scout found with one wait-free pop: no directory
+    /// walk, no `open`. [`Self::request_rescan`] becomes an atomic store
+    /// that asks the scout to look now.
+    #[must_use]
+    pub fn with_scout(root: impl Into<PathBuf>, max_line: usize, arrivals: Arrivals) -> Self {
+        Self {
+            arrivals: Some(arrivals),
+            ..Self::with_max_line(root, max_line)
+        }
+    }
+
+    /// True while a look asked for with [`Self::request_rescan`] has not
+    /// been finished by the scout: poll again soon, its answer is close.
+    /// Always false without a scout. One atomic load.
+    #[must_use]
+    pub fn look_pending(&self) -> bool {
+        self.arrivals.as_ref().is_some_and(Arrivals::pending)
     }
 
     /// [`Self::request_rescan`] then [`Self::poll_into`], collected into a
@@ -304,13 +345,41 @@ impl NodeTailer {
             return Ok(());
         }
         self.finish_switch();
-        if !std::mem::take(&mut self.rescan_due) {
-            return Ok(());
-        }
-        self.stats.rescans += 1;
-        let first = !std::mem::replace(&mut self.polled, true);
-        if let Some(newest) = find(&self.root)? {
-            let key = hourly_key(&newest);
+        let first = !self.polled;
+        let walk = if self.arrivals.is_some() {
+            // The scout walks; this thread only does so before it has
+            // anything to read.
+            first
+        } else {
+            std::mem::take(&mut self.rescan_due)
+        };
+        let candidate = if let Some(held) = self.held.take() {
+            Some(held)
+        } else if walk {
+            self.polled = true;
+            self.stats.rescans += 1;
+            find(&self.root)?.map(|path| Candidate {
+                key: hourly_key(&path),
+                path,
+                file: None,
+            })
+        } else {
+            // One wait-free pop: no system call, no allocation.
+            self.arrivals
+                .as_mut()
+                .and_then(Arrivals::pop)
+                .map(|f| Candidate {
+                    path: f.path,
+                    key: Some(f.key),
+                    file: Some(f.file),
+                })
+        };
+        if let Some(Candidate {
+            path: newest,
+            key,
+            file: opened,
+        }) = candidate
+        {
             let newer = match (&self.current, key) {
                 (None, Some(_)) => true,
                 (Some(c), Some(k)) => k > c.key,
@@ -326,12 +395,24 @@ impl NodeTailer {
                     self.drain(clock, sink, &mut budget)?;
                     if self.backlogged {
                         // More than this poll may read: finish the old file
-                        // first and look again.
-                        self.rescan_due = true;
+                        // first, then come back to this switch.
+                        if opened.is_some() {
+                            // The scout will not hand it over again.
+                            self.held = Some(Candidate {
+                                path: newest,
+                                key: Some(key),
+                                file: opened,
+                            });
+                        } else {
+                            self.rescan_due = true;
+                        }
                         return Ok(());
                     }
                 }
-                let mut file = File::open(&newest)?;
+                let mut file = match opened {
+                    Some(file) => file,
+                    None => File::open(&newest)?,
+                };
                 if self.current.is_some() {
                     self.stats.rotations += 1;
                     if self.splitter.clear() {
@@ -401,8 +482,14 @@ impl NodeTailer {
     /// The capture loop calls this on a coarse timer or on a directory
     /// event. Until that poll, lines in a newer file wait, which is why the
     /// poll that switches reports what it read as a [`Switch`].
+    ///
+    /// With a scout ([`Self::with_scout`]) this instead asks the scout to
+    /// look now: one atomic store.
     pub fn request_rescan(&mut self) {
-        self.rescan_due = true;
+        match self.arrivals.as_mut() {
+            Some(a) => a.ask(),
+            None => self.rescan_due = true,
+        }
     }
 
     /// The most recent switch to a file that was not yet reported, once the

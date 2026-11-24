@@ -24,8 +24,8 @@
 //! `--stream-with-block-info` one block can span several lines.
 //!
 //! Exit codes: 0 every record passed; 1 a record failed (or a height gap,
-//! when asked); 2 usage; 3 a path could not be read, or there was no hourly
-//! file to check.
+//! when asked); 2 usage; 3 a path could not be read, or a directory given
+//! has no hourly file (each one must, and nothing is reported then).
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -87,13 +87,20 @@ fn run(args: &Args) -> std::io::Result<Counts> {
     let mut files = Vec::new();
     for path in &args.paths {
         if std::fs::metadata(path)?.is_dir() {
-            files.extend(hourly_files(path)?);
+            let found = hourly_files(path)?;
+            // Every directory named must give a file: a mistyped or
+            // not-yet-written directory is not hidden by another path's
+            // files.
+            if found.is_empty() {
+                return Err(std::io::Error::other(format!(
+                    "no hourly file to check under {}",
+                    path.display()
+                )));
+            }
+            files.extend(found);
         } else {
             files.push(path.clone());
         }
-    }
-    if files.is_empty() {
-        return Err(std::io::Error::other("no hourly file to check"));
     }
     let mut out = std::io::stdout().lock();
     let mut emit = |line: &Line<'_>| -> std::io::Result<()> {

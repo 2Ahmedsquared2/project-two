@@ -1,0 +1,4 @@
+== /sys/kernel/mm/transparent_hugepage/enabled
+always [madvise] never
+== /sys/kernel/mm/transparent_hugepage/defrag
+always defer defer+madvise [madvise] never

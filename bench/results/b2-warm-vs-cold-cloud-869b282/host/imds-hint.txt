@@ -1,0 +1,4 @@
+== /sys/devices/virtual/dmi/id/product_name
+cat: /sys/devices/virtual/dmi/id/product_name: No such file or directory
+== /sys/devices/virtual/dmi/id/board_asset_tag
+cat: /sys/devices/virtual/dmi/id/board_asset_tag: No such file or directory

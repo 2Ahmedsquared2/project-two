@@ -187,6 +187,23 @@ repeats) fail it.
 Exit codes: 0 every record passed, 1 a record failed (or a gap, when asked),
 2 usage, 3 unreadable path or no hourly file found.
 
+Feed its stdout to the report: `hl-latency observations.jsonl --strict-pass
+strict-pass.jsonl` leaves every block listed as a scan-accepted failure out of
+the pairing. An observation carries no file offset, so a torn line's stamp
+cannot be told from a good line of the same block: the whole block goes (every
+node observation with that `block_number` and `block_time_ms`, and the
+public-WebSocket observations with that block time), and it counts as neither
+matched, node-only nor ws-only. The summary gains `strict_pass_applied`,
+`strict_dropped_observations`, `strict_dropped_blocks`,
+`strict_dropped_ws_arrivals`, `strict_failures_listed`,
+`strict_failures_unmatched` (listed blocks the capture never observed),
+`strict_failures_omitted` and `strict_drop_incomplete`. When the strict pass
+capped its list (`failures_omitted` above 0) the summary is still printed but
+`hl-latency` exits 1: torn stamps may remain, so rerun `hl-strict-pass` with a
+larger `--max-failures`. Strict-pass output that is malformed or has no
+`total` line (cut short) exits 2 with no summary. Without `--strict-pass`,
+`strict_pass_applied` is false and nothing was dropped.
+
 A newer hourly file is looked for every `--rescan-ms` (default 1000) and, in
 `inotify` mode, when a directory changes; never per poll, and only once the
 current file is read to its end. When the look finds a newer file, the old one
