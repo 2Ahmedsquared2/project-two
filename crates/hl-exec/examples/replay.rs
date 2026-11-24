@@ -203,6 +203,15 @@ fn fmt_units(v: u128, dec: u32) -> String {
     format!("{i}.{}", fs.trim_end_matches('0'))
 }
 
+/// Native prints a whole-number `totalSz` / `avgPx` with ".0" ("1710.0").
+fn pad_whole(s: String) -> String {
+    if s.contains('.') {
+        s
+    } else {
+        format!("{s}.0")
+    }
+}
+
 /// Decimal places of the fractional part, trailing zeros ignored.
 fn decs(s: &str) -> usize {
     s.split_once('.')
@@ -525,16 +534,17 @@ fn leg_json(meta: &Meta, asset: Asset, cl: Option<Cloid>, s: OrderStatus) -> Val
                 let i = info.unwrap();
                 let mut m = serde_json::Map::new();
                 let tot = fmt_units(u128::from(filled.0), i.sz_dec);
-                let tot = if tot.contains('.') {
-                    tot
-                } else {
-                    format!("{tot}.0")
-                };
-                m.insert("totalSz".into(), tot.into());
-                // avgPx: exact notional / filled, rounded half-up to the price grid (UNVERIFIED rule).
+                m.insert("totalSz".into(), pad_whole(tot).into());
+                // avgPx: exact notional / filled, FLOORED to the price grid. Native
+                // matches floor on 19,117 of 19,117 legs both we and native filled
+                // over 1232430001..1232440000; 1,085 of them tell floor from
+                // half-up and all say floor (lane 3's R2, adapter 0c97fb2:
+                // r2_filled_legs_0c97fb2.tsv, r2.py / r2b.py). Native-filled legs
+                // we do not fill are not in that count.
+                // A whole number prints with ".0" (R2: 991 whole-number avgPx).
                 let f = u128::from(filled.0);
-                let q = (notional * 2 + f) / (2 * f);
-                m.insert("avgPx".into(), fmt_units(q, i.px_dec).into());
+                let q = notional / f;
+                m.insert("avgPx".into(), pad_whole(fmt_units(q, i.px_dec)).into());
                 m.insert("oid".into(), oid.0.into());
                 serde_json::json!({ "filled": with_cloid(m) })
             }
@@ -1651,6 +1661,47 @@ mod tests {
         let (r, unsupported) = decode_leg(&meta, &leg(159, "30", "1"), 0);
         assert_eq!(r.pre_reject, None);
         assert!(!unsupported, "$30 notional is modelled");
+    }
+
+    fn filled(meta: &Meta, a: Asset, filled: u64, notional: u128) -> Value {
+        let st = OrderStatus::Placed {
+            oid: Oid(9),
+            filled: Sz(filled),
+            notional,
+            rested: Sz(0),
+        };
+        leg_json(meta, a, None, st)["filled"].clone()
+    }
+
+    /// avgPx is floored to the price grid, not rounded half-up (lane 3's R2:
+    /// 1232430012 ENA, VWAP 0.1015239763, native "0.101523").
+    #[test]
+    fn avg_px_floors_to_the_price_grid() {
+        let meta = meta_one(7, 0, 6); // ENA: szDecimals 0, grid 6 decimals
+        let f = filled(&meta, 7, 10_000, 1_015_239_763);
+        assert_eq!(f["avgPx"], "0.101523", "floor, not half-up 0.101524");
+        // Exactly on the grid: unchanged.
+        let f = filled(&meta, 7, 4, 4 * 101_523);
+        assert_eq!(f["avgPx"], "0.101523");
+    }
+
+    /// A whole-number avgPx prints with ".0" (native: 991 whole-number avgPx
+    /// in lane 3's R2, all with ".0"); a non-whole one and totalSz are
+    /// unchanged.
+    #[test]
+    fn avg_px_whole_number_prints_point_zero() {
+        let meta = meta_one(7, 2, 4); // szDecimals 2, price grid 4 decimals
+                                      // 3 lots of 0.01 at px 1710.0000: avgPx 1710 -> "1710.0".
+        let f = filled(&meta, 7, 3, 3 * 1710_0000);
+        assert_eq!(f["avgPx"], "1710.0");
+        assert_eq!(f["totalSz"], "0.03");
+        // Non-whole avgPx: unchanged, trailing zeros trimmed as before.
+        let f = filled(&meta, 7, 100, 100 * 1710_5000);
+        assert_eq!(f["avgPx"], "1710.5");
+        assert_eq!(f["totalSz"], "1.0", "whole totalSz keeps its \".0\"");
+        let f = filled(&meta, 7, 250, 250 * 1234);
+        assert_eq!(f["avgPx"], "0.1234");
+        assert_eq!(f["totalSz"], "2.5");
     }
 
     #[test]
