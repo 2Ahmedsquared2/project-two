@@ -172,6 +172,132 @@ fn capture(dir: &str, path_env: Option<&str>) -> String {
     std::fs::read_to_string(out).unwrap()
 }
 
+/// The last line a capture wrote to stderr, with its exit status.
+#[cfg(target_os = "linux")]
+fn exit_line(c: &mut Command) -> (Option<i32>, String) {
+    let o = c.output().unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    (
+        o.status.code(),
+        err.lines().last().unwrap_or_default().to_owned(),
+    )
+}
+
+// #38: a capture that ends non-zero says on stderr how it ended and where it
+// had got to. `/dev/full` refuses every write, so the script runs to its last
+// section and ends with the status of that section's last write.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_capture_that_ends_non_zero_says_where_on_stderr() {
+    let (code, last) = exit_line(Command::new(bash()).arg(script()).arg("/dev/full"));
+    assert_eq!(code, Some(1));
+    assert!(
+        last.starts_with(
+            "capture-host.sh: exit 1; file: /dev/full; last step: section smt; last command: "
+        ),
+        "{last:?}"
+    );
+}
+
+// #38, the cause: a caller that runs `set -e` with SHELLOPTS exported (as
+// scripts/check.sh does on a host that exports it) hands errexit to every bash
+// it starts. The script sets its own options, so it still runs to its last
+// section; under the inherited errexit it would end at the first refused write.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_errexit_inherited_from_the_caller_does_not_end_the_capture_early() {
+    for inherited in ["errexit", "errexit:pipefail", "errexit:nounset:pipefail"] {
+        let (code, last) = exit_line(
+            Command::new(bash())
+                .env("SHELLOPTS", inherited)
+                .arg(script())
+                .arg("/dev/full"),
+        );
+        assert_eq!(code, Some(1), "{inherited}");
+        assert!(
+            last.starts_with(
+                "capture-host.sh: exit 1; file: /dev/full; last step: section smt; last command: "
+            ),
+            "{inherited}: {last:?}"
+        );
+    }
+}
+
+// #38: the silent exit happened while the script had its own stderr turned
+// away to hide a vanished /proc/PID/comm. Here the capture is ended from
+// outside at exactly that point (a DEBUG trap, handed in through BASH_ENV,
+// exits 9 on the command that reads comm), and the exit line still arrives.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_capture_ended_while_its_stderr_is_turned_away_still_says_where() {
+    let dir = tmp("turned-away");
+    let env = dir.join("bash-env");
+    std::fs::write(
+        &env,
+        "set -T\ntrap 'case \"$BASH_COMMAND\" in *name*\\\"\\$f\\\"*) exit 9 ;; esac' DEBUG\n",
+    )
+    .unwrap();
+    let (code, last) = exit_line(
+        Command::new(bash())
+            .env("BASH_ENV", &env)
+            .arg(script())
+            .arg(dir.join("host-facts.txt")),
+    );
+    assert_eq!(code, Some(9), "the read of comm was not reached: {last:?}");
+    assert!(
+        last.starts_with("capture-host.sh: exit 9; file: ")
+            && last.contains("; last step: section irqbalance; last command: "),
+        "{last:?}"
+    );
+}
+
+// The exit line is for failures only: a capture that works stays silent.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_capture_that_works_says_nothing_on_stderr_or_stdout() {
+    let out = tmp("quiet").join("host-facts.txt");
+    let o = Command::new(bash())
+        .arg(script())
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{:?}", o.status);
+    assert_eq!(String::from_utf8_lossy(&o.stderr), "");
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "");
+}
+
+// The irqbalance section is read from /proc/PID/comm: a process of that name
+// is found and reported with its pid.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_running_irqbalance_is_reported_with_its_pid() {
+    let dir = tmp("irqbalance");
+    let exe = dir.join("irqbalance");
+    let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+        .expect("sleep");
+    std::fs::copy(sleep, &exe).unwrap();
+    let mut child = Command::new(&exe).arg("60").spawn().unwrap();
+    let out = dir.join("host-facts.txt");
+    let o = Command::new(bash())
+        .arg(script())
+        .arg(&out)
+        .output()
+        .unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(o.status.success(), "{:?}", o.status);
+    let f = HostFacts::parse(&std::fs::read_to_string(out).unwrap()).unwrap();
+    let body = f.section("irqbalance").unwrap();
+    assert!(
+        body.lines()
+            .all(|l| l.starts_with("running (pid ") && l.ends_with(')'))
+            && body.lines().count() == 1,
+        "{body:?}"
+    );
+}
+
 // The capture script is for Linux hosts (/proc, /sys, bash 4.2+).
 #[cfg(target_os = "linux")]
 #[test]
