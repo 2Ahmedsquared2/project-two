@@ -205,6 +205,8 @@ pub struct Report<'a> {
     pub released: u64,
     /// Numbers given up with [`Racer::skip_missing`].
     pub gaps: u64,
+    /// `u64::MAX` was released or skipped: the stream is finished.
+    pub exhausted: bool,
     /// Per source, by index.
     pub sources: &'a [SourceStats],
 }
@@ -216,6 +218,9 @@ pub struct Racer {
     store: Vec<u8>,
     max_payload: usize,
     next: u64,
+    /// Set once `u64::MAX` is released or skipped; `next` stays at
+    /// `u64::MAX` and every number counts as behind.
+    exhausted: bool,
     released: u64,
     gaps: u64,
     stats: Vec<SourceStats>,
@@ -233,6 +238,7 @@ impl Racer {
             store: vec![0; slots.saturating_mul(max_payload)],
             max_payload,
             next: start,
+            exhausted: false,
             released: 0,
             gaps: 0,
             stats: vec![SourceStats::default(); sources],
@@ -271,12 +277,14 @@ impl Racer {
                 self.stats[source].too_far += 1;
                 return Offer::TooFar;
             }
+            // Once exhausted, nothing is ahead: every number is behind.
             Position::Ahead { slot } | Position::Behind { slot } => slot,
         };
+        let behind = self.exhausted || matches!(pos, Position::Behind { .. });
         let s = self.slots[slot];
         let holds_seq = s.state != SlotState::Empty && s.seq == item.seq;
         if !holds_seq {
-            if matches!(pos, Position::Behind { .. }) {
+            if behind {
                 self.stats[source].late += 1;
                 return Offer::Late;
             }
@@ -310,6 +318,9 @@ impl Racer {
 
     /// Releases the next number if its first copy has arrived.
     pub fn pop(&mut self) -> Option<Released<'_>> {
+        if self.exhausted {
+            return None;
+        }
         let Position::Ahead { slot } = classify(self.next, self.next, self.window())? else {
             return None;
         };
@@ -318,8 +329,8 @@ impl Racer {
             return None;
         }
         self.slots[slot].state = SlotState::Released;
-        self.next = self.next.checked_add(1)?;
         self.released += 1;
+        self.advance();
         Some(Released {
             seq: s.seq,
             winner: s.winner,
@@ -332,6 +343,9 @@ impl Racer {
     /// caller timed out, or window pressure), counting a gap. Returns the
     /// skipped number, or `None` when it is held (pop it instead).
     pub fn skip_missing(&mut self) -> Option<u64> {
+        if self.exhausted {
+            return None;
+        }
         let Some(Position::Ahead { slot }) = classify(self.next, self.next, self.window()) else {
             return None;
         };
@@ -340,9 +354,26 @@ impl Racer {
             return None;
         }
         let skipped = self.next;
-        self.next = self.next.checked_add(1)?;
         self.gaps += 1;
+        self.advance();
         Some(skipped)
+    }
+
+    /// Moves past `next`; at `u64::MAX` there is no successor, so the racer
+    /// becomes exhausted instead (`next` stays `u64::MAX`).
+    fn advance(&mut self) {
+        match self.next.checked_add(1) {
+            Some(n) => self.next = n,
+            None => self.exhausted = true,
+        }
+    }
+
+    /// True once `u64::MAX` has been released or skipped: nothing further
+    /// can be released, and every later copy is a duplicate, divergent or
+    /// late.
+    #[must_use]
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted
     }
 
     /// The next number to release.
@@ -364,6 +395,7 @@ impl Racer {
             next: self.next,
             released: self.released,
             gaps: self.gaps,
+            exhausted: self.exhausted,
             sources: &self.stats,
         }
     }

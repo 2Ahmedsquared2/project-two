@@ -108,11 +108,47 @@ fn wraps_cleanly_at_the_top_of_u64() {
     for s in [start + 2, start, start + 1] {
         assert_eq!(r.offer(0, it(s, &s.to_le_bytes()[..1], 0)), Offer::Won);
     }
-    // u64::MAX - 2 and - 1 release; u64::MAX is held but next cannot advance
-    // past it, so it is not released (documented: pop returns None).
+    // All three release, u64::MAX last and exactly once; then the racer is
+    // exhausted: nothing more to pop or skip.
     let got: Vec<u64> = pop_all(&mut r).iter().map(|x| x.0).collect();
-    assert_eq!(got, vec![start, start + 1]);
-    assert_eq!(r.next_seq(), u64::MAX);
+    assert_eq!(got, vec![start, start + 1, u64::MAX]);
+    assert_eq!(r.report().released, 3);
+    assert!(r.is_exhausted());
+    assert!(r.pop().is_none());
+    assert_eq!(r.skip_missing(), None);
+    assert_eq!(r.report().released, 3);
+    assert_eq!(r.report().gaps, 0);
+}
+
+#[test]
+fn terminal_key_copies_after_release_are_duplicates_or_divergent() {
+    let mut r = Racer::new(2, 4, 4, u64::MAX);
+    assert_eq!(r.offer(0, it(u64::MAX, b"m", 10)), Offer::Won);
+    assert_eq!(pop_all(&mut r).len(), 1);
+    assert_eq!(
+        r.offer(1, it(u64::MAX, b"m", 15)),
+        Offer::Duplicate { lag_ns: 5 }
+    );
+    assert_eq!(r.offer(1, it(u64::MAX, b"x", 16)), Offer::Divergent);
+    assert!(r.pop().is_none());
+    assert_eq!(r.report().released, 1);
+}
+
+#[test]
+fn skipping_the_terminal_key_exhausts_and_later_copies_are_late() {
+    let mut r = Racer::new(1, 4, 4, u64::MAX);
+    assert!(r.pop().is_none());
+    assert_eq!(r.skip_missing(), Some(u64::MAX));
+    assert!(r.is_exhausted());
+    assert_eq!(r.skip_missing(), None);
+    assert_eq!(r.report().gaps, 1);
+    // A copy of the skipped terminal key arrives: it must not be held or
+    // released (it was given up), only counted late.
+    assert_eq!(r.offer(0, it(u64::MAX, b"m", 1)), Offer::Late);
+    assert!(r.pop().is_none());
+    assert_eq!(r.report().released, 0);
+    assert_eq!(r.stats()[0].late, 1);
+    assert_eq!(r.stats()[0].wins, 0);
 }
 
 #[test]

@@ -31,9 +31,11 @@ copied into this repo).
 
 ## 2. Tests (`cargo test -p hl-race`)
 
-17 tests: 3 histogram unit tests, 13 racer tests (known answers for win/duplicate/lag,
+19 tests: 3 histogram unit tests, 15 racer tests (known answers for win/duplicate/lag,
 divergence before and after release, gap held then filled by a slower source, skip counts a
-gap, window/payload limits, u64 top wraparound, JSON report, 3 simulated sources round-robin,
+gap, window/payload limits, u64 top: `u64::MAX` is released exactly once then the racer is
+exhausted (no further pop/skip; later copies are duplicate, divergent or late; a skipped
+`u64::MAX` is never held), JSON report, 3 simulated sources round-robin,
 real-data key, the TLC trace below reproduced in Rust), a proptest (2,000 cases, windows
 1..9, 3 sources, random loss/dup/reorder/5% divergent bytes) against an unbounded reference
 model, and `tests/alloc.rs`: `offer`+`pop` allocate 0 times over 50,000 ticks after
