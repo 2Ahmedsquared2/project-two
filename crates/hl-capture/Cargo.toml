@@ -14,6 +14,12 @@ memchr = "2"
 rtrb = "0.3"
 serde_json = { workspace = true }
 
+# inotify exists on Linux only; elsewhere `--detect inotify` falls back to
+# `poll` and says so (same shape as hl-replay's file-inotify arm).
+[target.'cfg(target_os = "linux")'.dependencies]
+inotify = { version = "0.11", default-features = false }
+rustix = { version = "1", features = ["event"] }
+
 [dev-dependencies]
 hl-alloc-gate = { path = "../hl-alloc-gate" }
 proptest = { workspace = true }

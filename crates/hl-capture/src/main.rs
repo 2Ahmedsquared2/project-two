@@ -1,8 +1,9 @@
 //! `hl-capture`: the probe's capture side.
 //!
 //! ```text
-//! hl-capture node <dir> --out <obs.jsonl> [--poll-us N] [--duration-s N]
-//!     [--max-line-bytes N] [--ring-records N] [--rescan-ms N]
+//! hl-capture node <dir> --out <obs.jsonl> [--detect busy-poll|poll|inotify]
+//!     [--poll-us N] [--duration-s N] [--max-line-bytes N] [--ring-records N]
+//!     [--rescan-ms N]
 //! ```
 //!
 //! `node` follows the newest hourly file under `<dir>` (for example
@@ -17,10 +18,23 @@
 //! dropped and counted in `ring_dropped`; the reader is never held up. A run
 //! with `ring_dropped` above 0 is incomplete: discard it.
 //!
-//! The reader polls every `--poll-us` microseconds (default 100) and stops
-//! after `--duration-s` seconds (default: never; the last sleep is cut short
-//! so the run ends on time). A newer hourly file is looked for every
-//! `--rescan-ms` milliseconds (default 10), never per poll; what the switching
+//! `--detect` says how the reader waits for the node to write:
+//!
+//! - `busy-poll` (default): it does not wait; it spins on `read`. Lowest
+//!   delay, one core at 100%: give it a core of its own (`taskset`). With
+//!   only one usable CPU it falls back to `poll`.
+//! - `poll`: it sleeps `--poll-us` microseconds (default 100) between reads.
+//! - `inotify`: it sleeps until the kernel reports a write. Linux only; off
+//!   Linux, or if inotify cannot be set up, it falls back to `poll`.
+//!
+//! The mode asked for, the mode in use and the reason for any fallback are
+//! printed on stderr as a `detect` line at start (and again if a later
+//! inotify failure forces `poll`).
+//!
+//! The run stops after `--duration-s` seconds (default: never; a sleep is
+//! cut short so the run ends on time). A newer hourly file is looked for every
+//! `--rescan-ms` milliseconds (default 10) and, in `inotify` mode, as soon as
+//! a directory changes; never per poll. What the switching
 //! poll reads from a new file may be stamped up to that much late, so it is
 //! reported on stderr as a `rotation` line and counted in
 //! `post_rotation_lines`. Lines longer than `--max-line-bytes` (default
@@ -35,9 +49,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use hl_capture::{ring, NodeTailer};
+use hl_capture::{ring, Detect, NodeTailer, Waiter};
 
-const USAGE: &str = "usage: hl-capture node <dir> --out <obs.jsonl> [--poll-us N] [--duration-s N] [--max-line-bytes N] [--ring-records N] [--rescan-ms N]";
+const USAGE: &str = "usage: hl-capture node <dir> --out <obs.jsonl> [--detect busy-poll|poll|inotify] [--poll-us N] [--duration-s N] [--max-line-bytes N] [--ring-records N] [--rescan-ms N]";
 
 /// How long the writer thread sleeps when the ring is empty.
 const WRITER_IDLE: Duration = Duration::from_millis(1);
@@ -50,6 +64,7 @@ struct Args {
     max_line: usize,
     ring_records: usize,
     rescan: Duration,
+    detect: Detect,
 }
 
 fn parse_args(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
@@ -61,6 +76,7 @@ fn parse_args(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
     let mut max_line = hl_capture::DEFAULT_MAX_LINE;
     let mut ring_records = hl_capture::DEFAULT_RING_RECORDS;
     let mut rescan = Duration::from_millis(10);
+    let mut detect = Detect::BusyPoll;
     while let Some(flag) = it.next() {
         let value = it.next()?;
         let num = || value.to_str()?.parse::<u64>().ok();
@@ -71,6 +87,7 @@ fn parse_args(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
             "--duration-s" => duration = Some(Duration::from_secs(num()?)),
             "--max-line-bytes" => max_line = positive()?,
             "--ring-records" => ring_records = positive()?,
+            "--detect" => detect = Detect::parse(value.to_str()?)?,
             "--rescan-ms" => rescan = Duration::from_millis(num().filter(|&n| n > 0)?),
             _ => return None,
         }
@@ -83,6 +100,7 @@ fn parse_args(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
         max_line,
         ring_records,
         rescan,
+        detect,
     })
 }
 
@@ -94,7 +112,24 @@ fn realtime_ns() -> u64 {
         .unwrap_or(0)
 }
 
+/// Says on stderr which detect mode is live, and why if it is not the one
+/// asked for.
+fn announce(requested: Detect, live: Detect, fallback: Option<&str>) {
+    let fallback = fallback.map_or_else(
+        || "null".to_owned(),
+        |why| serde_json::Value::from(why).to_string(),
+    );
+    eprintln!(
+        "{{\"detect\":{{\"requested\":\"{}\",\"live\":\"{}\",\"fallback\":{fallback}}}}}",
+        requested.name(),
+        live.name()
+    );
+}
+
 fn run(args: &Args) -> std::io::Result<()> {
+    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let (mut waiter, note) = Waiter::new(args.detect, args.poll, cpus);
+    announce(args.detect, waiter.mode(), note.as_deref());
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -125,6 +160,9 @@ fn run(args: &Args) -> std::io::Result<()> {
             // The writer thread stopped; its error is reported below.
             break Ok(());
         }
+        if let Some(why) = waiter.follow(&args.root, tail.current_file()) {
+            announce(args.detect, waiter.mode(), Some(&why));
+        }
         if let Some(sw) = tail.take_switch() {
             // Cold: once per new file.
             let h = |n: Option<u64>| n.map_or_else(|| "null".into(), |n| n.to_string());
@@ -139,9 +177,11 @@ fn run(args: &Args) -> std::io::Result<()> {
             // More data waits: check the deadline, then read on at once.
             continue;
         }
-        // Never sleep past the deadline or the next rescan.
-        let wake = deadline.map_or(next_rescan, |d| d.min(next_rescan));
-        std::thread::sleep(args.poll.min(wake.saturating_duration_since(now)));
+        // Never wait past the deadline or the next rescan.
+        let until = deadline.map_or(next_rescan, |d| d.min(next_rescan));
+        if waiter.wait(until).rescan {
+            tail.request_rescan();
+        }
     };
     let dropped = sink.dropped();
     // Dropping the reader's end tells the writer to drain and stop.

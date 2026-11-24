@@ -870,9 +870,11 @@ version = "0.1.0"
 dependencies = [
  "hl-alloc-gate",
  "hl-latency",
+ "inotify",
  "memchr",
  "proptest",
  "rtrb",
+ "rustix",
  "serde_json",
  "tempfile",
 ]
