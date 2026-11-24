@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a512e897054f05512975ca066f2aa744eabfc3c08397233a737f0a8631563ee2 # shrinks to isolcpus = "", nohz_full = "0", rcu_nocbs = "0-3:0/0", feeder = Some(1), hot = None, sqpoll = None
