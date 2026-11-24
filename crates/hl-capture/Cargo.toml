@@ -40,5 +40,12 @@ harness = false
 name = "legacy"
 harness = false
 
+# Issue #31: the reader's cost of a due look, and a new file's first-line
+# delay through the real binary:
+#   cargo bench -p hl-capture --bench rotation
+[[bench]]
+name = "rotation"
+harness = false
+
 [lints]
 workspace = true

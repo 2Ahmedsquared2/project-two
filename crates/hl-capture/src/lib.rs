@@ -18,13 +18,15 @@
 mod detect;
 mod lines;
 mod ring;
+mod scout;
 mod stop;
 mod tail;
 mod ws;
 
 pub use detect::{Detect, Waiter, Wake};
 pub use lines::{LineSink, LineSplitter, StampedLine, DEFAULT_MAX_LINE};
-pub use ring::{ring, RingSink, RingSource, DEFAULT_RING_RECORDS};
+pub use ring::{ring, RingSink, RingSource, DEFAULT_RING_RECORDS, WRITE_CHUNK};
+pub use scout::{scout, Arrivals, Scout};
 pub use stop::Stop;
 pub use tail::{
     hourly_key, newest_hourly_file, NodeTailer, ObservationSink, Switch, TailStats,
