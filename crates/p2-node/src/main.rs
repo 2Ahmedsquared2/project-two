@@ -646,14 +646,19 @@ fn compare_only(
         ReplayBlock::new(height, block, diffs.remove(&height)).map_err(|e| e.to_string())
     });
     let mut unseeded = std::collections::HashSet::new();
+    let no_placed = std::collections::HashSet::new();
     let mut classes: HashMap<u64, Vec<String>> = HashMap::new();
     let each = |blk: &ReplayBlock, out: &p2_node::engine::BlockOutcome, reproduced: bool| {
-        if let Some((table, all, _, _)) = hl {
+        if let Some((table, all, _, st)) = hl {
             if p2_node::hlexec::touches_unseeded(table, blk) {
                 unseeded.insert(blk.height());
             }
             if !reproduced {
-                let mut c = p2_node::hlexec::block_classes(table, all, blk, out);
+                // Without --statuses there is nothing to tell native's
+                // action-less book activity apart: never diffs:no-action.
+                let placed = (!st.max_oids.is_empty())
+                    .then(|| st.placed.get(&blk.height()).unwrap_or(&no_placed));
+                let mut c = p2_node::hlexec::block_classes(table, all, blk, out, placed);
                 if c.is_empty() {
                     // compare() saw a difference block_classes does not name.
                     c.push("unclassified".into());

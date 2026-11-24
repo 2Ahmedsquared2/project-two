@@ -26,7 +26,7 @@
 //! response record; the vault address when trading for a vault): this
 //! adapter does not recover signers from signatures.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::time::Instant;
 
@@ -334,19 +334,28 @@ pub fn touches_unseeded(meta: &AssetTable, b: &crate::replay::ReplayBlock) -> bo
 ///   `min-value`, `reduce-only`, `too-many-orders`), `alo`,
 ///   `cancel-unknown`, `ioc-no-match`, `modify-unknown`, `filled`,
 ///   `resting` or `other`.
+/// - `diffs:no-action` (book activity with no action): every action matched
+///   and native's held diffs are ours behind a non-empty leading run whose
+///   orders no action of this block placed (none of their oids has a
+///   status with an action `hash` in `placed`, native's hashed order
+///   statuses for the block; every non-`open` status has `hash: null`).
+///   Native moved resting orders before any action we can see.
 /// - `diffs:content` / `diffs:order`: the held books' diffs differ and no
 ///   action-level class explains the block (unexplained). When an action
 ///   class exists, a diff mismatch is attributed to it and not listed.
+///   `diffs:no-action` needs `placed` (`None`: never given).
 /// - `result-count`: our result list has the wrong length.
 ///
 /// `seeded` holds the seeded books, `all` every asset the static meta lists.
 /// Empty = every action and diff matched.
 #[must_use]
+#[allow(clippy::implicit_hasher)] // `None` at call sites; a hasher parameter would need a turbofish
 pub fn block_classes(
     seeded: &AssetTable,
     all: &AssetTable,
     b: &crate::replay::ReplayBlock,
     out: &crate::engine::BlockOutcome,
+    placed: Option<&HashSet<u64>>,
 ) -> Vec<String> {
     let mut cls: Vec<String> = Vec::new();
     let book_class = |listed: bool, kind: &str| {
@@ -397,6 +406,16 @@ pub fn block_classes(
     }
     let ours: Vec<BookDiff> = out.book_diffs.iter().map(canonical_node_diff).collect();
     if !action_level && ours != held {
+        let lead = held.len().saturating_sub(ours.len());
+        if let Some(placed) = placed {
+            if lead > 0
+                && held[lead..] == ours[..]
+                && held[..lead].iter().all(|d| !placed.contains(&d.oid))
+            {
+                push_once(&mut cls, "diffs:no-action".to_owned());
+                return cls;
+            }
+        }
         let key = |d: &BookDiff| format!("{d:?}");
         let (mut x, mut y) = (ours, held);
         x.sort_by_key(key);
@@ -789,10 +808,20 @@ fn fmt_cloid(c: Cloid) -> String {
 /// How one action was converted, for rendering it back.
 #[derive(Clone, Debug)]
 enum Kind {
-    Order { legs: Vec<LegInfo> },
-    Cancel { assets: Vec<Asset> },
-    Modify { single: bool, legs: Vec<LegInfo> },
+    Order {
+        legs: Vec<LegInfo>,
+    },
+    Cancel {
+        assets: Vec<Asset>,
+    },
+    Modify {
+        single: bool,
+        legs: Vec<LegInfo>,
+    },
     Noop,
+    /// `SetGlobalAction`: no book effect; native answers one constant
+    /// (223 of 223 in 10,000 blocks). Acknowledged, state not modelled.
+    SetGlobal,
     Unsupported,
 }
 
@@ -915,6 +944,13 @@ impl Converted {
             let done = match (a.action_type, user) {
                 ("noop", _) => {
                     c.kinds.push(Kind::Noop);
+                    c.users.push(user.unwrap_or_default());
+                    c.ranges.push((0, 0));
+                    c.types.push(String::new());
+                    true
+                }
+                ("SetGlobalAction", _) => {
+                    c.kinds.push(Kind::SetGlobal);
                     c.users.push(user.unwrap_or_default());
                     c.ranges.push((0, 0));
                     c.types.push(String::new());
@@ -1063,7 +1099,7 @@ impl Converted {
                         user,
                         modifies: &self.modifies[s..e],
                     },
-                    Kind::Noop => XAction::Noop,
+                    Kind::Noop | Kind::SetGlobal => XAction::Noop,
                     Kind::Unsupported => XAction::Unsupported(self.types[i].as_str()),
                 }
             })
@@ -1184,6 +1220,7 @@ fn render_action(
     match kind {
         Kind::Unsupported => None,
         Kind::Noop => Some(json!({"status":"ok","response":{"type":"default"}})),
+        Kind::SetGlobal => Some(json!({"status":"ok","response":{"type":"setGlobal","data":[]}})),
         Kind::Order { legs } => {
             let mut v = Vec::with_capacity(sts.len());
             for (s, l) in sts.iter().zip(legs) {
@@ -1343,6 +1380,10 @@ pub struct StatusIndex {
     /// gives an adopted order its cloid even when the block's responses do
     /// not show it (lane 1's harness does the same).
     pub cloids: HashMap<u64, Cloid>,
+    /// Per height, the oids with a status carrying an action `hash` (orders
+    /// an action of that block placed); every other status has `hash:
+    /// null`. Classification only ([`block_classes`]'s `diffs:no-action`).
+    pub placed: HashMap<u64, HashSet<u64>>,
 }
 
 /// Reads native's order-status file once for [`StatusIndex`].
@@ -1355,6 +1396,8 @@ pub fn load_statuses(reader: impl std::io::BufRead) -> Result<StatusIndex, Strin
     #[derive(serde::Deserialize)]
     struct Event {
         order: Option<Order>,
+        #[serde(default)]
+        hash: Option<serde::de::IgnoredAny>,
     }
     #[derive(serde::Deserialize)]
     struct Order {
@@ -1369,9 +1412,13 @@ pub fn load_statuses(reader: impl std::io::BufRead) -> Result<StatusIndex, Strin
         }
         let l: Line = serde_json::from_str(&line).map_err(|e| format!("line {}: {e}", i + 1))?;
         let mut max = None;
-        for o in l.events.iter().filter_map(|e| e.order.as_ref()) {
+        for e in &l.events {
+            let Some(o) = e.order.as_ref() else { continue };
             let Some(oid) = o.oid else { continue };
             max = max.max(Some(oid));
+            if e.hash.is_some() {
+                out.placed.entry(l.block_number).or_default().insert(oid);
+            }
             if let Some(c) = o.cloid.as_deref().and_then(parse_cloid) {
                 out.cloids.insert(oid, c);
             }
@@ -1605,7 +1652,7 @@ pub fn roundtrip(meta: &AssetTable, a: &UserAction<'_>, native: &Value) -> Optio
     }
     let Some(Value::Array(sts_json)) = native.pointer("/response/data/statuses") else {
         return match kind {
-            Kind::Noop | Kind::Modify { single: true, .. } => {
+            Kind::Noop | Kind::SetGlobal | Kind::Modify { single: true, .. } => {
                 let st = OrderStatus::Placed {
                     oid: Oid(0),
                     filled: Sz(0),

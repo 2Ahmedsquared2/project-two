@@ -528,7 +528,7 @@ fn block_classes_lists_every_cause_not_the_first() {
     let mut e = engine();
     let out = e.execute_block(b.block().time_ns, &b.user_actions());
     assert_eq!(
-        p2_node::hlexec::block_classes(&meta(), &all, &b, &out),
+        p2_node::hlexec::block_classes(&meta(), &all, &b, &out, None),
         vec![
             "unsupported:scheduleCancel",
             "resp:noop:unknown-wallet",
@@ -546,7 +546,7 @@ fn block_classes_lists_every_cause_not_the_first() {
     );
     let out = engine().execute_block(b.block().time_ns, &b.user_actions());
     assert_eq!(
-        p2_node::hlexec::block_classes(&meta(), &all, &b, &out),
+        p2_node::hlexec::block_classes(&meta(), &all, &b, &out, None),
         vec!["diffs:content"]
     );
 }
@@ -584,4 +584,91 @@ fn resync_takes_cloids_from_native_order_statuses() {
             .any(|l| l.contains(" 601 ") && l.ends_with(" -")),
         "{book}"
     );
+}
+
+/// `SetGlobalAction`: native answers one constant (223 of 223 in 10,000
+/// blocks) and no book diff; we answer the same constant and touch no book.
+/// The rest of the non-book actions stay unsupported.
+#[test]
+fn set_global_action_answers_native_constant() {
+    let constant = json!({"status": "ok", "response": {"type": "setGlobal", "data": []}});
+    let sg = json!({"type": "SetGlobalAction", "pxs": [["1.0", "1.0"]], "externalPerpPxs": [], "usdtUsdcPx": null, "nativePx": null});
+    let line = block_line(&[(sg.clone(), ALICE, constant.clone())]);
+    let b = replay_block(&line, json!([]));
+    let mut e = engine();
+    let out = e.execute_block(b.block().time_ns, &b.user_actions());
+    assert_eq!(resp(&out.results[0]), &constant);
+    assert_eq!(out.book_diffs, []);
+    assert_eq!(
+        p2_node::hlexec::block_classes(&meta(), &meta(), &b, &out, None),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        p2_node::hlexec::roundtrip(&meta(), &ua("SetGlobalAction", &sg, ALICE), &constant),
+        Some(true)
+    );
+    for t in ["evmRawTx", "voteAbciDigest", "voteL1Hash", "scheduleCancel"] {
+        let a = json!({"type": t});
+        let out = e.execute_block(2, &[ua(t, &a, ALICE)]);
+        assert!(matches!(out.results[0], ActionResult::Unsupported), "{t}");
+    }
+}
+
+/// Native's held diffs are ours behind a leading run on orders no action of
+/// the block placed (their oids have no hashed status): book activity with
+/// no action, `diffs:no-action`. The same diffs on an order the block placed,
+/// or with no status index, stay `diffs:content`; extra native diffs after
+/// ours are never `diffs:no-action`.
+#[test]
+fn leading_native_diffs_without_an_action_are_no_action() {
+    let ok_default = json!({"status": "ok", "response": {"type": "default"}});
+    let ioc = json!({"type": "order", "grouping": "na", "orders": [{"a": 7, "b": true, "p": "10.0", "s": "0.5", "r": false, "t": {"limit": {"tif": "Ioc"}}}]});
+    let filled = json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [{"filled": {"totalSz": "0.5", "avgPx": "10.0", "oid": 200}}]}}});
+    let line = block_line(&[
+        (json!({"type": "noop", "nonce": 1}), ALICE, ok_default),
+        (ioc, ALICE, filled),
+    ]);
+    let ours_fill = json!({"user": BOB, "oid": 100, "coin": "TST", "side": "A", "px": "10.0", "raw_book_diff": {"update": {"origSz": "1.5", "newSz": "1.0"}}});
+    let early = json!({"user": BOB, "oid": 90, "coin": "TST", "side": "A", "px": "10.5", "raw_book_diff": "remove"});
+    let classes = |diffs: Value, placed: Option<&std::collections::HashSet<u64>>| {
+        let b = replay_block(&line, diffs);
+        let out = engine().execute_block(b.block().time_ns, &b.user_actions());
+        assert_eq!(
+            resp(&out.results[1])["response"]["data"]["statuses"][0]["filled"]["oid"],
+            200
+        );
+        p2_node::hlexec::block_classes(&meta(), &meta(), &b, &out, placed)
+    };
+    let none = std::collections::HashSet::new();
+    let placed_90: std::collections::HashSet<u64> = [90].into();
+    assert_eq!(
+        classes(json!([early.clone(), ours_fill.clone()]), Some(&none)),
+        vec!["diffs:no-action"]
+    );
+    assert_eq!(
+        classes(json!([early.clone(), ours_fill.clone()]), Some(&placed_90)),
+        vec!["diffs:content"]
+    );
+    assert_eq!(
+        classes(json!([early.clone(), ours_fill.clone()]), None),
+        vec!["diffs:content"]
+    );
+    assert_eq!(
+        classes(json!([ours_fill, early]), Some(&none)),
+        vec!["diffs:content"]
+    );
+}
+
+/// The status index records, per height, the oids whose status carries an
+/// action hash; `hash: null` statuses (fills, cancels, rejects) are left out.
+#[test]
+fn status_index_records_hashed_oids_per_height() {
+    let statuses = concat!(
+        r#"{"block_number":5,"events":[{"status":"open","hash":"0xab","order":{"oid":700,"cloid":null}},"#,
+        r#"{"status":"filled","hash":null,"order":{"oid":650,"cloid":null}}]}"#,
+        "\n"
+    );
+    let idx = p2_node::hlexec::load_statuses(statuses.as_bytes()).unwrap();
+    assert_eq!(idx.placed.get(&5), Some(&[700].into()));
+    assert_eq!(idx.max_oids.get(&5), Some(&700));
 }
