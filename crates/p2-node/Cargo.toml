@@ -1,0 +1,26 @@
+[package]
+name = "p2-node"
+description = "Block replay driver: feed replica_cmds blocks to an execution engine, compare every block with native hl-node, time execute_block behind the warm gate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+hl-block = { path = "../hl-block" }
+hl-warm = { path = "../hl-warm" }
+hl-node-convert = { path = "../hl-node-convert" }
+hl-exec = { path = "../hl-exec" }
+hl-book-ref = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+hl-block = { path = "../hl-block" }
+
+[lints]
+workspace = true

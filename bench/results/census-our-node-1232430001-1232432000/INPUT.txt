@@ -1,0 +1,1 @@
+input: replica_first2000.jsonl.gz sha256 280ea6f4c1fa3744426dcd885b912232292b0ce07c50ac60f500408fa1c09e07 (our node, heights 1232430001..1232432000); command: zcat replica_first2000.jsonl.gz | hl-block census [--json] -

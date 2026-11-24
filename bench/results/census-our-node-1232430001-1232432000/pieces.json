@@ -1,0 +1,344 @@
+{
+ "blocks": 2000,
+ "heights": [
+  1232430001,
+  1232432000
+ ],
+ "book_only_ceiling": 106,
+ "alone": {
+  "1-stateless": 106,
+  "2-refprice": 106,
+  "3-perp-margin": 112,
+  "4-spot-balance": 106,
+  "5-open-orders": 106,
+  "6-abstraction": 106,
+  "7a-scheduleCancel": 106,
+  "7b-evm": 238,
+  "7c-trigger-tpsl-twap-frontend": 106,
+  "7d-validator-oracle-system": 118,
+  "7e-account-other": 170
+ },
+ "cumulative": {
+  "1-stateless": 106,
+  "2-refprice": 106,
+  "3-perp-margin": 112,
+  "4-spot-balance": 143,
+  "5-open-orders": 152,
+  "6-abstraction": 152,
+  "7a-scheduleCancel": 371,
+  "7b-evm": 601,
+  "7c-trigger-tpsl-twap-frontend": 758,
+  "7d-validator-oracle-system": 1175,
+  "7e-account-other": 2000
+ },
+ "why": {
+  "1-stateless": [
+   [
+    "order:err:Action already expired",
+    338
+   ],
+   [
+    "order:Order has invalid price<n>",
+    51
+   ],
+   [
+    "order:Order has invalid size<n>",
+    16
+   ],
+   [
+    "order:Price must be divisible by tick size<n> asset=<n>",
+    5
+   ],
+   [
+    "order:Order has zero size<n>",
+    2
+   ]
+  ],
+  "2-refprice": [
+   [
+    "order:Order must have minimum value of $<n> asset=<n>",
+    607
+   ],
+   [
+    "order:Order must have minimum value of <n> USDC<n> asset=<n>",
+    40
+   ],
+   [
+    "order:Order price cannot be more than <n>% away from the reference",
+    29
+   ],
+   [
+    "modify:err:Order price cannot be more than <n>% away from the reference",
+    3
+   ],
+   [
+    "batchModify:Error placing new order during modify: Order must have minim",
+    2
+   ]
+  ],
+  "3-perp-margin": [
+   [
+    "order:Insufficient margin to place order<n> asset=<n>",
+    51519
+   ],
+   [
+    "reduce-only leg",
+    17164
+   ],
+   [
+    "non-book type updateLeverage",
+    610
+   ],
+   [
+    "non-book type updateIsolatedMargin",
+    266
+   ],
+   [
+    "status event reduceOnlyCanceled (no action behind it)",
+    258
+   ],
+   [
+    "order:Reduce only order would increase position<n> asset=<n>",
+    143
+   ],
+   [
+    "updateLeverage:err",
+    131
+   ],
+   [
+    "order:Cannot flip position when open interest is at cap<n> asset=<",
+    91
+   ],
+   [
+    "order:Cannot increase position when open interest is at cap<n> ass",
+    89
+   ],
+   [
+    "batchModify:Error placing new order during modify: Insufficient margin t",
+    49
+   ],
+   [
+    "updateIsolatedMargin:err",
+    30
+   ],
+   [
+    "modify:err:Error placing new order during modify: Insufficient margin t",
+    1
+   ]
+  ],
+  "4-spot-balance": [
+   [
+    "order:Insufficient spot balance asset=<n>",
+    3770
+   ],
+   [
+    "order:err:Invalid spot",
+    1
+   ]
+  ],
+  "5-open-orders": [
+   [
+    "order:Too many open orders asset=<n>",
+    2982
+   ]
+  ],
+  "6-abstraction": [],
+  "7a-scheduleCancel": [
+   [
+    "non-book type scheduleCancel",
+    6166
+   ],
+   [
+    "scheduleCancel:err",
+    258
+   ]
+  ],
+  "7b-evm": [
+   [
+    "evmRawTx:err",
+    2177
+   ],
+   [
+    "non-book type evmRawTx",
+    1082
+   ],
+   [
+    "non-book type evmUserModify",
+    4
+   ],
+   [
+    "sendToEvmWithData:err",
+    3
+   ],
+   [
+    "non-book type sendToEvmWithData",
+    1
+   ]
+  ],
+  "7c-trigger-tpsl-twap-frontend": [
+   [
+    "trigger leg",
+    745
+   ],
+   [
+    "tif FrontendMarket",
+    240
+   ],
+   [
+    "status waitingForTrigger",
+    101
+   ],
+   [
+    "status event triggered (no action behind it)",
+    101
+   ],
+   [
+    "grouping positionTpsl",
+    67
+   ],
+   [
+    "grouping normalTpsl",
+    52
+   ],
+   [
+    "non-book type twapOrder",
+    41
+   ],
+   [
+    "status waitingForFill",
+    34
+   ],
+   [
+    "status event siblingFilledCanceled (no action behind it)",
+    8
+   ],
+   [
+    "non-book type twapCancel",
+    3
+   ],
+   [
+    "non-book type trailingStop",
+    3
+   ]
+  ],
+  "7d-validator-oracle-system": [
+   [
+    "non-book type validatorL1UpdateReferenceOracle",
+    849
+   ],
+   [
+    "non-book type multiSig",
+    101
+   ],
+   [
+    "non-book type perpDeploy",
+    73
+   ],
+   [
+    "non-book type voteAbciDigest",
+    59
+   ],
+   [
+    "gossipPriorityBid:err",
+    48
+   ],
+   [
+    "non-book type SetGlobalAction",
+    44
+   ],
+   [
+    "non-book type l1ValidatorVoteBridgeDeposit",
+    44
+   ],
+   [
+    "non-book type voteL1Hash",
+    30
+   ],
+   [
+    "non-book type NetChildVaultPositionsAction",
+    13
+   ],
+   [
+    "non-book type VoteEthDepositAction",
+    8
+   ],
+   [
+    "non-book type VoteEthFinalizedWithdrawalAction",
+    3
+   ],
+   [
+    "voteAbciDigest:err",
+    2
+   ]
+  ],
+  "7e-account-other": [
+   [
+    "setReferrer:err",
+    201
+   ],
+   [
+    "non-book type userSetAbstraction",
+    161
+   ],
+   [
+    "non-book type sendAsset",
+    64
+   ],
+   [
+    "sendAsset:err",
+    52
+   ],
+   [
+    "agentSetAbstraction:err",
+    37
+   ],
+   [
+    "non-book type approveAgent",
+    27
+   ],
+   [
+    "non-book type approveBuilderFee",
+    23
+   ],
+   [
+    "batchModify:Attempted to modify to invalid new order",
+    18
+   ],
+   [
+    "status event outcomeSettledCanceled (no action behind it)",
+    17
+   ],
+   [
+    "non-book type agentSendAsset",
+    13
+   ],
+   [
+    "non-book type spotSend",
+    11
+   ],
+   [
+    "non-book type userOutcome",
+    10
+   ]
+  ]
+ },
+ "blocks_needing_each": {
+  "1-stateless": 137,
+  "2-refprice": 504,
+  "3-perp-margin": 1641,
+  "4-spot-balance": 1347,
+  "5-open-orders": 368,
+  "6-abstraction": 0,
+  "7a-scheduleCancel": 1488,
+  "7b-evm": 645,
+  "7c-trigger-tpsl-twap-frontend": 617,
+  "7d-validator-oracle-system": 728,
+  "7e-account-other": 825
+ },
+ "nonbook_diff_check": {
+  "blocks_with_diffs_by_users_with_only_nonbook_actions": 8,
+  "diff_events": 19
+ },
+ "blocks_with_accepted_evmRawTx": 559,
+ "book_only_blocks_with_accepted_evmRawTx": 120
+}

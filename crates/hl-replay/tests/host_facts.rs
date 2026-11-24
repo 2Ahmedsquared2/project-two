@@ -701,3 +701,91 @@ fn the_checked_bytes_are_what_gets_written_beside_the_report() {
         .collect();
     assert_eq!(names, ["host-facts.txt"]);
 }
+
+#[test]
+fn a_cpu_number_no_kernel_can_hold_makes_the_list_unreadable() {
+    // The kernel refuses a list naming a CPU at or past its mask width
+    // (-ERANGE, Linux v6.8 lib/bitmap-str.c bitmap_check_region), and no
+    // x86-64 or arm64 kernel is built wider than 8192 CPUs (v6.8
+    // arch/x86/Kconfig NR_CPUS_RANGE_END; arm64 stops at 4096). Such a range
+    // is never expanded CPU by CPU.
+    let unread = |key: &str, raw: &str| {
+        format!("{key} ({raw}) is not a CPU list this harness can read: pinned cores not checked against it")
+    };
+    let none = Vec::<String>::new();
+    for raw in [
+        "0-18446744073709551615",
+        "0-99999999999",
+        "2-8192",
+        "2-3,8192",
+    ] {
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: 0-7\nnohz_full: {raw}\nrcu_nocbs: all"),
+                Some(2),
+                Some(3)
+            ),
+            [unread("nohz_full", raw)],
+            "{raw}"
+        );
+        let f = file_with_cores(&format!("isolcpus: {raw}"), "active: 0");
+        assert_eq!(f.isolated_cpus(), None, "{raw}");
+    }
+    // The last CPU number such a kernel can have is still read.
+    assert_eq!(
+        list_warnings(
+            "isolcpus: 0-8191\nnohz_full: 2-8191\nrcu_nocbs: 8191,0-8191:1/2",
+            Some(2),
+            Some(8191)
+        ),
+        none
+    );
+    assert_eq!(
+        list_warnings(
+            "isolcpus: 0-8191\nnohz_full: 4-8191\nrcu_nocbs: all",
+            Some(2),
+            Some(8191)
+        ),
+        ["feeder core 2 is not in nohz_full (4-8191)"]
+    );
+}
+
+#[test]
+fn isolated_cpus_are_listed_once_each_in_ascending_order() {
+    // A list may name a CPU many times; the result stays bounded by the CPUs
+    // a kernel can have, not by the length of the list.
+    let f = file_with_cores("isolcpus: 6,2-3,2-3,0-7:1/8", "active: 0");
+    assert_eq!(f.isolated_cpus(), Some(vec![0, 2, 3, 6]));
+}
+
+#[test]
+fn a_stride_using_more_than_its_group_is_unreadable() {
+    // The kernel rejects the whole list when "used size" exceeds "group
+    // size" (-EINVAL: `r->off > r->group_len`, Linux v6.8 lib/bitmap-str.c
+    // bitmap_check_region), so it is not a CPU list to read either.
+    let unread = |key: &str, raw: &str| {
+        format!("{key} ({raw}) is not a CPU list this harness can read: pinned cores not checked against it")
+    };
+    for raw in ["0-7:3/2", "2-3,0-7:5/4"] {
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: 0-7\nnohz_full: {raw}\nrcu_nocbs: all"),
+                Some(2),
+                Some(3)
+            ),
+            [unread("nohz_full", raw)],
+            "{raw}"
+        );
+        let f = file_with_cores(&format!("isolcpus: {raw}"), "active: 0");
+        assert_eq!(f.isolated_cpus(), None, "{raw}");
+    }
+    // Used equal to the group is the whole range, which the kernel accepts.
+    assert_eq!(
+        list_warnings(
+            "isolcpus: 0-7\nnohz_full: 0-7:2/2\nrcu_nocbs: all",
+            Some(1),
+            Some(5)
+        ),
+        Vec::<String>::new()
+    );
+}

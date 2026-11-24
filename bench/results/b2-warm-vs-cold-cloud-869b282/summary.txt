@@ -1,0 +1,24 @@
+host: Linux 6.1.189-sc x86_64; cpu: Intel(R) Xeon(R) Processor; nproc: 2; load: 3.08 3.09 2.21 2/421 340
+git: 869b282f844f818ea03c278f7e8daf8906c8a3a5; trials: 30; n: 200; core: 1; seed: 1
+memlock: 8192 KiB (mlockall not in matrix unless unlimited)
+config          events       samples    p50 ns    p90 ns    p99 ns    max ns  pin/arena
+cold            0                 30     57829     61447     63346     63346  off/none
+cold            1-9              270     23836     29013     37514     66703  off/none
+cold            0-199           6000     20582     23217     44539   3886305  off/none
+warm            0                 30     28594     29598     41905     41905  core1/ThpAdvised
+warm            1-9              270     22185     25146     37508     62435  core1/ThpAdvised
+warm            0-199           6000     20354     22240     32641   6424457  core1/ThpAdvised
+warm-no-pin     0                 30     28733     29888     30164     30164  off/ThpAdvised
+warm-no-pin     1-9              270     22098     24871     30521     35486  off/ThpAdvised
+warm-no-pin     0-199           6000     20311     21701     29133   2669013  off/ThpAdvised
+warm-no-arena   0                 30     28673     29792   1761210   1761210  core1/none
+warm-no-arena   1-9              270     22333     24421     32167    788016  core1/none
+warm-no-arena   0-199           6000     20364     21873     31032   1761210  core1/none
+warm-no-prewarm 0                 30     66396     70229     71878     71878  core1/ThpAdvised
+warm-no-prewarm 1-9              270     25002     29244     37684     39556  core1/ThpAdvised
+warm-no-prewarm 0-199           6000     20543     23375     48731    668485  core1/ThpAdvised
+warm-no-arena    per-trial measured-window minor faults 0..0, major 0..0, involuntary switches 0..2
+warm-no-prewarm  per-trial measured-window minor faults 71..74, major 0..0, involuntary switches 0..5
+warm-no-pin      per-trial measured-window minor faults 0..0, major 0..0, involuntary switches 0..4
+warm             per-trial measured-window minor faults 0..0, major 0..0, involuntary switches 0..8
+cold             per-trial measured-window minor faults 72..74, major 0..0, involuntary switches 0..9
