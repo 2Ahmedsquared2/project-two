@@ -1,4 +1,5 @@
-//! Exhaustive bounded check (EVIDENCE, not a Kani proof) that
+//! Exhaustive bounded check (EVIDENCE, not a Kani proof; Kani cannot yet
+//! verify `rollback`, see README) that
 //! `Engine::resync(&[])` after `execute_block` restores the pre-block engine,
 //! and that the oid / cloid indexes stay consistent across the block.
 //!
@@ -138,7 +139,8 @@ fn actions() -> Vec<Act> {
 }
 
 /// The action places an order whose cloid is already live for the same user
-/// (and, for a modify, the target is not that order). Known bug class B1.
+/// (and, for a modify, the target is not that order): bug class B1, fixed by
+/// lane 1 in ff7821e. Counted apart so a regression is named.
 fn reuses_live_cloid(s: &[RestingOrder], a: Act, user: User) -> bool {
     let (req, target) = match a {
         Act::Order(r) => (r, None),
@@ -239,7 +241,7 @@ fn resync_empty_restores_pre_block_exhaustive() {
     let bad: Vec<&String> = results.iter().flat_map(|r| r.1.iter()).collect();
     let b1: u64 = results.iter().map(|r| r.2).sum();
     println!(
-        "exhaustive resync(&[]): {} snapshots x {} actions x 2 users x STP on/off = {cases} cases; {b1} failures in known class B1 (live cloid reused, reported to lane 1); {} other failures",
+        "exhaustive resync(&[]): {} snapshots x {} actions x 2 users x STP on/off = {cases} cases; {b1} failures in class B1 (live cloid reused; fixed in ff7821e); {} other failures",
         snaps.len(),
         acts.len(),
         bad.len()
@@ -247,5 +249,5 @@ fn resync_empty_restores_pre_block_exhaustive() {
     for b in bad.iter().take(3) {
         println!("{b}");
     }
-    assert!(bad.is_empty());
+    assert!(bad.is_empty() && b1 == 0);
 }

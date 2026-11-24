@@ -263,8 +263,13 @@ pub fn cloid_index(e: &Engine) -> [Option<Oid>; 4] {
 /// Property (7), index half: the oid index is a bijection onto the resting
 /// orders (`Engine::check_invariants`: one entry per live order, each naming
 /// a live slot holding that oid), and for every (user, cloid) of the domain
-/// `cancelByCloid` resolves to exactly the resting order with that user and
-/// cloid, or to nothing when none rests.
+/// `cancelByCloid` resolves to the newest (largest-oid) resting order with
+/// that user and cloid, or to nothing when none rests. This is native's
+/// `cloid_tracker` rule as lane 1 implements it (a reused cloid points at the
+/// newest order). It holds in the harness domains, where a snapshot has at
+/// most one order per (user, cloid) and a block cannot remove the newest
+/// order of a reused cloid while an older one stays; outside them an older
+/// order may be left unreachable by design.
 #[must_use]
 pub fn index_consistent(e: &Engine) -> bool {
     if !e.check_invariants() {
@@ -278,14 +283,12 @@ pub fn index_consistent(e: &Engine) -> bool {
     let mut k = 0;
     for u in USERS {
         for c in CLOIDS {
-            let mut it = orders
+            let want = orders
                 .iter()
                 .filter(|o| o.user == u && o.cloid == Some(c))
-                .map(|o| o.oid);
-            let want = it.next();
-            // Two live orders with the same (user, cloid): one of them is
-            // necessarily unreachable through cancelByCloid.
-            if it.next().is_some() || idx[k] != want {
+                .map(|o| o.oid)
+                .max();
+            if idx[k] != want {
                 return false;
             }
             k += 1;

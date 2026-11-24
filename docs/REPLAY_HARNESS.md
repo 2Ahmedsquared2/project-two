@@ -83,8 +83,18 @@ The report also prints `warning:` lines, which never stop a run:
   or one of those three not set at all. A core in `nohz_full` is not reported
   as missing from `rcu_nocbs`, because the kernel offloads RCU callbacks on
   every `nohz_full` CPU. `all` and stepped ranges (`0-7:2/4`) are read as CPU
-  lists; a list the harness cannot read (the kernel's `N` for the last CPU)
-  gets a line saying the pinned cores were not checked against it;
+  lists. A list with any part the harness cannot read (the kernel's `N` for
+  the last CPU, as in `0,2-N`) is unreadable as a whole, never partly read,
+  and gets a line saying the pinned cores were not checked against it;
+- with `nohz_full` unreadable, a core outside `rcu_nocbs` (or `rcu_nocbs` not
+  set) is reported as "whether it is offloaded from RCU callbacks is
+  undetermined", not as not offloaded;
+- a pinned CPU 0 that `nohz_full` names: the kernel forces the boot CPU
+  outside `nohz_full` for timekeeping (Linux v6.8
+  `Documentation/admin-guide/kernel-parameters.txt`, `nohz_full=`), so it may
+  still take the tick. The capture does not record which CPU booted; the
+  harness takes CPU 0. For the same reason a pinned CPU 0 outside `nohz_full`
+  keeps its ordinary "not in nohz_full" line;
 - a hot core whose physical core has a second thread.
 
 The warnings read the kernel command line only. A kernel built to offload

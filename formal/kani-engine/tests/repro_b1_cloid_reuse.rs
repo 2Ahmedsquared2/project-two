@@ -1,9 +1,9 @@
-//! B1 repro (reported to lane 1; hl-exec is lane 1's to fix).
+//! B1 regression test. Failed on lane 1 `56514ca`; fixed in `ff7821e`
+//! (journalled per-book cloid index).
 //! A user's new order reuses the cloid of their own live order. The block
 //! overwrites the (user, cloid) index entry, and `resync(&[])` then deletes
 //! it instead of restoring it: the old order still rests but
-//! `cancelByCloid` no longer finds it. Ignored until fixed; run with
-//! `cargo test -p kani-engine --test repro_b1_cloid_reuse -- --ignored`.
+//! `cancelByCloid` no longer finds it.
 
 use hl_exec::{
     CancelReq, Capacity, Cloid, Engine, EngineConfig, Oid, OrderRef, OrderReq, OrderStatus, Px,
@@ -33,7 +33,6 @@ fn cancel_by_cloid_finds(e: &Engine, c: Cloid) -> bool {
 }
 
 #[test]
-#[ignore = "B1: hl-exec bug reported to lane 1 (resync(&[]) drops a reused cloid's index entry)"]
 fn resync_empty_restores_cloid_of_live_order() {
     let snap = [RestingOrder {
         asset: 0,

@@ -7,7 +7,7 @@
 //! ```text
 //! cargo run --release -p hl-exec --example replay -- \
 //!   --meta DIR --seed l4.json --replica replica.jsonl --diffs diffs.jsonl \
-//!   [--statuses statuses.jsonl] [--max N] [--show K]
+//!   [--statuses statuses.jsonl] [--max N] [--show K] [--heights-out FILE.tsv]
 //! ```
 //!
 //! `--meta DIR` holds `meta.json`, `spotMeta.json`, `perpDexs.json` and
@@ -56,6 +56,29 @@ struct AssetInfo {
 struct Meta {
     by_idx: HashMap<Asset, AssetInfo>,
     by_name: HashMap<String, Asset>,
+}
+
+/// Outcome-market asset id for coin "#E": actions name it 100,000,000 + E
+/// (observed in our node's order actions, e.g. "#414130" is a = 100414130).
+const OUTCOME_ASSET_BASE: Asset = 100_000_000;
+
+impl Meta {
+    /// Register outcome coin "#E" (the seed holds its book). szDecimals 0 and
+    /// 8 price decimals (spot rule 8 - szDecimals) are inferred: every "#E"
+    /// size in the window is a whole number and outcomeMeta has no szDecimals.
+    fn add_outcome(&mut self, coin: &str) -> Option<Asset> {
+        let e: Asset = coin.strip_prefix('#')?.parse().ok()?;
+        let a = OUTCOME_ASSET_BASE.checked_add(e)?;
+        self.by_idx.insert(
+            a,
+            AssetInfo {
+                sz_dec: 0,
+                px_dec: 8,
+            },
+        );
+        self.by_name.insert(coin.to_owned(), a);
+        Some(a)
+    }
 }
 
 fn load_meta(dir: &str) -> Meta {
@@ -214,6 +237,11 @@ fn decode_leg(meta: &Meta, o: &Value, priority: u64) -> (OrderReq, bool) {
     let notional = u128::from(req.px.0) * u128::from(req.sz.0);
     let ten = 10u128 * 10u128.pow(info.px_dec + info.sz_dec);
     let unsupported = req.pre_reject.is_none() && notional < ten;
+    if unsupported {
+        // Hand the leg to the engine as unmodelled: it answers `Unsupported`
+        // but still takes the oid native spends on it.
+        req.tif = Tif::Other;
+    }
     (req, unsupported)
 }
 
@@ -234,6 +262,8 @@ struct Block {
     assets: Vec<Asset>,
     /// Actions per signed-action bundle (native's in-block order is per bundle).
     bundle_lens: Vec<u32>,
+    /// Per action, its range in `assets`.
+    act_assets: Vec<(usize, usize)>,
 }
 
 impl Block {
@@ -308,6 +338,7 @@ fn decode_block(meta: &Meta, line: &str) -> Block {
             b.native.push(r["res"].clone());
             let expired = sa["expiresAfter"].as_u64().is_some_and(|e| e < b.time_ms);
             let mut unsupported = expired;
+            let a0 = b.assets.len();
             let kind = match t.as_str() {
                 "order" => {
                     let prio = a["grouping"]["p"].as_u64().unwrap_or(0);
@@ -316,8 +347,9 @@ fn decode_block(meta: &Meta, line: &str) -> Block {
                     }
                     let mut legs = Vec::new();
                     for o in a["orders"].as_array().into_iter().flatten() {
-                        let (leg, uns) = decode_leg(meta, o, prio);
-                        unsupported |= uns || leg.reduce_only || leg.tif == Tif::Other;
+                        // An unmodelled leg goes to the engine, which answers
+                        // it `Unsupported` and takes its oid (native does).
+                        let (leg, _uns) = decode_leg(meta, o, prio);
                         b.assets.push(leg.asset);
                         legs.push(leg);
                     }
@@ -354,8 +386,7 @@ fn decode_block(meta: &Meta, line: &str) -> Block {
                             }
                             x => OrderRef::Oid(Oid(x.as_u64().unwrap_or(0))),
                         };
-                        let (leg, uns) = decode_leg(meta, &m["order"], 0);
-                        unsupported |= uns || leg.reduce_only || leg.tif == Tif::Other;
+                        let (leg, _uns) = decode_leg(meta, &m["order"], 0);
                         b.assets.push(leg.asset);
                         ms.push(ModifyReq { target, order: leg });
                     }
@@ -366,6 +397,7 @@ fn decode_block(meta: &Meta, line: &str) -> Block {
                 _ => 4,
             };
             let kind = if unsupported { 4 } else { kind };
+            b.act_assets.push((a0, b.assets.len()));
             b.acts.push((
                 kind,
                 match kind {
@@ -588,6 +620,21 @@ fn parse_diffs(meta: &Meta, line: &str) -> (u64, Vec<BookDiff>, usize) {
     (h, out, unknown)
 }
 
+/// Native raw book diffs carry no cloid; give each `New` the cloid native's
+/// order statuses report for that oid, so an order adopted by `resync` can
+/// still be cancelled or modified by cloid.
+fn attach_cloids(nd: &[BookDiff], by_oid: &HashMap<u64, Cloid>) -> Vec<BookDiff> {
+    nd.iter()
+        .map(|d| match d.kind {
+            DiffKind::New { .. } => BookDiff {
+                cloid: by_oid.get(&d.oid.0).copied(),
+                ..*d
+            },
+            _ => *d,
+        })
+        .collect()
+}
+
 struct Seed {
     height: u64,
     orders: Vec<RestingOrder>,
@@ -598,7 +645,7 @@ struct Seed {
     seeded: std::collections::HashSet<Asset>,
 }
 
-fn load_seed(meta: &Meta, path: &str) -> Seed {
+fn load_seed(meta: &mut Meta, path: &str) -> Seed {
     let v: Value = serde_json::from_reader(BufReader::new(File::open(path).unwrap())).unwrap();
     let h = v[0].as_u64().unwrap();
     let mut out = Vec::new();
@@ -606,7 +653,12 @@ fn load_seed(meta: &Meta, path: &str) -> Seed {
     let mut seeded = std::collections::HashSet::new();
     for cb in v[1].as_array().unwrap() {
         let coin = cb[0].as_str().unwrap();
-        let Some(&asset) = meta.by_name.get(coin) else {
+        let Some(asset) = meta
+            .by_name
+            .get(coin)
+            .copied()
+            .or_else(|| meta.add_outcome(coin))
+        else {
             skipped += 1;
             continue;
         };
@@ -651,7 +703,7 @@ fn arg(name: &str) -> Option<String> {
 }
 
 fn main() {
-    let meta = load_meta(&arg("--meta").expect("--meta"));
+    let mut meta = load_meta(&arg("--meta").expect("--meta"));
     let max: usize = arg("--max").map_or(usize::MAX, |s| s.parse().unwrap());
     let show: usize = arg("--show").map_or(5, |s| s.parse().unwrap());
     let Seed {
@@ -660,7 +712,8 @@ fn main() {
         skipped,
         next_oid: seed_next,
         seeded,
-    } = load_seed(&meta, &arg("--seed").expect("--seed"));
+    } = load_seed(&mut meta, &arg("--seed").expect("--seed"));
+    let meta = meta;
     eprintln!(
         "seed height {seed_h}: {} resting orders in {} books, {skipped} coins not in meta, next_oid {seed_next:?}",
         seed.len(),
@@ -677,24 +730,17 @@ fn main() {
     )
     .expect("seed loads");
     assert!(e.check_invariants());
-    // Decode everything first so timing covers execute_block only.
+    // Blocks are decoded one at a time inside the loop (2,000 decoded blocks
+    // hold ~8 GB of native responses); only execute_block is timed.
     let rep = BufReader::new(File::open(arg("--replica").expect("--replica")).unwrap());
-    let mut blocks = Vec::new();
-    for line in rep.lines() {
-        let line = line.unwrap();
-        let b = decode_block(&meta, &line);
-        if b.height <= seed_h {
-            continue;
-        }
-        blocks.push(b);
-        if blocks.len() >= max {
-            break;
-        }
-    }
+    let first = seed_h + 1;
+    let last = if max == usize::MAX {
+        u64::MAX
+    } else {
+        seed_h + max as u64
+    };
     let mut native_diffs: BTreeMap<u64, (Vec<BookDiff>, usize)> = BTreeMap::new();
     let mut unseeded_diffs: HashMap<u64, usize> = HashMap::new();
-    let first = blocks.first().map_or(0, |b| b.height);
-    let last = blocks.last().map_or(0, |b| b.height);
     for line in BufReader::new(File::open(arg("--diffs").expect("--diffs")).unwrap()).lines() {
         let line = line.unwrap();
         let (h, d, unk) = parse_diffs(&meta, &line);
@@ -714,6 +760,8 @@ fn main() {
     }
     // Native next-oid per block from statuses (resync path only).
     let mut status_max: HashMap<u64, u64> = HashMap::new();
+    // Native cloid per oid from statuses (raw book diffs carry none).
+    let mut status_cloids: HashMap<u64, Cloid> = HashMap::new();
     if let Some(p) = arg("--statuses") {
         for line in BufReader::new(File::open(p).unwrap()).lines() {
             let v: Value = serde_json::from_str(&line.unwrap()).unwrap();
@@ -721,9 +769,15 @@ fn main() {
             if h < first || h > last {
                 continue;
             }
-            let m = v["events"]
-                .as_array()
-                .unwrap()
+            let evs = v["events"].as_array().unwrap();
+            for s in evs {
+                if let (Some(o), Some(c)) =
+                    (s["order"]["oid"].as_u64(), cloid(&s["order"]["cloid"]))
+                {
+                    status_cloids.insert(o, c);
+                }
+            }
+            let m = evs
                 .iter()
                 .filter_map(|s| s["order"]["oid"].as_u64())
                 .max()
@@ -733,13 +787,28 @@ fn main() {
         }
     }
     let mut k = 0usize;
+    // (height, verdict): "reproduced" or the block's mismatch classes.
+    let mut verdicts: Vec<(u64, String)> = Vec::new();
     let mut classes: BTreeMap<String, usize> = BTreeMap::new();
     let mut examples: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut times_ns: Vec<u64> = Vec::with_capacity(blocks.len());
+    let mut times_ns: Vec<u64> = Vec::new();
     let mut counted_ns: Vec<u64> = Vec::new();
     let mut global_max_oid = max_oid;
     let empty = (Vec::new(), 0usize);
-    for b in &blocks {
+    let (mut n, mut first_seen, mut last_seen) = (0usize, 0u64, 0u64);
+    for line in rep.lines() {
+        if n >= max {
+            break;
+        }
+        let b = &decode_block(&meta, &line.unwrap());
+        if b.height <= seed_h {
+            continue;
+        }
+        if n == 0 {
+            first_seen = b.height;
+        }
+        last_seen = b.height;
+        n += 1;
         let acts = b.actions();
         let t0 = Instant::now();
         let out = e.execute_block_bundled(b.time_ms, &acts, &b.expires, &b.bundle_lens);
@@ -769,12 +838,36 @@ fn main() {
             why.push("oid-hint".into());
         }
         let mut resp_bad = None;
+        let mut unknown_wallet = false;
         for i in 0..b.acts.len() {
             let expired = out.responses[i].expired;
             if b.acts[i].0 == 4 && !expired {
                 continue;
             }
+            // A leg the engine answered `Unsupported` already keeps the block
+            // out of k; compare the next action instead.
+            if out.statuses_of(i).contains(&OrderStatus::Unsupported) {
+                continue;
+            }
+            // An action on a book the seed lacks cannot match (the block is
+            // already unseeded-book); classify the next one instead.
+            let (a0, a1) = b.act_assets[i];
+            if b.assets[a0..a1].iter().any(|a| !seeded.contains(a)) {
+                continue;
+            }
             let ours = response_json(&meta, b, i, out.statuses_of(i), expired);
+            // Native rejects an action whose signer is not a known user or
+            // agent (an account-side check the engine does not model). It
+            // keeps the block out of k under its own class; keep comparing.
+            if ours != b.native[i]
+                && b.native[i]["status"] == "err"
+                && b.native[i]["response"].as_str().is_some_and(|r| {
+                    r.starts_with("User or API Wallet ") && r.ends_with(" does not exist.")
+                })
+            {
+                unknown_wallet = true;
+                continue;
+            }
             if ours != b.native[i] {
                 resp_bad = Some(format!(
                     "h{} act{i} {}: ours {} native {}",
@@ -782,6 +875,9 @@ fn main() {
                 ));
                 break;
             }
+        }
+        if unknown_wallet {
+            why.push("resp:unknown-wallet".into());
         }
         if let Some(ex) = resp_bad {
             let cls = if ex.contains("Post only") {
@@ -860,21 +956,43 @@ fn main() {
         }
         if why.is_empty() {
             k += 1;
+            verdicts.push((b.height, "reproduced".into()));
             counted_ns.push(ns);
         } else {
             for w in &why {
                 *classes.entry(w.clone()).or_default() += 1;
             }
+            verdicts.push((b.height, why.join(",")));
             // Adopt native's book and counter (non-reproduced block only).
-            if let Err(err) = e.resync(nd) {
+            if let Err(err) = e.resync(&attach_cloids(nd, &status_cloids)) {
                 eprintln!("h{}: resync failed: {err:?}; stopping", b.height);
                 break;
             }
             e.set_next_oid(Oid(global_max_oid + 1));
         }
     }
-    let n = blocks.len();
-    println!("blocks N={n} heights {first}..={last}  reproduced k={k}");
+    println!("blocks N={n} heights {first_seen}..={last_seen}  reproduced k={k}");
+    // The engine's own score: blocks whose every action and native diff is on
+    // a book the seed holds (and, second, with no action the engine skips).
+    let held = |v: &str| !v.contains("unseeded-book") && !v.contains("diffs:unmodelled-coin");
+    let n_held = verdicts.iter().filter(|(_, v)| held(v)).count();
+    let n_held_modelled = verdicts
+        .iter()
+        .filter(|(_, v)| held(v) && !v.contains("unsupported:"))
+        .count();
+    println!(
+        "held books only: k={k} of N={n_held}; and no unsupported action: k={k} of N={n_held_modelled}"
+    );
+    if let Some(p) = arg("--heights-out") {
+        let body = verdicts
+            .iter()
+            .map(|(h, v)| format!("{h}\t{v}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&p, body).unwrap();
+        println!("per-block verdicts (height TAB reproduced|classes) written to {p}");
+    }
     println!("non-reproduced blocks by class (a block can be in several):");
     let mut cl: Vec<_> = classes.into_iter().collect();
     cl.sort_by_key(|c| std::cmp::Reverse(c.1));
@@ -907,4 +1025,42 @@ fn main() {
     stat(&mut times_ns, "all blocks");
     stat(&mut counted_ns, "reproduced blocks");
     assert!(e.check_invariants(), "engine invariants after replay");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn diff(oid: u64, kind: DiffKind) -> BookDiff {
+        BookDiff {
+            asset: 0,
+            user: User([7; 20]),
+            oid: Oid(oid),
+            side: Side::Bid,
+            px: Px(100),
+            kind,
+            cloid: None,
+        }
+    }
+
+    /// Native raw book diffs carry no cloid. An order adopted by resync must
+    /// get its cloid from native's order statuses, or a later cancelByCloid
+    /// of it is answered "never placed" (1,507 of 2,000 blocks before).
+    #[test]
+    fn resync_diffs_get_cloids_from_native_statuses() {
+        let new = DiffKind::New {
+            sz: Sz(5),
+            insert_before: None,
+        };
+        let nd = [diff(5, new), diff(6, new), diff(5, DiffKind::Remove)];
+        let by_oid = HashMap::from([(5u64, Cloid(42))]);
+        let out = attach_cloids(&nd, &by_oid);
+        assert_eq!(out[0].cloid, Some(Cloid(42)));
+        assert_eq!(out[1].cloid, None, "no status cloid: stays None");
+        assert_eq!(out[2].cloid, None, "only New diffs rest an order");
+        assert_eq!(
+            out.iter().map(|d| (d.oid, d.kind)).collect::<Vec<_>>(),
+            nd.iter().map(|d| (d.oid, d.kind)).collect::<Vec<_>>()
+        );
+    }
 }

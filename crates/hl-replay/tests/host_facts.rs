@@ -4,6 +4,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::process::Command;
 use std::time::Duration;
 
@@ -273,8 +274,8 @@ fn cores_outside_the_isolated_set_are_a_warning_not_a_failure() {
     let f = file_with_cores(&format!("isolcpus: 2-3\n{QUIET}"), smt);
     assert_eq!(warnings(&f, Some(2), Some(3)), Vec::<String>::new());
     assert_eq!(
-        warnings(&f, Some(0), Some(3)),
-        ["feeder core 0 is not in isolcpus (2-3)"]
+        warnings(&f, Some(1), Some(3)),
+        ["feeder core 1 is not in isolcpus (2-3)"]
     );
     assert_eq!(
         warnings(&f, Some(2), Some(1)),
@@ -397,7 +398,7 @@ fn cores_outside_rcu_nocbs_warn_as_isolcpus_does() {
     );
     // `all` and a stepped range (CPUs 0, 1, 4, 5) are CPU lists too.
     let stepped = "isolcpus: 0-7\nnohz_full: 0-7:2/4\nrcu_nocbs: all";
-    assert_eq!(list_warnings(stepped, Some(0), Some(5)), none);
+    assert_eq!(list_warnings(stepped, Some(1), Some(5)), none);
     assert_eq!(
         list_warnings(stepped, Some(2), Some(5)),
         ["feeder core 2 is not in nohz_full (0-7:2/4)"]
@@ -435,7 +436,131 @@ fn a_list_the_harness_cannot_read_is_not_called_unset() {
     // `N` (the last CPU) is valid to the kernel and not resolved here.
     assert_eq!(
         list_warnings("isolcpus: 2-3\nnohz_full: 2-N\nrcu_nocbs: ALL", Some(2), Some(3)),
-        ["nohz_full (2-N) names no CPU this harness can read: pinned cores not checked against it"]
+        ["nohz_full (2-N) is not a CPU list this harness can read: pinned cores not checked against it"]
+    );
+}
+
+#[test]
+fn a_list_with_one_unreadable_part_is_unreadable_as_a_whole() {
+    // `0,2-N` names CPU 0 and CPUs 2 to the last: reading it as [0] would
+    // report core 3 as outside a list that holds it.
+    let unread = |key: &str, raw: &str| {
+        format!("{key} ({raw}) is not a CPU list this harness can read: pinned cores not checked against it")
+    };
+    assert_eq!(
+        list_warnings(
+            "isolcpus: 0-7\nnohz_full: 0,2-N\nrcu_nocbs: all",
+            Some(2),
+            Some(3)
+        ),
+        [unread("nohz_full", "0,2-N")]
+    );
+    assert_eq!(
+        list_warnings(
+            "isolcpus: 0-7\nnohz_full: all\nrcu_nocbs: 2,x",
+            Some(2),
+            Some(3)
+        ),
+        Vec::<String>::new(),
+        "every nohz_full core is offloaded, so rcu_nocbs is not consulted"
+    );
+    assert_eq!(
+        list_warnings(
+            "isolcpus: 0-7\nnohz_full: 6-7\nrcu_nocbs: 2,x",
+            Some(2),
+            None
+        ),
+        [
+            "feeder core 2 is not in nohz_full (6-7)".to_owned(),
+            unread("rcu_nocbs", "2,x")
+        ]
+    );
+    // isolcpus takes the kernel's three flags before its list and no other word.
+    assert_eq!(
+        list_warnings(
+            &format!("isolcpus: nohz,domain,managed_irq,2-3\n{QUIET}"),
+            Some(2),
+            Some(3)
+        ),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        list_warnings(&format!("isolcpus: 2,3-N\n{QUIET}"), Some(2), Some(3)),
+        [unread("isolcpus", "2,3-N")]
+    );
+    // The flags belong to isolcpus alone.
+    assert_eq!(
+        list_warnings(
+            "isolcpus: 2-3\nnohz_full: domain,2-3\nrcu_nocbs: all",
+            Some(2),
+            Some(3)
+        ),
+        [unread("nohz_full", "domain,2-3")]
+    );
+    let f = file_with_cores("isolcpus: 2,3-N", "active: 0");
+    assert_eq!(
+        f.isolated_cpus(),
+        None,
+        "a partly read list is not returned"
+    );
+}
+
+#[test]
+fn an_unreadable_nohz_full_leaves_rcu_offload_undetermined() {
+    // nohz_full CPUs are offloaded whatever rcu_nocbs says, so with nohz_full
+    // unread a core outside rcu_nocbs may or may not be offloaded.
+    let unread =
+        "nohz_full (2-N) is not a CPU list this harness can read: pinned cores not checked against it";
+    assert_eq!(
+        list_warnings("isolcpus: 2-3\nnohz_full: 2-N\nrcu_nocbs: not set", Some(2), Some(3)),
+        [
+            unread,
+            "rcu_nocbs is not set and nohz_full (2-N) could not be parsed: whether feeder core 2 and hot core 3 are offloaded from RCU callbacks is undetermined"
+        ]
+    );
+    assert_eq!(
+        list_warnings("isolcpus: 2-3\nnohz_full: 2-N\nrcu_nocbs: not set", None, Some(3)),
+        [
+            unread,
+            "rcu_nocbs is not set and nohz_full (2-N) could not be parsed: whether hot core 3 is offloaded from RCU callbacks is undetermined"
+        ]
+    );
+    assert_eq!(
+        list_warnings("isolcpus: 2-3\nnohz_full: 2-N\nrcu_nocbs: 2", Some(2), Some(3)),
+        [
+            unread,
+            "hot core 3 is not in rcu_nocbs (2) and nohz_full (2-N) could not be parsed: whether it is offloaded from RCU callbacks is undetermined"
+        ]
+    );
+    // A core rcu_nocbs names is offloaded whatever nohz_full says.
+    assert_eq!(
+        list_warnings(
+            "isolcpus: 2-3\nnohz_full: 2-N\nrcu_nocbs: 2-3",
+            Some(2),
+            Some(3)
+        ),
+        [unread]
+    );
+}
+
+#[test]
+fn a_pinned_cpu_0_is_weighed_as_the_boot_cpu() {
+    // Linux v6.8 Documentation/admin-guide/kernel-parameters.txt, nohz_full=:
+    // "The boot CPU will be forced outside the range to maintain the
+    // timekeeping." So CPU 0 outside nohz_full is truly not tickless and the
+    // warning stays; CPU 0 named in nohz_full may not be tickless either.
+    let rest = "isolcpus: 0-7\nrcu_nocbs: all";
+    assert_eq!(
+        list_warnings(&format!("{rest}\nnohz_full: 1-7"), Some(2), Some(0)),
+        ["hot core 0 is not in nohz_full (1-7)"]
+    );
+    assert_eq!(
+        list_warnings(&format!("{rest}\nnohz_full: 0-7"), Some(0), Some(3)),
+        ["feeder core 0 is in nohz_full (0-7), but the kernel forces the boot CPU (normally CPU 0) outside nohz_full: it may still take the tick"]
+    );
+    assert_eq!(
+        list_warnings(&format!("{rest}\nnohz_full: all"), Some(2), Some(0)),
+        ["hot core 0 is in nohz_full (all), but the kernel forces the boot CPU (normally CPU 0) outside nohz_full: it may still take the tick"]
     );
 }
 
