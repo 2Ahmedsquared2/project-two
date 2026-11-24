@@ -11,7 +11,13 @@ echo "== cargo clippy -D warnings (hl-replay --no-default-features)"
 cargo clippy -p hl-replay --no-default-features --all-targets -- -D warnings
 echo "== cargo clippy -D warnings (hl-replay --features prototype-signer)"
 cargo clippy -p hl-replay --features prototype-signer --all-targets -- -D warnings
+echo "== cargo clippy -D warnings (hl-replay --no-default-features --features prototype-signer)"
+cargo clippy -p hl-replay --no-default-features --features prototype-signer --all-targets -- -D warnings
 echo "== cargo test";                cargo test --workspace
+# The workspace run above tests hl-replay with default features only: a test
+# that breaks only without the io_uring arms must fail the gate too (#73).
+echo "== cargo test (hl-replay --no-default-features)"
+cargo test -p hl-replay --no-default-features
 echo "== cargo doc";                 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 echo "== golden vectors"
 cargo run -q -p book-check -- golden/basic.jsonl
