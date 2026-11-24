@@ -925,6 +925,7 @@ dependencies = [
  "hdrhistogram",
  "hl-alloc-gate",
  "hl-latency",
+ "hl-order",
  "inotify",
  "proptest",
  "rmp-serde",

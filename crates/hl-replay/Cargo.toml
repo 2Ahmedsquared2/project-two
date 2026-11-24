@@ -14,9 +14,16 @@ default = ["compio"]
 # The two io_uring arms. On by default; build with `--no-default-features` if
 # compio does not build on a host, and those arms report "unavailable".
 compio = ["dep:compio"]
+# Runs `PrototypeSigner` (libsecp256k1, placeholder domain) as the signer stage
+# instead of the real `HlOrderSigner`, to compare their cost. The report then
+# says `signer=prototype`.
+prototype-signer = []
 
 [dependencies]
 hl-latency = { path = "../hl-latency" }
+# The real signer. Only its signing and body-building functions are called;
+# the crate ships no transport, so this adds no network code.
+hl-order = { path = "../hl-order" }
 hdrhistogram = "7.6"
 thiserror = { workspace = true }
 serde = { workspace = true }
