@@ -30,6 +30,9 @@ pub fn parse_node_line(line: &str, recv_ns: u64) -> Result<Observation, ParseErr
         block_time_ms: parse_naive_utc_ms(block_time)?,
         block_number: Some(block_number),
         recv_ns,
+        file_date: None,
+        file_hour: None,
+        line_offset: None,
     })
 }
 
@@ -41,6 +44,9 @@ pub fn parse_ws_message(msg: &str, recv_ns: u64) -> Result<Vec<Observation>, Par
         block_time_ms: t,
         block_number: None,
         recv_ns,
+        file_date: None,
+        file_hour: None,
+        line_offset: None,
     };
     let time_of = |d: &Value| {
         d.get("time")

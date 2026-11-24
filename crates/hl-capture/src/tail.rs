@@ -137,11 +137,13 @@ struct Parser<'a, S: ?Sized> {
     last_height: &'a mut Option<u64>,
     /// Set while the file just switched to is read for the first time.
     switch: Option<&'a mut Switch>,
+    /// `(date, hour)` of the file being read.
+    key: (u32, u8),
     sink: &'a mut S,
 }
 
 impl<S: ObservationSink + ?Sized> LineSink for Parser<'_, S> {
-    fn line(&mut self, bytes: &[u8], recv_ns: u64) {
+    fn line(&mut self, bytes: &[u8], recv_ns: u64, offset: u64) {
         // The splitter only hands out lines whose newline it has seen.
         let line = CompleteLine::assume_newline_seen(bytes);
         let obs = if let Some((block_time_ms, block_number)) = scan_node_header(line) {
@@ -150,6 +152,10 @@ impl<S: ObservationSink + ?Sized> LineSink for Parser<'_, S> {
                 block_time_ms,
                 block_number: Some(block_number),
                 recv_ns,
+                // Not implemented yet (red).
+                file_date: None,
+                file_hour: None,
+                line_offset: None,
             }
         } else {
             // Not hl-node's exact header shape: let the strict parse decide.
@@ -163,6 +169,7 @@ impl<S: ObservationSink + ?Sized> LineSink for Parser<'_, S> {
                 return;
             };
             self.stats.scan_fallbacks += 1;
+            let _ = (offset, self.key);
             obs
         };
         self.stats.lines += 1;
@@ -442,12 +449,15 @@ impl NodeTailer {
                         self.stats.bad_lines += 1;
                     }
                 }
-                if self.current.is_none() && first {
+                // Line offsets count from where reading starts in the file.
+                let position = if self.current.is_none() && first {
                     // History is not an arrival.
-                    file.seek(SeekFrom::End(0))?;
+                    file.seek(SeekFrom::End(0))?
                 } else {
                     self.switch = SwitchState::Reading(Switch::default());
-                }
+                    0
+                };
+                self.splitter.set_position(position);
                 self.current = Some(Current {
                     path: newest,
                     key,
@@ -478,6 +488,7 @@ impl NodeTailer {
                 SwitchState::Reading(sw) => Some(sw),
                 SwitchState::None | SwitchState::Ready(_) => None,
             },
+            key: cur.key,
             sink,
         };
         loop {

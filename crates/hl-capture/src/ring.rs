@@ -19,12 +19,87 @@
 use std::io::Write;
 use std::time::Duration;
 
-use hl_latency::Observation;
+use hl_latency::{Observation, Source};
 
 use crate::tail::ObservationSink;
 
-/// Default ring size, in records (32 bytes each: 2 MiB).
+/// Default ring size, in records ([`RECORD_BYTES`] each).
 pub const DEFAULT_RING_RECORDS: usize = 65_536;
+
+/// Size of one ring record, in bytes.
+pub const RECORD_BYTES: usize = std::mem::size_of::<Record>();
+
+// The reader writes one of these per line: its size is part of the reader's
+// cost and of the ring's memory, so it changes only on purpose.
+const _: () = assert!(RECORD_BYTES == 40);
+
+const WS: u8 = 1;
+const HAS_HEIGHT: u8 = 2;
+const HAS_FILE: u8 = 4;
+
+/// An [`Observation`] as the ring holds it: the same fields without the
+/// `Option` tags, which are folded into one byte of flags. 40 bytes against
+/// 64 for the observation itself.
+#[derive(Debug, Clone, Copy)]
+struct Record {
+    block_time_ms: u64,
+    block_number: u64,
+    recv_ns: u64,
+    line_offset: u64,
+    file_date: u32,
+    file_hour: u8,
+    flags: u8,
+}
+
+impl From<Observation> for Record {
+    #[inline]
+    fn from(o: Observation) -> Self {
+        let mut flags = match o.source {
+            Source::Node => 0,
+            Source::PublicWs => WS,
+        };
+        if o.block_number.is_some() {
+            flags |= HAS_HEIGHT;
+        }
+        // All three or none: a record with only some is written without
+        // any.
+        let file = match (o.file_date, o.file_hour, o.line_offset) {
+            (Some(date), Some(hour), Some(offset)) => {
+                flags |= HAS_FILE;
+                (date, hour, offset)
+            }
+            _ => (0, 0, 0),
+        };
+        Self {
+            block_time_ms: o.block_time_ms,
+            block_number: o.block_number.unwrap_or(0),
+            recv_ns: o.recv_ns,
+            line_offset: file.2,
+            file_date: file.0,
+            file_hour: file.1,
+            flags,
+        }
+    }
+}
+
+impl From<Record> for Observation {
+    fn from(r: Record) -> Self {
+        let file = r.flags & HAS_FILE != 0;
+        Self {
+            source: if r.flags & WS == 0 {
+                Source::Node
+            } else {
+                Source::PublicWs
+            },
+            block_time_ms: r.block_time_ms,
+            block_number: (r.flags & HAS_HEIGHT != 0).then_some(r.block_number),
+            recv_ns: r.recv_ns,
+            file_date: file.then_some(r.file_date),
+            file_hour: file.then_some(r.file_hour),
+            line_offset: file.then_some(r.line_offset),
+        }
+    }
+}
 
 /// Most records the writer thread writes before it calls its hook again
 /// (see [`RingSource::run_with`]).
@@ -33,14 +108,14 @@ pub const WRITE_CHUNK: usize = 1024;
 /// The reader's end of the ring.
 #[derive(Debug)]
 pub struct RingSink {
-    tx: rtrb::Producer<Observation>,
+    tx: rtrb::Producer<Record>,
     dropped: u64,
 }
 
 /// The writer's end of the ring.
 #[derive(Debug)]
 pub struct RingSource {
-    rx: rtrb::Consumer<Observation>,
+    rx: rtrb::Consumer<Record>,
 }
 
 /// A bounded single-producer single-consumer ring of `capacity` records,
@@ -55,7 +130,7 @@ impl ObservationSink for RingSink {
     /// Pushes the record, or drops and counts it when the ring is full.
     /// Never blocks, never allocates, makes no system call.
     fn observe(&mut self, obs: Observation) {
-        if self.tx.push(obs).is_err() {
+        if self.tx.push(Record::from(obs)).is_err() {
             self.dropped += 1;
         }
     }
@@ -78,7 +153,7 @@ impl RingSink {
 impl RingSource {
     /// The oldest record, if any.
     pub fn pop(&mut self) -> Option<Observation> {
-        self.rx.pop().ok()
+        self.rx.pop().ok().map(Observation::from)
     }
 
     /// Writes every record now in the ring to `out` as JSON lines and

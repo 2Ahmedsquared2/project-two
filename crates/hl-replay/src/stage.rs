@@ -186,6 +186,9 @@ impl Parser for HeaderScanParser {
                 block_time_ms,
                 block_number: Some(block_number),
                 recv_ns,
+                file_date: None,
+                file_hour: None,
+                line_offset: None,
             });
         }
         self.fallbacks += 1;

@@ -599,13 +599,22 @@ impl Region {
                 None => return Self::Refused,
             }
         };
-        // What follows a stride starts the next region, with no comma needed.
-        if !rest.is_empty() {
-            return match Self::parse(rest) {
-                Self::Refused => Self::Refused,
-                _ => Self::HostDependent,
-            };
+        let own = Self::classify(first, last, stride);
+        if rest.is_empty() {
+            return own;
         }
+        // What follows a stride starts the next region, with no comma
+        // needed. `bitmap_parselist` checks this region before it parses the
+        // next, so a refusal here stands whatever follows.
+        match (own, Self::parse(rest)) {
+            (Self::Refused, _) | (_, Self::Refused) => Self::Refused,
+            _ => Self::HostDependent,
+        }
+    }
+
+    /// What `bitmap_check_region` makes of one region's numbers.
+    fn classify(first: Num, last: Num, stride: Option<(Num, Num)>) -> Self {
+        use Num::{Is, LastCpu};
         match stride {
             Some((_, Is(0))) => return Self::Refused,
             Some((Is(used), Is(group))) if used > group => return Self::Refused,

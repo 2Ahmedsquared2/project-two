@@ -879,6 +879,7 @@ version = "0.1.0"
 dependencies = [
  "hl-alloc-gate",
  "hl-latency",
+ "hl-strict-pass",
  "inotify",
  "memchr",
  "proptest",

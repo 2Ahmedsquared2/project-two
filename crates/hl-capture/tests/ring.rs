@@ -12,6 +12,9 @@ fn obs(h: u64) -> Observation {
         block_time_ms: 1_795_075_200_000 + h,
         block_number: Some(h),
         recv_ns: 10 * h,
+        file_date: None,
+        file_hour: None,
+        line_offset: None,
     }
 }
 

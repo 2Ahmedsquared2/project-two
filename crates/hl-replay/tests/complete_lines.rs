@@ -42,6 +42,9 @@ impl Parser for CountingScan {
                 .unwrap(),
             block_number: Some(bn.parse().unwrap()),
             recv_ns,
+            file_date: None,
+            file_hour: None,
+            line_offset: None,
         })
     }
 }
