@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/hl-book-ref", "crates/hl-dataset", "crates/book-check", "crates/hl-latency", "crates/hl-capture", "crates/hl-node-convert", "crates/hl-order", "crates/hl-alloc-gate", "crates/hl-replay", "crates/hl-race"]
+members = ["crates/hl-book-ref", "crates/hl-dataset", "crates/book-check", "crates/hl-latency", "crates/hl-capture", "crates/hl-node-convert", "crates/hl-order", "crates/hl-alloc-gate", "crates/hl-replay", "crates/hl-race", "crates/hl-strict-pass"]
 
 [workspace.package]
 version = "0.1.0"
