@@ -1,0 +1,64 @@
+# Plausible racer bugs; each names the one property that must fail.
+
+mutation keep the first copy silently on different bytes
+detects DivergenceAlarmed
+only gap2 bad
+- THEN alarms' = alarms \cup {<<s, k>>}                \* Divergent
++           THEN UNCHANGED alarms                                \* Divergent
+
+mutation a later copy overwrites the held one (last wins, not first)
+detects ReleasedIsWinner
+only gap2 bad
+- ELSE IF slot[i].st # "empty" /\ slot[i].seq = k
++   ELSE IF slot[i].st # "empty" /\ slot[i].seq = k /\ FALSE
+
+mutation a released slot is never reused, so the stream stalls
+detects AllReleased
+only gap
+- ELSE IF k < next
++   ELSE IF k < next \/ slot[i].st = "released"
+
+mutation off-by-one window admits a key that shares a slot with an unreleased one
+detects HeldNotLost
+only w2 n5
+- IF k >= next + W
++   IF k > next + W
+
+mutation the late test runs before the held test, so a divergent copy after release is never compared
+detects DivergenceAlarmed
+only 3src gap bad
+- ELSE IF slot[i].st # "empty" /\ slot[i].seq = k
++   ELSE IF slot[i].st = "held" /\ slot[i].seq = k
+
+mutation the window never holds a key past a gap
+detects reach:GapHeld
+- IF k >= next + W
++   IF k > next
+
+mutation alarm on every duplicate
+detects NoFalseAlarm
+only dup
+- ELSE UNCHANGED alarms                                \* Duplicate
++           ELSE alarms' = alarms \cup {<<s, k>>}                \* Duplicate
+
+mutation the driver offers again before draining pop(), so the complete source's copy is dropped as TooFar
+detects AllReleased
+only w1 n3 2src clean
+-   /\ ~CanPop
+-   /\ k < N
++   /\ k < N
+
+mutation pop hands out the item without consuming it, so it is released again
+detects InOrderOnce
+only w1 n3 2src clean
+-   /\ slot' = [slot EXCEPT ![i].st = "released"]
+-   /\ out' = Append(out, <<next, slot[i].val>>)
+-   /\ next' = next + 1
++   /\ out' = Append(out, <<next, slot[i].val>>)
++   /\ UNCHANGED <<slot, next>>
+
+mutation an alarm records a key outside the stream
+detects TypeOK
+only gap2 bad
+- THEN alarms' = alarms \cup {<<s, k>>}                \* Divergent
++           THEN alarms' = alarms \cup {<<s, k + N>>}            \* Divergent

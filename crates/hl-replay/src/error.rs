@@ -36,6 +36,9 @@ pub enum ReplayError {
     /// A key that is not a valid secp256k1 secret.
     #[error("signer: {0}")]
     Signer(String),
+    /// A host-facts file that is missing something the capture script writes.
+    #[error("host facts: {0}")]
+    HostFacts(String),
     /// A round was asked to do something meaningless.
     #[error("config: {0}")]
     Config(String),

@@ -4,13 +4,51 @@
 use std::fmt::Write as _;
 
 use std::fs;
-use std::process::Command;
+use std::io::{BufRead, BufReader, Read};
+use std::process::{Child, ChildStderr, Command, Stdio};
 use std::time::Duration;
 
 use hl_latency::{read_observations, Source};
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_hl-capture"))
+}
+
+/// The line `hl-capture node` writes to stderr once its first poll is done:
+/// a file that appears after it is read from its start.
+const READY: &str = "{\"ready\":true}";
+
+/// Spawns `cmd` with stderr piped and blocks until it reports [`READY`], so
+/// a test never races the binary's startup (a slow `exec` on a loaded Mac
+/// once made the first poll see the burst as history and skip it).
+fn spawn_ready(cmd: &mut Command) -> (Child, BufReader<ChildStderr>) {
+    let mut child = cmd.stderr(Stdio::piped()).spawn().unwrap();
+    let mut err = BufReader::new(child.stderr.take().unwrap());
+    let mut first = String::new();
+    err.read_line(&mut first).unwrap();
+    assert_eq!(first.trim_end(), READY, "first stderr line");
+    (child, err)
+}
+
+/// A first poll that takes longer than the old fixed 200 ms sleep must not
+/// make the test skip the burst: the ready line comes after the first poll,
+/// however late that is.
+#[test]
+fn node_arm_reports_ready_after_its_first_poll() {
+    let t = tempfile::tempdir().unwrap();
+    let (child, mut err) = spawn_ready(
+        bin()
+            .arg("node")
+            .arg(t.path())
+            .arg("--out")
+            .arg(t.path().join("obs.jsonl"))
+            .args(["--duration-s", "1", "--poll-us", "1000"]),
+    );
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let mut rest = String::new();
+    err.read_to_string(&mut rest).unwrap();
+    assert!(rest.contains("\"reads\":"), "counters follow: {rest}");
 }
 
 #[test]
@@ -33,15 +71,13 @@ fn node_arm_captures_lines_from_a_file_that_appears_during_the_run() {
     let t = tempfile::tempdir().unwrap();
     let root = t.path().join("node_raw_book_diffs");
     let out = t.path().join("obs.jsonl");
-    let mut child = bin()
-        .arg("node")
-        .arg(&root)
-        .arg("--out")
-        .arg(&out)
-        .args(["--duration-s", "2", "--poll-us", "1000"])
-        .spawn()
-        .unwrap();
-    std::thread::sleep(Duration::from_millis(400));
+    let (mut child, _err) =
+        spawn_ready(bin().arg("node").arg(&root).arg("--out").arg(&out).args([
+            "--duration-s",
+            "2",
+            "--poll-us",
+            "1000",
+        ]));
     let dir = root.join("hourly").join("20261119");
     fs::create_dir_all(&dir).unwrap();
     fs::write(
@@ -112,15 +148,13 @@ fn duration_bounds_the_run_under_a_busy_input() {
     fs::write(&staged, body).unwrap();
     let out = t.path().join("obs.jsonl");
     let start = std::time::Instant::now();
-    let mut child = bin()
-        .arg("node")
-        .arg(&root)
-        .arg("--out")
-        .arg(&out)
-        .args(["--duration-s", "1", "--poll-us", "1000"])
-        .spawn()
-        .unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    let (mut child, _err) =
+        spawn_ready(bin().arg("node").arg(&root).arg("--out").arg(&out).args([
+            "--duration-s",
+            "1",
+            "--poll-us",
+            "1000",
+        ]));
     fs::rename(&staged, dir.join("8")).unwrap();
     let status = child.wait().unwrap();
     let took = start.elapsed();
