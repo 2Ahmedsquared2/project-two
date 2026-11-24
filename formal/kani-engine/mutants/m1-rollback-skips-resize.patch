@@ -1,0 +1,16 @@
+--- a/crates/hl-exec/src/book.rs
++++ b/crates/hl-exec/src/book.rs
+@@ -213,11 +213,8 @@
+     pub fn rollback(&mut self, mut on: impl FnMut(Restored)) {
+         while let Some(u) = self.journal.pop() {
+             match u {
+-                Undo::Resized { slot, old } => {
+-                    let n = self.nodes[idx(slot)];
+-                    let lv = &mut self.levels[idx(n.level)];
+-                    lv.total = lv.total.saturating_sub(n.sz.0).saturating_add(old.0);
+-                    self.nodes[idx(slot)].sz = old;
++                Undo::Resized { .. } => {
++                    // MUTANT M1: skip undoing a resize.
+                 }
+                 Undo::Rested {
+                     slot,

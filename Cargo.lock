@@ -1069,6 +1069,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kani-engine"
+version = "0.1.0"
+dependencies = [
+ "hl-exec",
+]
+
+[[package]]
 name = "keccak"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

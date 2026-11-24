@@ -1,0 +1,18 @@
+[package]
+name = "kani-engine"
+description = "Kani harnesses for hl-exec (book invariants, matching, index consistency, rollback). Uses only hl-exec's public API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+hl-exec = { path = "../../crates/hl-exec" }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
