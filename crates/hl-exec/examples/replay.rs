@@ -33,6 +33,11 @@
 //! in the window (deposits, transfers) are not added. `--wallet-log FILE`
 //! writes every action where the rule and native disagree.
 //!
+//! `--set-global-const` answers every `SetGlobalAction` with native's
+//! constant `{"type":"setGlobal","data":[]}` and no book effect (223 of 223
+//! over 1232430001..1232440000, lane 3's count; lane 3's adapter does the
+//! same). Off by default; a k that uses it is labelled `set-global-const`.
+//!
 //! `--cancel-log FILE` (needs `--statuses`) writes one JSON line per
 //! `cancel`/`cancelByCloid` leg whose response differs from native's, in
 //! every block, past the block's first mismatch too: both responses, the
@@ -323,7 +328,7 @@ impl Block {
                     user: self.users[i],
                     modifies: &self.modifies[j],
                 },
-                3 | 5 => UserAction::Noop,
+                3 | 5 | 6 => UserAction::Noop,
                 _ => UserAction::Unsupported("x"),
             })
             .collect()
@@ -353,6 +358,7 @@ fn time_ms(s: &str) -> u64 {
 fn decode_block(meta: &Meta, line: &str, mut rule: Option<&mut WalletRule>) -> Block {
     let v: Value = serde_json::from_str(line).unwrap();
     let l1 = rule.as_ref().map(|_| signers::signed_actions(line));
+    let set_global = flag("--set-global-const");
     let mut act_no = 0usize;
     let ab = &v["abci_block"];
     let mut b = Block {
@@ -435,6 +441,7 @@ fn decode_block(meta: &Meta, line: &str, mut rule: Option<&mut WalletRule>) -> B
                     2
                 }
                 "noop" => 3,
+                "SetGlobalAction" if set_global => 6,
                 _ => 4,
             };
             let kind = if unsupported { 4 } else { kind };
@@ -619,6 +626,7 @@ fn response_json(meta: &Meta, b: &Block, i: usize, st: &[OrderStatus], expired: 
             }
         }
         3 => serde_json::json!({"status":"ok","response":{"type":"default"}}),
+        6 => serde_json::json!({"status":"ok","response":{"type":"setGlobal","data":[]}}),
         5 => serde_json::json!({"status":"err","response":format!(
             "User or API Wallet {} does not exist.",
             signers::addr_hex(&b.unknown_signer[i].unwrap())
@@ -1141,6 +1149,10 @@ fn arg(name: &str) -> Option<String> {
         .and_then(|i| a.get(i + 1).cloned())
 }
 
+fn flag(name: &str) -> bool {
+    std::env::args().any(|x| x == name)
+}
+
 fn main() {
     let mut meta = load_meta(&arg("--meta").expect("--meta"));
     let max: usize = arg("--max").map_or(usize::MAX, |s| s.parse().unwrap());
@@ -1502,6 +1514,9 @@ fn main() {
         }
     }
     println!("blocks N={n} heights {first_seen}..={last_seen}  reproduced k={k}");
+    if flag("--set-global-const") {
+        println!("label: set-global-const (SetGlobalAction answered with native's constant)");
+    }
     if let Some(mut w) = cancel_log {
         w.flush().unwrap();
         println!(
