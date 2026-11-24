@@ -355,6 +355,80 @@ fn backlog_on_the_old_file_holds_rotation_until_it_is_drained() {
     assert_eq!(tail.stats().rotations, 1);
 }
 
+/// Issue #27: the node can append to the old file after the reader last
+/// read it and before the reader's look finds the new file. That line must
+/// not be lost: once a newer file is found, the old one is read to its end
+/// once more before the switch.
+#[test]
+fn a_line_appended_to_the_old_file_just_before_the_switch_is_not_lost() {
+    let t = tempfile::tempdir().unwrap();
+    let old = touch(t.path(), "20261119", "8");
+    let mut tail = NodeTailer::new(t.path());
+    let (mut clock, _) = ticking();
+    tail.poll(&mut clock).unwrap();
+    let new_path = t.path().join("hourly").join("20261119").join("9");
+
+    let mut got: Vec<Observation> = Vec::new();
+    tail.request_rescan();
+    // By the time the look runs, this poll has already read the old file to
+    // its end: what the node writes now is in the gap.
+    tail.poll_into_with(&mut clock, &mut got, |root| {
+        append(&old, &node_line("2026-11-19T08:59:59.990", 10));
+        let new = touch(t.path(), "20261119", "9");
+        append(&new, &node_line("2026-11-19T09:00:00.060", 11));
+        newest_hourly_file(root)
+    })
+    .unwrap();
+    let heights: Vec<_> = got.iter().map(|o| o.block_number.unwrap()).collect();
+    assert_eq!(
+        heights,
+        vec![10, 11],
+        "the old file's last line, then the new file from byte 0"
+    );
+    assert_eq!(tail.current_file(), Some(new_path.as_path()));
+    let s = tail.stats();
+    assert_eq!((s.rotations, s.height_breaks, s.bad_lines), (1, 0, 0));
+    assert_eq!(s.post_rotation_lines, 1, "only the new file's line is late");
+}
+
+/// The last read of the old file obeys the read budget like any other: if
+/// more was appended in the gap than one poll may read, the switch waits
+/// (and the look stays due) until the old file is at its end.
+#[test]
+fn a_backlog_appended_just_before_the_switch_holds_the_switch() {
+    let t = tempfile::tempdir().unwrap();
+    let old = touch(t.path(), "20261119", "8");
+    let mut tail = NodeTailer::new(t.path());
+    let (mut clock, _) = ticking();
+    tail.poll(&mut clock).unwrap();
+    let new_path = t.path().join("hourly").join("20261119").join("9");
+    let (body, n) = many_lines(0, 2);
+
+    let mut got: Vec<Observation> = Vec::new();
+    tail.request_rescan();
+    tail.poll_into_with(&mut clock, &mut got, |root| {
+        append(&old, &body);
+        let new = touch(t.path(), "20261119", "9");
+        append(&new, &node_line("2026-11-19T09:00:00.060", n));
+        newest_hourly_file(root)
+    })
+    .unwrap();
+    assert!(tail.backlogged(), "more of the old file waits");
+    assert_eq!(tail.current_file(), Some(old.as_path()), "not switched yet");
+    assert_eq!(tail.stats().rotations, 0);
+    let mut polls = 1;
+    while tail.current_file() != Some(new_path.as_path()) || tail.backlogged() {
+        // No further rescan is requested: the one that found the file is
+        // still due.
+        tail.poll_into(&mut clock, &mut got).unwrap();
+        polls += 1;
+        assert!(polls < 100, "never rotated");
+    }
+    let heights: Vec<_> = got.iter().map(|o| o.block_number.unwrap()).collect();
+    assert_eq!(heights, (0..=n).collect::<Vec<_>>());
+    assert_eq!(tail.stats().rotations, 1);
+}
+
 // ---- WS filter --------------------------------------------------------------
 
 fn l2(coin: &str, time: u64) -> String {
