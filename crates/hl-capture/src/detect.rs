@@ -15,6 +15,12 @@
 //!   becomes `poll`.
 //! - `inotify` whose watch on the followed file is refused later becomes
 //!   `poll` at that point.
+//!
+//! In `inotify` mode the watch on a file is added after the caller has read
+//! that file to its end, and a write between the two raises no event. So the
+//! first wait after a file is followed does not sleep: the caller reads once
+//! more with the watch in place, and a line written in that gap is stamped
+//! at once instead of at the next write.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -106,7 +112,10 @@ impl Waiter {
     /// Tells the waiter which file is followed now. Call it after any poll
     /// that may have switched files; it does nothing unless the file
     /// changed (and nothing at all outside inotify mode). Returns a note if
-    /// the mode had to change.
+    /// the mode had to change. In inotify mode, the first [`Self::wait`]
+    /// after the file changed returns without sleeping: poll the file again
+    /// after it, since a write made before the watch existed raised no
+    /// event.
     pub fn follow(&mut self, root: &Path, current: Option<&Path>) -> Option<String> {
         #[cfg(target_os = "linux")]
         if let Kind::Inotify(w) = &mut self.kind {
@@ -174,6 +183,10 @@ mod linux {
         file: Option<(WatchDescriptor, PathBuf)>,
         dirs: Vec<(WatchDescriptor, PathBuf)>,
         followed_once: bool,
+        /// A file was followed since the last wait: what the node wrote to
+        /// it before the watch existed raised no event, so the next wait
+        /// must not sleep.
+        unseen_writes: bool,
         events: Box<[u8; EVENT_BUF]>,
     }
 
@@ -193,6 +206,7 @@ mod linux {
                 file: None,
                 dirs: Vec::new(),
                 followed_once: false,
+                unseen_writes: false,
                 events: Box::new([0; EVENT_BUF]),
             })
         }
@@ -237,6 +251,7 @@ mod linux {
             if let Some(file) = current {
                 let wd = self.ino.watches().add(file, WatchMask::MODIFY)?;
                 self.file = Some((wd, file.to_path_buf()));
+                self.unseen_writes = true;
                 // Stop watching date directories that are no longer on the
                 // path to the followed file.
                 let mut i = 0;
@@ -261,7 +276,15 @@ mod linux {
         }
 
         pub(super) fn wait(&mut self, until: Instant) -> Wake {
-            let left = until.saturating_duration_since(Instant::now());
+            // The file was read to its end before its watch was added, and
+            // the node may have written in between: do not sleep, only
+            // collect the events already queued, so the caller reads again
+            // at once. Cold: once per followed file.
+            let left = if std::mem::take(&mut self.unseen_writes) {
+                std::time::Duration::ZERO
+            } else {
+                until.saturating_duration_since(Instant::now())
+            };
             let timeout = Timespec::try_from(left).ok();
             let ready = {
                 let mut fds = [PollFd::new(&self.ino, PollFlags::IN)];

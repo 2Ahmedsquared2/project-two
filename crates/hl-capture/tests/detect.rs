@@ -33,14 +33,24 @@ fn busy_poll_needs_a_second_cpu_for_the_writer_thread() {
 #[test]
 fn busy_poll_does_not_sleep_and_poll_sleeps_its_interval() {
     let (mut busy, _) = Waiter::new(Detect::BusyPoll, POLL, 2);
-    let start = Instant::now();
+    // No bound on the whole loop: on a loaded machine the thread can lose
+    // the CPU for longer than any bound worth setting (issue #30). A wait
+    // that sleeps takes at least POLL every time, because a sleep never
+    // returns early; a wait that spins takes that long only when the
+    // scheduler takes the CPU away mid-wait, which cannot happen to more
+    // than a few of 1000 waits that need microseconds between them.
+    let far = Instant::now() + Duration::from_secs(3600);
+    let mut slow = 0_u32;
     for _ in 0..1000 {
-        assert!(!busy.wait(start + Duration::from_secs(5)).rescan);
+        let start = Instant::now();
+        assert!(!busy.wait(far).rescan);
+        if start.elapsed() >= POLL {
+            slow += 1;
+        }
     }
     assert!(
-        start.elapsed() < POLL,
-        "1000 busy waits took {:?}",
-        start.elapsed()
+        slow <= 10,
+        "{slow} of 1000 busy waits took as long as a {POLL:?} sleep"
     );
 
     let (mut poll, note) = Waiter::new(Detect::Poll, POLL, 2);

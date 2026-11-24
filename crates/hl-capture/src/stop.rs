@@ -12,6 +12,12 @@
 //! is the way out when the writer cannot finish, for example on a disk that
 //! has stopped accepting writes.
 //!
+//! The first signal only sets the flag the reader's loop watches. Once that
+//! loop has ended for another reason (the `--duration-s` deadline) nothing
+//! reads the flag any more, so a first signal during the writer's final
+//! write is not acted on or reported; the next one is still the second and
+//! exits.
+//!
 //! `SIGKILL` cannot be handled and `SIGHUP` is not: both end the process the
 //! default way, losing what the ring holds and the counters.
 
