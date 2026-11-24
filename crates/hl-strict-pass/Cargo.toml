@@ -1,0 +1,22 @@
+[package]
+name = "hl-strict-pass"
+description = "Offline check of the node's hourly output files that hl-capture tails: strict-parses every line, lists the ones that fail and counts block-height breaks."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+hl-capture = { path = "../hl-capture", version = "0.1.0" }
+hl-latency = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = "3"
+
+[lints]
+workspace = true
