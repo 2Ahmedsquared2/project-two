@@ -476,3 +476,255 @@ fn the_first_file_is_found_quickly_whatever_the_rescan_interval() {
     let c = counters(&stderr);
     assert_eq!(c["written"], 2, "{c}");
 }
+
+// ---- signals (issue #28) ------------------------------------------------------
+
+#[cfg(unix)]
+mod signals {
+    use super::*;
+    use std::time::Instant;
+
+    fn send(child: &Child, signal: &str) {
+        let status = Command::new("kill")
+            .arg(format!("-{signal}"))
+            .arg(child.id().to_string())
+            .status()
+            .unwrap();
+        assert!(status.success(), "kill -{signal}");
+    }
+
+    /// Kills the child with SIGKILL if the test has not finished with it in
+    /// 60 s, so a run that ignores its signal fails the test instead of
+    /// hanging it. Dropping the guard calls the watchdog off.
+    struct Watchdog(std::sync::mpsc::Sender<()>);
+
+    impl Drop for Watchdog {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    fn watchdog(child: &Child) -> Watchdog {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pid = child.id().to_string();
+        std::thread::spawn(move || {
+            if rx.recv_timeout(Duration::from_secs(60))
+                == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            {
+                let _ = Command::new("kill").args(["-KILL", &pid]).status();
+            }
+        });
+        Watchdog(tx)
+    }
+
+    /// Complete lines in `path` so far (0 while it does not exist).
+    fn lines_in(path: &std::path::Path) -> usize {
+        fs::read(path).map_or(0, |b| memchr::memchr_iter(b'\n', &b).count())
+    }
+
+    /// Reads stderr up to and including `want`; returns what came before it.
+    fn read_until(err: &mut BufReader<ChildStderr>, want: &str) -> String {
+        let (mut before, mut line) = (String::new(), String::new());
+        while err.read_line(&mut line).unwrap() > 0 && line.trim_end() != want {
+            before.push_str(&line);
+            line.clear();
+        }
+        assert_eq!(line.trim_end(), want, "stderr ended first: {before}");
+        before
+    }
+
+    /// A run with no `--duration-s`, stopped by `signal` while the writer
+    /// still has a backlog: it exits 0, everything the reader pushed is in
+    /// the file, and the counters line is there and says which signal.
+    fn stops_cleanly_on(signal: &str, number: u64) {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("node_raw_book_diffs");
+        let dir = root.join("hourly").join("20261119");
+        fs::create_dir_all(&dir).unwrap();
+        let staged = t.path().join("staged");
+        fs::write(&staged, burst(300_000)).unwrap();
+        let out = t.path().join("obs.jsonl");
+        let (mut child, mut err, _pre) = spawn_ready(
+            bin()
+                .arg("node")
+                .arg(&root)
+                .arg("--out")
+                .arg(&out)
+                .args(["--detect", "poll", "--poll-us", "1000"])
+                .args(["--ring-records", "1048576"]),
+        );
+        let _guard = watchdog(&child);
+        fs::rename(&staged, dir.join("8")).unwrap();
+        // Signal as soon as the writer has started on the burst.
+        let start = Instant::now();
+        while lines_in(&out) == 0 {
+            assert!(start.elapsed() < Duration::from_secs(20), "nothing written");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        send(&child, signal);
+        let mut rest = String::new();
+        err.read_to_string(&mut rest).unwrap();
+        let status = child.wait().unwrap();
+        assert_eq!(status.code(), Some(0), "{status}: {rest}");
+        assert!(rest.contains(READER_STOPPED), "{rest}");
+        let c = counters(rest.as_bytes());
+        assert_eq!(c["stop_signal"], number, "{c}");
+        assert_eq!(c["ring_dropped"], 0, "{c}");
+        assert_eq!(c["written"], c["lines"], "the ring was drained: {c}");
+        let written = c["written"].as_u64().unwrap();
+        assert!(written > 0, "{c}");
+        let obs =
+            read_observations(std::io::BufReader::new(fs::File::open(&out).unwrap())).unwrap();
+        let heights: Vec<_> = obs.iter().map(|o| o.block_number.unwrap()).collect();
+        assert_eq!(
+            heights,
+            (0..written).collect::<Vec<_>>(),
+            "every record pushed is in the file, in order"
+        );
+    }
+
+    #[test]
+    fn sigterm_stops_reading_drains_the_ring_and_prints_the_counters() {
+        stops_cleanly_on("TERM", 15);
+    }
+
+    #[test]
+    fn sigint_stops_reading_drains_the_ring_and_prints_the_counters() {
+        stops_cleanly_on("INT", 2);
+    }
+
+    /// A run that ends at its deadline says no signal stopped it.
+    #[test]
+    fn a_run_that_ends_at_its_deadline_reports_no_stop_signal() {
+        let t = tempfile::tempdir().unwrap();
+        let out = bin()
+            .arg("node")
+            .arg(t.path())
+            .arg("--out")
+            .arg(t.path().join("obs.jsonl"))
+            .args(["--duration-s", "0"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let c = counters(&out.stderr);
+        assert!(c["stop_signal"].is_null(), "{c}");
+        assert!(c.get("stop_signal").is_some(), "the field is present: {c}");
+    }
+
+    /// A sleeping reader notices the signal within its 100 ms wait cap, not
+    /// at the end of a long `--poll-us` or `--rescan-ms`.
+    fn a_sleeping_reader_stops_promptly(detect: &str) {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("node_raw_book_diffs");
+        let dir = root.join("hourly").join("20261119");
+        fs::create_dir_all(&dir).unwrap();
+        // A followed file, so the rescan timer is the long one.
+        fs::write(dir.join("8"), "").unwrap();
+        let (mut child, mut err, _pre) = spawn_ready(
+            bin()
+                .arg("node")
+                .arg(&root)
+                .arg("--out")
+                .arg(t.path().join("obs.jsonl"))
+                .args(["--detect", detect, "--poll-us", "30000000"])
+                .args(["--rescan-ms", "30000"]),
+        );
+        let _guard = watchdog(&child);
+        // Let it reach its first long wait.
+        std::thread::sleep(Duration::from_millis(300));
+        let start = Instant::now();
+        send(&child, "TERM");
+        read_until(&mut err, READER_STOPPED);
+        let took = start.elapsed();
+        let mut rest = String::new();
+        err.read_to_string(&mut rest).unwrap();
+        let status = child.wait().unwrap();
+        assert_eq!(status.code(), Some(0), "{status}: {rest}");
+        assert_eq!(counters(rest.as_bytes())["stop_signal"], 15);
+        // The cap is 100 ms; the margin is for a loaded machine. Without the
+        // cap this is 30 s (or a kill).
+        assert!(took < Duration::from_secs(5), "stopped after {took:?}");
+    }
+
+    #[test]
+    fn a_long_poll_sleep_does_not_delay_the_stop() {
+        a_sleeping_reader_stops_promptly("poll");
+    }
+
+    #[test]
+    fn an_inotify_wait_does_not_delay_the_stop() {
+        // Off Linux this falls back to poll, which the other test covers.
+        a_sleeping_reader_stops_promptly("inotify");
+    }
+
+    /// The way out when the drain cannot finish (here: `--out` is a FIFO
+    /// nobody reads any more). The first signal stops the reader and warns;
+    /// the second ends the process at once with 128 + the signal number and
+    /// no counters line, which marks the run invalid.
+    #[test]
+    fn a_second_signal_forces_exit_while_the_drain_is_stuck() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("node_raw_book_diffs");
+        let dir = root.join("hourly").join("20261119");
+        fs::create_dir_all(&dir).unwrap();
+        let staged = t.path().join("staged");
+        // About 2.8 MB of output: far more than a pipe holds.
+        fs::write(&staged, burst(30_000)).unwrap();
+        let fifo = t.path().join("obs.fifo");
+        assert!(Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let mut child = bin()
+            .arg("node")
+            .arg(&root)
+            .arg("--out")
+            .arg(&fifo)
+            .args(["--detect", "poll", "--poll-us", "1000"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _guard = watchdog(&child);
+        // The binary's open of the FIFO waits for this reader.
+        let mut pipe = BufReader::new(fs::File::open(&fifo).unwrap());
+        let mut err = BufReader::new(child.stderr.take().unwrap());
+        read_until(&mut err, READY);
+        fs::rename(&staged, dir.join("8")).unwrap();
+        // Read a little, proving the writer is at work, then stop reading
+        // (the FIFO stays open, so the writer blocks instead of failing).
+        let mut line = String::new();
+        for _ in 0..100 {
+            line.clear();
+            assert!(pipe.read_line(&mut line).unwrap() > 0);
+        }
+        // Time for the reader to take in the rest of the 3.5 MB burst.
+        std::thread::sleep(Duration::from_millis(1000));
+        send(&child, "TERM");
+        let before = read_until(&mut err, READER_STOPPED);
+        let warning: serde_json::Value = serde_json::from_str(
+            before
+                .lines()
+                .find(|l| l.starts_with("{\"signal\""))
+                .unwrap_or_else(|| panic!("no signal line before the stop line: {before}")),
+        )
+        .unwrap();
+        assert_eq!(warning["signal"], 15);
+        assert!(
+            warning["note"].as_str().unwrap().contains("second signal"),
+            "{warning}"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the writer is stuck on the full FIFO, so the process is still there"
+        );
+        send(&child, "TERM");
+        let status = child.wait().unwrap();
+        assert_eq!(status.code(), Some(128 + 15), "{status}");
+        let mut rest = String::new();
+        err.read_to_string(&mut rest).unwrap();
+        assert!(!rest.contains("\"lines\""), "no counters line: {rest}");
+        drop(pipe);
+    }
+}
