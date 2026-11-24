@@ -4,15 +4,33 @@
 # Changes nothing. Each section goes to its own file; a missing tool is
 # recorded as "unavailable", never fatal. Attach the whole directory to the
 # benchmark run it describes (bench/results/<run>/host/).
+# The options are the script's own. A caller that runs `set -e` with SHELLOPTS
+# exported hands errexit to every bash it starts, and under errexit the first
+# tool that fails or file that cannot be read ends the capture instead of
+# being recorded (#83).
 set -uo pipefail
+set +e
 out="${1:-./host-capture-$(date -u +%Y%m%dT%H%M%SZ)}"
+# A capture that ends non-zero says so on stderr: its status, its directory,
+# the section it had reached and the command it ended on. A capture that works
+# prints nothing more, and none of this changes a file.
+section="start"
+on_exit() {
+  local rc=$? last="$BASH_COMMAND"
+  ((rc == 0)) && return 0
+  printf 'capture-host.sh: exit %s; directory: %s; last section: %s; last command: %s\n' \
+    "$rc" "$out" "$section" "$last" >&2
+}
+trap on_exit EXIT
 mkdir -p "$out"
 run() { # run NAME CMD...
   local name="$1"; shift
+  section="$name"
   { echo "\$ $*"; if command -v "$1" >/dev/null 2>&1; then "$@" 2>&1; echo "exit=$?"; else echo "unavailable: $1"; fi; } > "$out/$name.txt"
 }
 cat_files() { # cat_files NAME PATH...
   local name="$1"; shift
+  section="$name"
   for f in "$@"; do echo "== $f"; cat "$f" 2>&1; done > "$out/$name.txt"
 }
 date -u +%Y-%m-%dT%H:%M:%S.%NZ > "$out/captured_at.txt"
@@ -30,6 +48,7 @@ cat_files hugepages /proc/sys/vm/nr_hugepages /proc/meminfo
 cat_files sysctl-net /proc/sys/net/core/busy_poll /proc/sys/net/core/busy_read /proc/sys/net/core/netdev_budget /proc/sys/net/ipv4/tcp_low_latency
 cat_files clocksource /sys/devices/system/clocksource/clocksource0/current_clocksource /sys/devices/system/clocksource/clocksource0/available_clocksource
 cat_files irqs /proc/interrupts
+section="irq-affinity"
 for d in /proc/irq/[0-9]*; do echo "$(basename "$d") $(cat "$d/smp_affinity_list" 2>/dev/null)"; done > "$out/irq-affinity.txt"
 run chrony chronyc tracking
 run chrony-sources chronyc sources -v
