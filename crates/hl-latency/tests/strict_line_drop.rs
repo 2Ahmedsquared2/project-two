@@ -111,6 +111,7 @@ fn a_torn_line_of_a_multi_line_block_goes_and_the_block_stays() {
             strict_drop_incomplete: false,
             strict_drop_by_line: true,
             strict_shifted_first_arrival: 0,
+            ..StrictDrop::default()
         }
     );
     let p = pair(kept);

@@ -457,6 +457,25 @@ pub struct StrictDrop {
     /// Blocks that lost their earliest node line to the drop and kept a
     /// later one, so they pair on a later stamp. By-line drop only.
     pub strict_shifted_first_arrival: u64,
+    /// Failure lines read that the scan did not accept. Each is either a
+    /// line hl-capture stamped after its strict parse accepted it (its
+    /// `scan_fallbacks`) or a line it never stamped (its `bad_lines`); the
+    /// strict pass does not say which.
+    pub strict_fallback_failures_listed: u64,
+    /// Of those, the ones with no node observation at their line: lines
+    /// hl-capture did not stamp. Over the files a capture covered this is
+    /// expected to equal its `bad_lines`; a difference is worth a look, and
+    /// is not an error (the two can cover different spans). By-line drop
+    /// only.
+    pub strict_fallback_failures_unmatched: u64,
+    /// Node observations removed because the strict pass failed their line
+    /// and the scan had not accepted it: stamped scan-fallback lines. Not in
+    /// `strict_dropped_observations`. By-line drop only.
+    pub strict_dropped_fallback_lines: u64,
+    /// The drop was by block and the strict pass listed failures the scan
+    /// did not accept: a stamped one cannot be found without its offset, so
+    /// its stamp may still be in the distribution.
+    pub strict_fallback_lines_unchecked: bool,
 }
 
 /// Why observations and `hl-strict-pass` output cannot be matched by line.
