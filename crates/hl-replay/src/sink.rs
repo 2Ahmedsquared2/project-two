@@ -165,7 +165,15 @@ fn accept_one(
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 after_would_block();
                 if stop.load(Ordering::Acquire) {
-                    return Ok(None);
+                    // The empty accept above may predate a connection made
+                    // before stop was set: `finish()` sets stop only after
+                    // any earlier `connect()` returned, so that connection
+                    // is in the accept queue by now. Look once more.
+                    return match listener.accept() {
+                        Ok((s, _)) => Ok(Some(s)),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+                        Err(e) => Err(e),
+                    };
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
