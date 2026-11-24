@@ -17,8 +17,19 @@
 //! unsupported action or leg, no oid hint differed from our counter, every
 //! response equals native's and our diff sequence equals native's. Leg
 //! pre-rejects are derived from the action and static metadata only. The
-//! acting user is taken from native's response (`user`): signature recovery
-//! and agent-to-master mapping are not implemented (input, not outcome).
+//! acting user is taken from native's response (`user`): agent-to-master
+//! mapping is not implemented (input, not outcome).
+//!
+//! `--signers FILE` (lane 2's `signers_<height>.txt`, one address per line;
+//! pass a `.gz` through `<(zcat …)`) turns on the unknown-wallet rule: each
+//! L1 action's signer is recovered from its own signature (mainnet phantom
+//! agent) and, when it is not in the set, the action is a noop answered
+//! `User or API Wallet {signer} does not exist.` An `approveAgent` native
+//! accepted adds its agent to the set (acceptance read from native: input).
+//! User-signed actions (`signatureChainId`) and `multiSig` are not ruled.
+//! The set is the seed plus in-window accepted `approveAgent`s; users created
+//! in the window (deposits, transfers) are not added. `--wallet-log FILE`
+//! writes every action where the rule and native disagree.
 #![allow(
     missing_docs,
     clippy::unwrap_used,
@@ -36,7 +47,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write as _};
 use std::time::Instant;
 
 use hl_exec::decimal::parse_fixed;
@@ -46,6 +57,9 @@ use hl_exec::{
     UserAction,
 };
 use serde_json::Value;
+
+#[path = "replay_support/signers.rs"]
+mod signers;
 
 #[derive(Clone, Debug)]
 struct AssetInfo {
@@ -264,6 +278,19 @@ struct Block {
     bundle_lens: Vec<u32>,
     /// Per action, its range in `assets`.
     act_assets: Vec<(usize, usize)>,
+    /// Per action, the recovered signer the unknown-wallet rule found absent
+    /// (kind 5; `None` for every other action).
+    unknown_signer: Vec<Option<[u8; 20]>>,
+    /// Per action, the recovered L1 signer when the rule was applied.
+    signer: Vec<Option<[u8; 20]>>,
+}
+
+/// The unknown-wallet rule's state across blocks.
+struct WalletRule {
+    set: signers::Signers,
+    ctx: secp256k1::Secp256k1<secp256k1::VerifyOnly>,
+    not_recovered: usize,
+    agents_added: usize,
 }
 
 impl Block {
@@ -284,7 +311,7 @@ impl Block {
                     user: self.users[i],
                     modifies: &self.modifies[j],
                 },
-                3 => UserAction::Noop,
+                3 | 5 => UserAction::Noop,
                 _ => UserAction::Unsupported("x"),
             })
             .collect()
@@ -311,8 +338,10 @@ fn time_ms(s: &str) -> u64 {
     (((days * 24 + h) * 60 + mi) * 60 + se) as u64 * 1000 + ms as u64
 }
 
-fn decode_block(meta: &Meta, line: &str) -> Block {
+fn decode_block(meta: &Meta, line: &str, mut rule: Option<&mut WalletRule>) -> Block {
     let v: Value = serde_json::from_str(line).unwrap();
+    let l1 = rule.as_ref().map(|_| signers::signed_actions(line));
+    let mut act_no = 0usize;
     let ab = &v["abci_block"];
     let mut b = Block {
         height: v["height"].as_u64().unwrap(),
@@ -397,6 +426,38 @@ fn decode_block(meta: &Meta, line: &str) -> Block {
                 _ => 4,
             };
             let kind = if unsupported { 4 } else { kind };
+            // Unknown-wallet rule: a signer outside the set makes the whole
+            // action a noop with native's error, whatever its type.
+            let mut unknown = None;
+            let mut ruled = None;
+            if let (Some(r), Some(l1)) = (rule.as_deref_mut(), l1.as_ref()) {
+                let user_signed = a.get("signatureChainId").is_some() || t == "multiSig";
+                if !user_signed && !expired {
+                    match l1[act_no].recover(&r.ctx, signers::MAINNET) {
+                        Some(s) => {
+                            ruled = Some(s);
+                            if !r.set.exists(&s) {
+                                unknown = Some(s);
+                            }
+                        }
+                        None => r.not_recovered += 1,
+                    }
+                }
+                if t == "approveAgent" && b.native.last().is_some_and(|x| x["status"] == "ok") {
+                    if let Some(ag) = a["agentAddress"].as_str() {
+                        r.agents_added += usize::from(r.set.add_hex(ag));
+                    }
+                }
+            }
+            act_no += 1;
+            let kind = if unknown.is_some() {
+                b.assets.truncate(a0);
+                5
+            } else {
+                kind
+            };
+            b.unknown_signer.push(unknown);
+            b.signer.push(ruled);
             b.act_assets.push((a0, b.assets.len()));
             b.acts.push((
                 kind,
@@ -545,6 +606,10 @@ fn response_json(meta: &Meta, b: &Block, i: usize, st: &[OrderStatus], expired: 
             }
         }
         3 => serde_json::json!({"status":"ok","response":{"type":"default"}}),
+        5 => serde_json::json!({"status":"err","response":format!(
+            "User or API Wallet {} does not exist.",
+            signers::addr_hex(&b.unknown_signer[i].unwrap())
+        )}),
         _ => Value::Null,
     }
 }
@@ -695,6 +760,179 @@ fn load_seed(meta: &mut Meta, path: &str) -> Seed {
     }
 }
 
+/// Book kind of an internal asset id, as `load_meta` and `add_outcome` assign
+/// them: perp 0..10000 and 100000.., spot 10000..100000, outcome 1e8 + E.
+fn kind(a: Asset) -> &'static str {
+    if a >= OUTCOME_ASSET_BASE {
+        "outcome"
+    } else if (10_000..100_000).contains(&a) {
+        "spot"
+    } else {
+        "perp"
+    }
+}
+
+/// One resting order as compared at the end: (px, oid, user, sz).
+type Leg = (Px, Oid, User, Sz);
+
+/// Compare the engine's books after the last replayed block with an l4so
+/// reference taken at that height. Covers only books both sides hold (the
+/// seed's set); `next_oid` in a reference built from a books cut is max
+/// resting oid + 1, a lower bound, so only `>=` is reported. Per side, legs
+/// are compared in queue order (levels best first, the reference's file
+/// order within a level) and, separately, as a set.
+fn end_state_check(e: &Engine, meta_dir: &str, path: &str, last_seen: u64) {
+    let mut meta = load_meta(meta_dir);
+    let r = load_seed(&mut meta, path);
+    if r.height != last_seen {
+        println!(
+            "end-state check NOT RUN: replay ended at height {last_seen}, reference {path} is at {}",
+            r.height
+        );
+        return;
+    }
+    let mut want: BTreeMap<Asset, [Vec<Leg>; 2]> = BTreeMap::new();
+    for a in &r.seeded {
+        want.entry(*a).or_default();
+    }
+    for o in &r.orders {
+        let si = usize::from(o.side == Side::Ask);
+        want.entry(o.asset).or_default()[si].push((o.px, o.oid, o.user, o.sz));
+    }
+    for v in want.values_mut() {
+        // Best first; a stable sort keeps the file's order within a level.
+        v[0].sort_by_key(|l| std::cmp::Reverse(l.0));
+        v[1].sort_by_key(|l| l.0);
+    }
+    // Coins whose book mapping is carried over, not confirmed by a surviving
+    // oid (`--unconfirmed "#E,#E,.."`): tallied apart, since a difference
+    // there may be the map, not the engine.
+    let unconfirmed: std::collections::HashSet<Asset> = arg("--unconfirmed")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|c| meta.by_name.get(c.trim()).copied())
+        .collect();
+    // Outcome coins whose outcome settled or was created inside the window
+    // (`--window-changed "#E,#E,.."`): the engine does not model the outcome
+    // lifecycle, so they are tallied apart and are never engine findings.
+    let changed: std::collections::HashSet<Asset> = arg("--window-changed")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|c| {
+            let c = c.trim();
+            meta.by_name.get(c).copied().or_else(|| meta.add_outcome(c))
+        })
+        .collect();
+    let label = |a: Asset| {
+        if changed.contains(&a) {
+            "outcome (settled or created in window)"
+        } else if unconfirmed.contains(&a) {
+            "outcome (map unconfirmed)"
+        } else {
+            kind(a)
+        }
+    };
+    println!("end-state check at height {last_seen} against {path} (books both sides hold only):");
+    let mut tally: BTreeMap<&str, [usize; 4]> = BTreeMap::new();
+    let mut shown = 0usize;
+    for (a, w) in &want {
+        let t = tally.entry(label(*a)).or_default();
+        let Some(b) = e.book(*a) else {
+            t[3] += 1;
+            continue;
+        };
+        let mut equal = true;
+        let mut same_set = true;
+        for (si, side) in [(0usize, Side::Bid), (1, Side::Ask)] {
+            let got: Vec<Leg> = b
+                .levels(side)
+                .flat_map(|px| b.queue(side, px).map(|n| (n.px, n.oid, n.user, n.sz)))
+                .collect();
+            if got == w[si] {
+                continue;
+            }
+            equal = false;
+            let key = |l: &Leg| (l.1, l.0, l.3);
+            let mut g: Vec<_> = got.iter().map(key).collect();
+            let mut x: Vec<_> = w[si].iter().map(key).collect();
+            g.sort_unstable();
+            x.sort_unstable();
+            same_set &= g == x;
+            if shown < 20 {
+                shown += 1;
+                let i = got
+                    .iter()
+                    .zip(&w[si])
+                    .position(|(p, q)| p != q)
+                    .unwrap_or(got.len().min(w[si].len()));
+                println!(
+                    "  differs {} asset {a} {side:?}: ours {} legs, reference {}; first differing #{i}: ours {:?} reference {:?}",
+                    label(*a),
+                    got.len(),
+                    w[si].len(),
+                    got.get(i),
+                    w[si].get(i)
+                );
+            }
+        }
+        if equal {
+            t[0] += 1;
+        } else if same_set {
+            t[1] += 1;
+        } else {
+            t[2] += 1;
+        }
+    }
+    // Books the engine holds that the reference lacks: listed as "not in
+    // reference", never as differences.
+    let mut absent: BTreeMap<&str, [usize; 2]> = BTreeMap::new();
+    for b in e.books() {
+        let a = b.asset();
+        if want.contains_key(&a) {
+            continue;
+        }
+        let n = [Side::Bid, Side::Ask]
+            .into_iter()
+            .map(|s| b.levels(s).map(|px| b.queue(s, px).count()).sum::<usize>())
+            .sum::<usize>();
+        let t = absent.entry(label(a)).or_default();
+        t[0] += 1;
+        t[1] += n;
+    }
+    for (k, t) in &tally {
+        println!(
+            "  {k}: {} equal, {} same orders in another queue order, {} differing, {} missing from the engine",
+            t[0], t[1], t[2], t[3]
+        );
+    }
+    for (k, t) in &absent {
+        println!(
+            "  {k}: {} engine books not in reference ({} resting orders), not compared",
+            t[0], t[1]
+        );
+    }
+    let ours = e.next_oid().0;
+    // A counter read from the state at the reference height (`--ref-next-oid`)
+    // is exact, unlike the books cut's max resting oid + 1.
+    if let Some(n) = arg("--ref-next-oid").and_then(|s| s.parse::<u64>().ok()) {
+        println!(
+            "  next_oid (read): ours {ours}, reference {n}: {}",
+            if ours == n {
+                "equal".to_owned()
+            } else {
+                format!("ours - reference = {}", i128::from(ours) - i128::from(n))
+            }
+        );
+    }
+    match r.next_oid {
+        Some(n) => println!(
+            "  next_oid: ours {ours}, reference {n} (lower bound when inferred): ours {} it",
+            if ours >= n { ">=" } else { "<" }
+        ),
+        None => println!("  next_oid: ours {ours}, reference has none"),
+    }
+}
+
 fn arg(name: &str) -> Option<String> {
     let a: Vec<String> = std::env::args().collect();
     a.iter()
@@ -786,6 +1024,26 @@ fn main() {
             *ent = (*ent).max(m);
         }
     }
+    let mut wallet_rule = arg("--signers").map(|p| {
+        let set = signers::Signers::from_reader(BufReader::new(File::open(&p).unwrap()));
+        eprintln!("signers: {} addresses from {p}", set.len());
+        WalletRule {
+            set,
+            ctx: secp256k1::Secp256k1::verification_only(),
+            not_recovered: 0,
+            agents_added: 0,
+        }
+    });
+    // Unknown-wallet rule tallies over counted blocks: (native says absent,
+    // we said absent), native absent only, we absent only.
+    let (mut uw_both, mut uw_missed, mut uw_false) = (0usize, 0usize, 0usize);
+    // `--wallet-log FILE`: every action where the rule and native disagree
+    // (height, action index, type, recovered signer or -, our verdict, native).
+    let mut wallet_log = arg("--wallet-log").map(|p| {
+        let mut w = std::io::BufWriter::new(File::create(p).unwrap());
+        writeln!(w, "height\tact\ttype\tsigner\tours\tnative").unwrap();
+        w
+    });
     let mut k = 0usize;
     // (height, verdict): "reproduced" or the block's mismatch classes.
     let mut verdicts: Vec<(u64, String)> = Vec::new();
@@ -800,7 +1058,7 @@ fn main() {
         if n >= max {
             break;
         }
-        let b = &decode_block(&meta, &line.unwrap());
+        let b = &decode_block(&meta, &line.unwrap(), wallet_rule.as_mut());
         if b.height <= seed_h {
             continue;
         }
@@ -839,6 +1097,7 @@ fn main() {
         }
         let mut resp_bad = None;
         let mut unknown_wallet = false;
+        let mut uw_class: Option<&str> = None;
         for i in 0..b.acts.len() {
             let expired = out.responses[i].expired;
             if b.acts[i].0 == 4 && !expired {
@@ -856,6 +1115,46 @@ fn main() {
                 continue;
             }
             let ours = response_json(&meta, b, i, out.statuses_of(i), expired);
+            let native_unknown = b.native[i]["status"] == "err"
+                && b.native[i]["response"].as_str().is_some_and(|r| {
+                    r.starts_with("User or API Wallet ") && r.ends_with(" does not exist.")
+                });
+            if wallet_rule.is_some() {
+                let ours_unknown = b.acts[i].0 == 5;
+                match (native_unknown, ours_unknown) {
+                    (true, true) => uw_both += 1,
+                    (true, false) => uw_missed += 1,
+                    (false, true) => uw_false += 1,
+                    (false, false) => {}
+                }
+                if ours != b.native[i] && (native_unknown || ours_unknown) {
+                    if let Some(w) = wallet_log.as_mut() {
+                        writeln!(
+                            w,
+                            "{}\t{i}\t{}\t{}\t{}\t{}",
+                            b.height,
+                            b.types[i],
+                            b.signer[i].map_or_else(|| "-".into(), |a| signers::addr_hex(&a)),
+                            if ours_unknown { "absent" } else { "present" },
+                            b.native[i]
+                        )
+                        .unwrap();
+                    }
+                    // A rule miss gets its own class; keep comparing.
+                    uw_class.get_or_insert(if !ours_unknown {
+                        if b.signer[i].is_some() {
+                            "resp:unknown-wallet-missed"
+                        } else {
+                            "resp:unknown-wallet-unruled"
+                        }
+                    } else if native_unknown {
+                        "resp:unknown-wallet-text"
+                    } else {
+                        "resp:unknown-wallet-false"
+                    });
+                    continue;
+                }
+            }
             // Native rejects an action whose signer is not a known user or
             // agent (an account-side check the engine does not model). It
             // keeps the block out of k under its own class; keep comparing.
@@ -878,6 +1177,9 @@ fn main() {
         }
         if unknown_wallet {
             why.push("resp:unknown-wallet".into());
+        }
+        if let Some(c) = uw_class {
+            why.push(c.into());
         }
         if let Some(ex) = resp_bad {
             let cls = if ex.contains("Post only") {
@@ -972,6 +1274,14 @@ fn main() {
         }
     }
     println!("blocks N={n} heights {first_seen}..={last_seen}  reproduced k={k}");
+    if let Some(r) = &wallet_rule {
+        println!(
+            "unknown-wallet rule (actions the comparison reached): both absent {uw_both}, native absent only {uw_missed}, ours absent only {uw_false}; L1 signatures not recovered {}; agents added {}; set now {}",
+            r.not_recovered,
+            r.agents_added,
+            r.set.len()
+        );
+    }
     // The engine's own score: blocks whose every action and native diff is on
     // a book the seed holds (and, second, with no action the engine skips).
     let held = |v: &str| !v.contains("unseeded-book") && !v.contains("diffs:unmodelled-coin");
@@ -983,6 +1293,9 @@ fn main() {
     println!(
         "held books only: k={k} of N={n_held}; and no unsupported action: k={k} of N={n_held_modelled}"
     );
+    if let Some(p) = arg("--end-state") {
+        end_state_check(&e, &arg("--meta").expect("--meta"), &p, last_seen);
+    }
     if let Some(p) = arg("--heights-out") {
         let body = verdicts
             .iter()

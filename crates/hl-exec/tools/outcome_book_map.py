@@ -14,9 +14,16 @@ itself carries E, so the mapping is read from data:
      but which has no oid hit of its own gets that neighbour, only if the
      neighbour book is spotMeta-unlisted and not already taken.
 
-Coins with neither are left out (the replay counts them as unseeded-book).
+  3. state (optional STATE_MAP_JSON): {"#E": spot_book_index} read from the
+     native state's own chain (outcome E -> side token T = ots[E].s[side].t
+     -> token_infos[T].spots[0] = spot pair J = spot_books[J].asset). Every
+     coin it shares with rules 1-2 must agree (else abort); a coin they left
+     out gets its book from here if that book is unlisted and not taken.
 
-Usage: outcome_book_map.py SPOT_CUT_JSON[.gz] META_DIR ORDER_STATUSES_JSONL OUT_JSON
+Coins with none of these are left out (the replay counts them as
+unseeded-book).
+
+Usage: outcome_book_map.py SPOT_CUT_JSON[.gz] META_DIR ORDER_STATUSES_JSONL OUT_JSON [STATE_MAP_JSON]
 """
 
 import collections
@@ -31,6 +38,9 @@ STATUS = re.compile(r'"coin":"(#\d+)","side":"[AB]","limitPx":"[^"]+","sz":"[^"]
 
 def main():
     cut, meta_dir, statuses, dst = sys.argv[1:5]
+    state = {}
+    if len(sys.argv) > 5:
+        state = {c: int(a) for c, a in json.load(open(sys.argv[5])).items()}
     _, spot_names = load_names(meta_dir)
     oid_book = {}
     unlisted = set()
@@ -78,11 +88,24 @@ def main():
             if a in unlisted and a not in taken:
                 out[coin] = {"book": a, "by": "pair"}
                 taken[a] += 1
+    agree = 0
+    for coin, a in sorted(state.items()):
+        if coin in out:
+            if out[coin]["book"] != a:
+                raise SystemExit(f"{coin}: state says book {a}, {out[coin]['by']} says {out[coin]['book']}")
+            agree += 1
+        elif coin in coins:
+            if a not in unlisted or a in taken:
+                raise SystemExit(f"{coin}: state book {a} is listed or already taken")
+            out[coin] = {"book": a, "by": "state"}
+            taken[a] += 1
     stats = {
         "coins": len(coins),
         "by_oid": sum(v["by"] == "oid" for v in out.values()),
         "by_pair": sum(v["by"] == "pair" for v in out.values()),
         "pairs_checked": pairs,
+        "by_state": sum(v["by"] == "state" for v in out.values()),
+        "state_agrees": agree,
         "unmapped": sorted(coins - set(out)),
     }
     json.dump({"coins": out, "stats": stats}, open(dst, "w"), indent=1, sort_keys=True)
