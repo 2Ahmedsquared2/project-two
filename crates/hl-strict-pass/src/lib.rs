@@ -188,7 +188,13 @@ impl StrictPass {
         // and the rest is skipped).
         let (mut number, mut offset, mut len, mut oversized) = (1u64, 0u64, 0u64, false);
         loop {
-            let buf = reader.fill_buf()?;
+            let buf = match reader.fill_buf() {
+                Ok(buf) => buf,
+                // A signal arrived during the read (EINTR): nothing was
+                // consumed, so ask again, as `Read::read_to_end` does.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
             if buf.is_empty() {
                 break;
             }
@@ -360,12 +366,15 @@ struct Top {
 /// 2. [`hl_latency::parse_node_line`] accepts it: the whole line is one
 ///    JSON value, an object whose `block_time` is a timestamp string and
 ///    whose `block_number` is a `u64`;
-/// 3. it has the documented top level `{local_time, block_time,
+/// 3. if [`hl_latency::scan_node_header`] answers for it, it gives the same
+///    block time and height. The scan trusts the first `block_time` and
+///    `block_number` and the strict parse the last, so this is what fails a
+///    line that repeats one with another value, and its reason gives both
+///    readings: what `hl-capture` stamped and what the line says;
+/// 4. it has the documented top level `{local_time, block_time,
 ///    block_number, events}` (`docs/NODE_SETUP.md`), each key once,
 ///    `local_time` a string and `events` an array. What the events hold is
-///    not checked;
-/// 4. if [`hl_latency::scan_node_header`] answers for it, it gives the same
-///    block time and height.
+///    not checked. A key repeated with the same value fails here.
 pub fn check_record(line: &[u8]) -> Result<(u64, u64), String> {
     let text = std::str::from_utf8(line).map_err(|e| format!("invalid UTF-8: {e}"))?;
     let obs = parse_node_line(text, 0).map_err(|e| e.to_string())?;
@@ -374,14 +383,16 @@ pub fn check_record(line: &[u8]) -> Result<(u64, u64), String> {
         obs.block_number
             .ok_or_else(|| "block_number missing".to_owned())?,
     );
-    serde_json::from_str::<Top>(text).map_err(|e| format!("schema: {e}"))?;
-    match scan_node_header(CompleteLine::assume_newline_seen(line)) {
-        Some(scan) if scan != strict => Err(format!(
-            "header scan reads block {} at {} ms, strict parse block {} at {} ms",
-            scan.1, scan.0, strict.1, strict.0
-        )),
-        _ => Ok(strict),
+    if let Some(scan) = scan_node_header(CompleteLine::assume_newline_seen(line)) {
+        if scan != strict {
+            return Err(format!(
+                "header scan reads block {} at {} ms, strict parse block {} at {} ms",
+                scan.1, scan.0, strict.1, strict.0
+            ));
+        }
     }
+    serde_json::from_str::<Top>(text).map_err(|e| format!("schema: {e}"))?;
+    Ok(strict)
 }
 
 /// Deepest directory level searched below the root, as in `hl-capture`.
