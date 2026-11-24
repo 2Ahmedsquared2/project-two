@@ -218,16 +218,33 @@ impl HostFacts {
     /// list) is read, as an empty list: the kernel accepts it and sets no
     /// bit (Linux v6.8 `lib/bitmap-str.c`: `bitmap_check_region` refuses only
     /// `off > group_len`, and `bitmap_set_region` sets `min(.., off)` bits).
+    ///
+    /// Empty parts are skipped and a key with nothing after it is an empty
+    /// list, as in the kernel: `bitmap_parselist` calls `bitmap_find_region`
+    /// before each region, which steps over any run of commas and ends the
+    /// list with success at the terminator, so `2,,3`, `,2,3` and `2,3,` name
+    /// CPUs 2 and 3 and an empty string names none (v6.8 `lib/bitmap-str.c`;
+    /// `nohz_full=` and `isolcpus=` reach it through `housekeeping_setup` in
+    /// `kernel/sched/isolation.c`, `rcu_nocbs=` through `rcu_nocb_setup` in
+    /// `kernel/rcu/tree_nocb.h`, each by `cpulist_parse`).
     fn cpu_list(&self, key: &str) -> Option<CpuList> {
         let mut ranges = Vec::new();
         let mut all = false;
+        // `isolcpus=` alone takes flags, and only before its list: the kernel
+        // takes them while the value starts with a letter and hands the rest
+        // to `cpulist_parse` whole (v6.8 `housekeeping_isolcpus_setup`), so
+        // an empty part or a CPU ends them.
+        let mut flags = key == "isolcpus";
         for part in self.cmdline_value(key)?.split(',') {
-            if part.eq_ignore_ascii_case("all") {
-                all = true;
+            if flags && ISOLCPUS_FLAGS.contains(&part) {
                 continue;
             }
-            // `isolcpus=` alone takes flags before its list.
-            if key == "isolcpus" && ISOLCPUS_FLAGS.contains(&part) {
+            flags = false;
+            if part.is_empty() {
+                continue;
+            }
+            if part.eq_ignore_ascii_case("all") {
+                all = true;
                 continue;
             }
             match CpuRange::parse(part) {
@@ -243,10 +260,20 @@ impl HostFacts {
     }
 
     /// A parsed kernel command-line value the script wrote as `key: value`.
+    /// A key set with nothing after it (`nohz_full=`) is written `key: `, and
+    /// read as the empty value with or without that trailing space: a
+    /// section's body is stored without its trailing whitespace.
     fn cmdline_value(&self, key: &str) -> Option<&str> {
         self.section("kernel-cmdline")?
             .lines()
-            .find_map(|l| l.strip_prefix(key)?.strip_prefix(": "))
+            .find_map(|l| {
+                let value = l.strip_prefix(key)?.strip_prefix(':')?;
+                if value.is_empty() {
+                    Some(value)
+                } else {
+                    value.strip_prefix(' ')
+                }
+            })
             .filter(|v| *v != "not set")
     }
 
