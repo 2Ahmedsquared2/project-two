@@ -201,10 +201,18 @@ pub struct NodeTailer {
     backlogged: bool,
     rescan_due: bool,
     last_height: Option<u64>,
-    /// The latest switch, until [`NodeTailer::take_switch`] takes it.
-    switch: Option<Switch>,
-    /// True from a switch until the new file has been read to its end once.
-    switching: bool,
+    switch: SwitchState,
+}
+
+/// Where the report of the latest switch stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitchState {
+    /// Nothing to report.
+    None,
+    /// The new file has not been read to its end yet: still counting.
+    Reading(Switch),
+    /// Complete; waits for [`NodeTailer::take_switch`].
+    Ready(Switch),
 }
 
 impl NodeTailer {
@@ -230,8 +238,7 @@ impl NodeTailer {
             backlogged: false,
             rescan_due: true,
             last_height: None,
-            switch: None,
-            switching: false,
+            switch: SwitchState::None,
         }
     }
 
@@ -271,7 +278,7 @@ impl NodeTailer {
             // rescan that is due stays due.
             return Ok(());
         }
-        self.switching = false;
+        self.finish_switch();
         if !std::mem::take(&mut self.rescan_due) {
             return Ok(());
         }
@@ -296,8 +303,7 @@ impl NodeTailer {
                     // History is not an arrival.
                     file.seek(SeekFrom::End(0))?;
                 } else {
-                    self.switch = Some(Switch::default());
-                    self.switching = true;
+                    self.switch = SwitchState::Reading(Switch::default());
                 }
                 self.current = Some(Current {
                     path: newest,
@@ -306,7 +312,7 @@ impl NodeTailer {
                 });
                 self.drain(clock, sink, &mut budget)?;
                 if !self.backlogged {
-                    self.switching = false;
+                    self.finish_switch();
                 }
             }
         }
@@ -325,7 +331,10 @@ impl NodeTailer {
         let mut parser = Parser {
             stats: &mut self.stats,
             last_height: &mut self.last_height,
-            switch: self.switch.as_mut().filter(|_| self.switching),
+            switch: match &mut self.switch {
+                SwitchState::Reading(sw) => Some(sw),
+                SwitchState::None | SwitchState::Ready(_) => None,
+            },
             sink,
         };
         loop {
@@ -360,10 +369,18 @@ impl NodeTailer {
     /// The most recent switch to a file that was not yet reported, once the
     /// new file has been read to its end, if any.
     pub fn take_switch(&mut self) -> Option<Switch> {
-        if self.switching {
+        let SwitchState::Ready(sw) = self.switch else {
             return None;
+        };
+        self.switch = SwitchState::None;
+        Some(sw)
+    }
+
+    /// The file switched to has been read to its end: its report is complete.
+    fn finish_switch(&mut self) {
+        if let SwitchState::Reading(sw) = self.switch {
+            self.switch = SwitchState::Ready(sw);
         }
-        self.switch.take()
     }
 
     /// True when the last [`Self::poll`] stopped at its read budget with

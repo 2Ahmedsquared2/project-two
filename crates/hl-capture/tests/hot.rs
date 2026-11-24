@@ -43,7 +43,7 @@ fn poll_into_walks_the_directory_only_when_asked() {
     let t = tempfile::tempdir().unwrap();
     let old = touch(t.path(), "20261119", "8");
     let mut tail = NodeTailer::new(t.path());
-    assert!(poll(&mut tail).is_empty());
+    assert_eq!(poll(&mut tail), Vec::<u64>::new());
     assert_eq!(tail.current_file(), Some(old.as_path()));
     assert_eq!(tail.stats().rescans, 1, "the first poll looks for a file");
 
@@ -52,7 +52,7 @@ fn poll_into_walks_the_directory_only_when_asked() {
     append(&old, &node_line(10));
     assert_eq!(poll(&mut tail), vec![10], "the current file is still read");
     for _ in 0..50 {
-        assert!(poll(&mut tail).is_empty());
+        assert_eq!(poll(&mut tail), Vec::<u64>::new());
     }
     assert_eq!(tail.stats().rescans, 1, "no walk on the poll path");
     assert_eq!(tail.current_file(), Some(old.as_path()));
