@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 hl-latency = { path = "../hl-latency", version = "0.1.0" }
+memchr = "2"
 serde_json = { workspace = true }
 
 [dev-dependencies]

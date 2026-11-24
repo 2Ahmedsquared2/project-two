@@ -4,9 +4,9 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use hl_latency::{parse_node_line, Observation};
+use hl_latency::{parse_node_line, scan_node_header, CompleteLine, Observation, Source};
 
-use crate::lines::{LineSplitter, StampedLine};
+use crate::lines::{LineSink, LineSplitter};
 
 /// Sort key of an hourly file path `.../{YYYYMMDD}/{H}`: `(date, hour)`.
 /// `None` when the last two components are not a date and an hour 0..=23.
@@ -64,13 +64,27 @@ pub fn newest_hourly_file(root: &Path) -> std::io::Result<Option<PathBuf>> {
     }
 }
 
+/// Receives each observation a [`NodeTailer`] completes, in file order.
+pub trait ObservationSink {
+    /// One stamped arrival.
+    fn observe(&mut self, obs: Observation);
+}
+
+/// Collects observations; grows on the heap. For tests and cold callers.
+impl ObservationSink for Vec<Observation> {
+    fn observe(&mut self, obs: Observation) {
+        self.push(obs);
+    }
+}
+
 /// Counters a run reports beside its observations.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TailStats {
-    /// Lines parsed into observations.
+    /// Lines turned into observations.
     pub lines: u64,
-    /// Lines `hl_latency::parse_node_line` rejected, plus unfinished lines
-    /// abandoned at a rotation (counted, not fatal).
+    /// Lines that are not node lines (both `hl_latency::scan_node_header`
+    /// and `hl_latency::parse_node_line` rejected them), plus unfinished
+    /// lines abandoned at a rotation (counted, not fatal).
     pub bad_lines: u64,
     /// Switches to a newer hourly file.
     pub rotations: u64,
@@ -79,6 +93,38 @@ pub struct TailStats {
     /// Lines dropped for exceeding the line cap (see
     /// [`NodeTailer::with_max_line`]); not included in `bad_lines`.
     pub oversized_lines: u64,
+}
+
+/// Turns each complete line into an observation, in place.
+struct Parser<'a, S: ?Sized> {
+    stats: &'a mut TailStats,
+    sink: &'a mut S,
+}
+
+impl<S: ObservationSink + ?Sized> LineSink for Parser<'_, S> {
+    fn line(&mut self, bytes: &[u8], recv_ns: u64) {
+        // The splitter only hands out lines whose newline it has seen.
+        let line = CompleteLine::assume_newline_seen(bytes);
+        let obs = match scan_node_header(line) {
+            Some((block_time_ms, block_number)) => Some(Observation {
+                source: Source::Node,
+                block_time_ms,
+                block_number: Some(block_number),
+                recv_ns,
+            }),
+            // Not hl-node's exact header shape: let the strict parse decide.
+            None => std::str::from_utf8(bytes)
+                .ok()
+                .and_then(|s| parse_node_line(s, recv_ns).ok()),
+        };
+        match obs {
+            Some(o) => {
+                self.stats.lines += 1;
+                self.sink.observe(o);
+            }
+            None => self.stats.bad_lines += 1,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -105,7 +151,6 @@ pub struct NodeTailer {
     polled: bool,
     splitter: LineSplitter,
     buf: Vec<u8>,
-    lines: Vec<StampedLine>,
     stats: TailStats,
     backlogged: bool,
 }
@@ -129,27 +174,41 @@ impl NodeTailer {
             polled: false,
             splitter: LineSplitter::with_max_line(max_line),
             buf: vec![0; BUF],
-            lines: Vec::new(),
             stats: TailStats::default(),
             backlogged: false,
         }
     }
 
-    /// Reads what is available now, at most [`MAX_READS_PER_POLL`] reads,
-    /// and returns the observations it completed. `clock` is called once
-    /// right after each `read` returns data, before that data is parsed.
-    /// When the budget runs out, [`Self::backlogged`] is true and the rest
-    /// (including any switch to a newer file) waits for the next poll.
+    /// [`Self::poll_into`] collected into a new `Vec`: allocates, so it is
+    /// for tests and cold callers, not for a capture loop.
     pub fn poll(&mut self, clock: &mut dyn FnMut() -> u64) -> std::io::Result<Vec<Observation>> {
+        let mut out = Vec::new();
+        self.poll_into(clock, &mut out)?;
+        Ok(out)
+    }
+
+    /// Reads what is available now, at most [`MAX_READS_PER_POLL`] reads,
+    /// and hands each observation it completes to `sink`. `clock` is called
+    /// once right after each `read` returns data, before that data is
+    /// parsed. When the budget runs out, [`Self::backlogged`] is true and
+    /// the rest (including any switch to a newer file) waits for the next
+    /// poll.
+    ///
+    /// A poll that finds no newer file does not allocate: lines are parsed
+    /// in place, from the read buffer or the splitter's reserved buffer.
+    pub fn poll_into<S: ObservationSink + ?Sized>(
+        &mut self,
+        clock: &mut dyn FnMut() -> u64,
+        sink: &mut S,
+    ) -> std::io::Result<()> {
         let first = !self.polled;
         self.polled = true;
-        let mut out = Vec::new();
         let mut budget = MAX_READS_PER_POLL;
         self.backlogged = false;
-        self.drain(clock, &mut out, &mut budget)?;
+        self.drain(clock, sink, &mut budget)?;
         if self.backlogged {
             // Finish the current file before looking for a newer one.
-            return Ok(out);
+            return Ok(());
         }
         if let Some(newest) = newest_hourly_file(&self.root)? {
             let key = hourly_key(&newest);
@@ -173,20 +232,24 @@ impl NodeTailer {
                     key,
                     file,
                 });
-                self.drain(clock, &mut out, &mut budget)?;
+                self.drain(clock, sink, &mut budget)?;
             }
         }
-        Ok(out)
+        Ok(())
     }
 
-    fn drain(
+    fn drain<S: ObservationSink + ?Sized>(
         &mut self,
         clock: &mut dyn FnMut() -> u64,
-        out: &mut Vec<Observation>,
+        sink: &mut S,
         budget: &mut usize,
     ) -> std::io::Result<()> {
         let Some(cur) = self.current.as_mut() else {
             return Ok(());
+        };
+        let mut parser = Parser {
+            stats: &mut self.stats,
+            sink,
         };
         loop {
             if *budget == 0 {
@@ -200,24 +263,9 @@ impl NodeTailer {
             }
             // Stamp before anything else touches the bytes.
             let recv_ns = clock();
-            self.stats.reads += 1;
-            self.splitter.push(
-                self.buf.get(..n).unwrap_or_default(),
-                recv_ns,
-                &mut self.lines,
-            );
-        }
-        for line in self.lines.drain(..) {
-            match std::str::from_utf8(&line.bytes)
-                .ok()
-                .and_then(|s| parse_node_line(s, line.recv_ns).ok())
-            {
-                Some(o) => {
-                    self.stats.lines += 1;
-                    out.push(o);
-                }
-                None => self.stats.bad_lines += 1,
-            }
+            parser.stats.reads += 1;
+            self.splitter
+                .push(self.buf.get(..n).unwrap_or_default(), recv_ns, &mut parser);
         }
         Ok(())
     }

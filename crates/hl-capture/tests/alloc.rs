@@ -9,7 +9,8 @@ use std::hint::black_box;
 use std::io::Write;
 
 use hl_alloc_gate::assert_no_alloc_after_warmup;
-use hl_capture::NodeTailer;
+use hl_capture::{NodeTailer, ObservationSink};
+use hl_latency::Observation;
 
 const WARMUP: u64 = 64;
 const TICKS: u64 = 2000;
@@ -36,6 +37,19 @@ fn hourly_file(root: &std::path::Path) -> File {
         .unwrap()
 }
 
+/// A sink that checks each observation and keeps nothing.
+struct Count {
+    seen: u64,
+    last_height: Option<u64>,
+}
+
+impl ObservationSink for Count {
+    fn observe(&mut self, obs: Observation) {
+        self.seen += 1;
+        self.last_height = black_box(obs).block_number;
+    }
+}
+
 fn gate(what: &str, events: usize) {
     let t = tempfile::tempdir().unwrap();
     let mut file = hourly_file(t.path());
@@ -49,15 +63,18 @@ fn gate(what: &str, events: usize) {
         ns += 1;
         ns
     };
-    let mut seen = 0u64;
+    let mut sink = Count {
+        seen: 0,
+        last_height: None,
+    };
+    // The first poll finds the file and follows it from its end.
+    tail.poll_into(&mut clock, &mut sink).unwrap();
     assert_no_alloc_after_warmup(what, WARMUP, TICKS, |i| {
         file.write_all(&lines[usize::try_from(i).unwrap()]).unwrap();
-        for o in tail.poll(&mut clock).unwrap() {
-            assert_eq!(black_box(o).block_number, Some(1000 + i));
-            seen += 1;
-        }
+        tail.poll_into(&mut clock, &mut sink).unwrap();
+        assert_eq!(sink.last_height, Some(1000 + i));
     });
-    assert_eq!(seen, WARMUP + TICKS, "every tick delivered its line");
+    assert_eq!(sink.seen, WARMUP + TICKS, "every tick delivered its line");
     assert_eq!(tail.stats().rotations, 0, "steady state: no rotation");
 }
 
