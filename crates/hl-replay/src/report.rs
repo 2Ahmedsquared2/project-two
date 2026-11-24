@@ -102,7 +102,7 @@ fn render_host_facts(s: &mut String, note: &HostFactsNote) {
             captured_utc,
             unavailable,
             manual_rtt,
-            warnings: _,
+            warnings,
         } => {
             let gaps = if unavailable.is_empty() {
                 "none".to_owned()
@@ -119,6 +119,9 @@ fn render_host_facts(s: &mut String, note: &HostFactsNote) {
                 "  rtt-manual: {} (operator step, never checked by the harness)",
                 if *manual_rtt { "present" } else { "absent" }
             );
+            for w in warnings {
+                let _ = writeln!(s, "  warning: {w}");
+            }
         }
     }
 }

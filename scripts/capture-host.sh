@@ -68,18 +68,58 @@ s_numa() {
   ((found)) || printf 'unavailable (no /sys/devices/system/node/node*)\n'
 }
 
-s_cstates() {
-  local d found=0
-  for d in /sys/devices/system/cpu/cpu0/cpuidle/state[0-9]*; do
-    found=1
-    printf 'cpu0 %s: name=%s disable=%s latency_us=%s\n' "${d##*/}" \
-      "$(rd "$d/name")" "$(rd "$d/disable")" "$(rd "$d/latency")"
+# CPUs that are online (cpu0 has no "online" file and always is).
+online_cpus() {
+  local d state
+  for d in /sys/devices/system/cpu/cpu[0-9]*; do
+    state=1
+    if [[ -r "$d/online" ]]; then state="$(<"$d/online")"; fi
+    [[ "$state" == 1 ]] && printf '%s\n' "$d"
   done
-  ((found)) || printf 'cpuidle states: unavailable (no /sys/devices/system/cpu/cpu0/cpuidle/state*)\n'
+}
+
+s_cmdline() {
+  local cmdline tok key found
+  if [[ ! -r /proc/cmdline ]]; then
+    printf 'unavailable (/proc/cmdline not readable)\n'
+    return 0
+  fi
+  cmdline="$(</proc/cmdline)"
+  printf '%s\n' "$cmdline"
+  for key in isolcpus nohz_full rcu_nocbs intel_idle.max_cstate processor.max_cstate; do
+    found="not set"
+    for tok in $cmdline; do
+      [[ "$tok" == "$key="* ]] && found="${tok#*=}"
+    done
+    printf '%s: %s\n' "$key" "$found"
+  done
+}
+
+s_cstates() {
+  local c d states found=0
+  while read -r c; do
+    found=1
+    states=""
+    for d in "$c"/cpuidle/state[0-9]*; do
+      states+=" $(rd "$d/name")(disable=$(rd "$d/disable"),latency_us=$(rd "$d/latency"))"
+    done
+    [[ -n "$states" ]] || states=" unavailable (no cpuidle states exposed)"
+    printf '%s states:%s; pm_qos_resume_latency_us=%s\n' "${c##*/}" "$states" \
+      "$(rd "$c/power/pm_qos_resume_latency_us")"
+  done < <(online_cpus)
+  ((found)) || printf 'unavailable (no /sys/devices/system/cpu/cpu*)\n'
   printf 'cpuidle driver: '
   rd /sys/devices/system/cpu/cpuidle/current_driver
-  printf 'intel_idle max_cstate: '
+  printf 'intel_idle max_cstate (module): '
   rd /sys/module/intel_idle/parameters/max_cstate
+  printf 'processor max_cstate (module): '
+  rd /sys/module/processor/parameters/max_cstate
+  # Opening the device registers a latency request of its own, so it is not opened.
+  if [[ -e /dev/cpu_dma_latency ]]; then
+    printf 'cpu_dma_latency: device present; holder and value not read (opening it files a request)\n'
+  else
+    printf 'cpu_dma_latency: unavailable (no /dev/cpu_dma_latency)\n'
+  fi
 }
 
 s_governor() {
@@ -160,11 +200,42 @@ s_irqbalance() {
   fi
 }
 
-s_busy_poll() {
-  printf 'net.core.busy_poll: '
-  rd /proc/sys/net/core/busy_poll
-  printf 'net.core.busy_read: '
-  rd /proc/sys/net/core/busy_read
+s_sysctls() {
+  local name
+  for name in net.core.busy_poll net.core.busy_read net.core.netdev_budget \
+    net.core.netdev_budget_usecs kernel.sched_rt_runtime_us kernel.numa_balancing \
+    kernel.timer_migration vm.stat_interval; do
+    printf '%s: ' "$name"
+    rd "/proc/sys/${name//.//}"
+  done
+}
+
+s_hugepages() {
+  local key rest found=0
+  if [[ -r /proc/meminfo ]]; then
+    while IFS=: read -r key rest; do
+      case "$key" in
+        HugePages_* | Hugepagesize | Hugetlb | AnonHugePages)
+          [[ "$key" == HugePages_Total ]] && found=1
+          printf '%s: %s\n' "$key" "${rest#"${rest%%[![:space:]]*}"}"
+          ;;
+      esac
+    done </proc/meminfo
+  fi
+  ((found)) || printf 'HugePages_Total: unavailable (not in /proc/meminfo)\n'
+  printf 'max locked memory (ulimit -l): %s\n' "$(ulimit -l 2>/dev/null || printf 'unavailable')"
+}
+
+s_smt() {
+  local c found=0
+  printf 'active: '
+  rd /sys/devices/system/cpu/smt/active
+  while read -r c; do
+    found=1
+    printf '%s thread siblings: ' "${c##*/}"
+    rd "$c/topology/thread_siblings_list"
+  done < <(online_cpus)
+  ((found)) || printf 'thread siblings: unavailable (no /sys/devices/system/cpu/cpu*)\n'
 }
 
 s_ethtool() { # FLAG: one of the read-only queries -c -k -l
@@ -191,7 +262,7 @@ TZ=UTC printf -v now '%(%Y-%m-%dT%H:%M:%SZ)T' -1
   printf 'kernel: '
   rd /proc/sys/kernel/osrelease
   printf 'iface: %s\n' "${iface:-unavailable (no default route in /proc/net/route)}"
-  section kernel-cmdline rd /proc/cmdline
+  section kernel-cmdline s_cmdline
   section lscpu tool lscpu
   section numa s_numa
   section cstates s_cstates
@@ -200,11 +271,13 @@ TZ=UTC printf -v now '%(%Y-%m-%dT%H:%M:%SZ)T' -1
   section tsc s_tsc
   section ena-irq-affinity s_irq_affinity
   section irqbalance s_irqbalance
-  section busy-poll-sysctls s_busy_poll
+  section busy-poll-sysctls s_sysctls
   section ethtool-c s_ethtool -c
   section ethtool-k s_ethtool -k
   section ethtool-l s_ethtool -l
   section thp s_thp
   section swappiness rd /proc/sys/vm/swappiness
   section chrony tool chronyc tracking
+  section hugepages-mlock s_hugepages
+  section smt s_smt
 } >"$out"

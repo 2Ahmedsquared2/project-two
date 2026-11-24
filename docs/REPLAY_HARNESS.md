@@ -48,31 +48,37 @@ mkdir -p results
 `--out` is refused (exit 2, nothing run, nothing written) unless
 `--host-facts FILE` names a file written by `scripts/capture-host.sh` on the
 same host. The harness checks, before anything runs, that the file has the
-header and all 16 sections, each terminated and not empty, and that it was
+header and all 18 sections, each terminated and not empty, and that it was
 captured on the running kernel. The report then carries
-`host facts: FILE, captured <UTC>, 16 sections checked, unavailable in: ...`
+`host facts: FILE, captured <UTC>, 18 sections checked, unavailable in: ...`
 and the file is copied to `DIR/host-facts.txt`.
 
 | Section | What the script reads |
 |---|---|
-| `kernel-cmdline` | `/proc/cmdline` |
+| `kernel-cmdline` | `/proc/cmdline`, then `isolcpus`, `nohz_full`, `rcu_nocbs`, `intel_idle.max_cstate` and `processor.max_cstate` parsed out of it (`not set` when absent) |
 | `lscpu` | `lscpu` |
 | `numa` | `/sys/devices/system/node/node*/cpulist` |
-| `cstates` | cpu0's cpuidle states (name, disable, latency), the cpuidle driver, `intel_idle` `max_cstate` |
+| `cstates` | every online CPU's cpuidle states (name, disable, latency) and `pm_qos_resume_latency_us`, the cpuidle driver, the `intel_idle` and `processor` `max_cstate` module values, and whether `/dev/cpu_dma_latency` exists (it is not opened: opening it files a latency request, and its holder cannot be read) |
 | `governor` | every CPU's `scaling_governor` |
 | `clocksource` | current and available clocksource |
 | `tsc` | the TSC flags in `/proc/cpuinfo` |
 | `ena-irq-affinity` | `smp_affinity_list` of every interrupt named for ENA or the NIC |
 | `irqbalance` | whether a process named `irqbalance` runs |
-| `busy-poll-sysctls` | `net.core.busy_poll`, `net.core.busy_read` |
+| `busy-poll-sysctls` | `net.core.busy_poll`, `busy_read`, `netdev_budget`, `netdev_budget_usecs`; `kernel.sched_rt_runtime_us`, `numa_balancing`, `timer_migration`; `vm.stat_interval` |
 | `ethtool-c`, `ethtool-k`, `ethtool-l` | `ethtool -c/-k/-l` on the NIC (queries only) |
 | `thp` | transparent hugepage `enabled` and `defrag` |
 | `swappiness` | `vm.swappiness` |
 | `chrony` | `chronyc tracking` |
+| `hugepages-mlock` | the hugepage lines of `/proc/meminfo` and `ulimit -l` |
+| `smt` | `/sys/devices/system/cpu/smt/active` and every online CPU's thread siblings |
 
 The script sets nothing and contacts no remote host. A fact the host cannot
 give is written as `unavailable (why)`, never left out; the report lists the
 sections that hold one, so read that list before trusting a run.
+
+The report also prints `warning:` lines, which never stop a run: a pinned
+feeder or hot core outside `isolcpus` (or `isolcpus` not set at all), and a
+hot core whose physical core has a second thread.
 
 For a local run that is not a result, `--allow-missing-host-facts` lets
 `--out` go ahead; the report then says

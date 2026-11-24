@@ -169,7 +169,70 @@ impl HostFacts {
     /// The CPUs the kernel command line isolates (`isolcpus=`), if any.
     #[must_use]
     pub fn isolated_cpus(&self) -> Option<Vec<usize>> {
-        None
+        let mut cpus = Vec::new();
+        // Flags such as `domain` and `managed_irq` are not CPU numbers.
+        for part in self.cmdline_value("isolcpus")?.split(',') {
+            let (first, last) = part.split_once('-').unwrap_or((part, part));
+            if let (Ok(first), Ok(last)) = (first.parse::<usize>(), last.parse::<usize>()) {
+                cpus.extend(first..=last);
+            }
+        }
+        (!cpus.is_empty()).then_some(cpus)
+    }
+
+    /// A parsed kernel command-line value the script wrote as `key: value`.
+    fn cmdline_value(&self, key: &str) -> Option<&str> {
+        self.section("kernel-cmdline")?
+            .lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix(": "))
+            .filter(|v| *v != "not set")
+    }
+
+    /// What a reader must weigh about the cores a run pinned to: a core
+    /// outside the isolated set, or a hot core that shares its physical core.
+    /// Warnings only; none of this stops a run.
+    fn core_warnings(&self, feeder: Option<usize>, hot: Option<usize>) -> Vec<String> {
+        let pinned: Vec<(&str, usize)> = [("feeder", feeder), ("hot", hot)]
+            .into_iter()
+            .filter_map(|(role, core)| Some((role, core?)))
+            .collect();
+        let mut warnings = Vec::new();
+        match self.isolated_cpus() {
+            Some(isolated) => {
+                let raw = self.cmdline_value("isolcpus").unwrap_or_default();
+                for (role, core) in &pinned {
+                    if !isolated.contains(core) {
+                        warnings.push(format!("{role} core {core} is not in isolcpus ({raw})"));
+                    }
+                }
+            }
+            None if !pinned.is_empty() => {
+                let cores: Vec<String> = pinned
+                    .iter()
+                    .map(|(role, core)| format!("{role} core {core}"))
+                    .collect();
+                let verb = if cores.len() == 1 { "is" } else { "are" };
+                warnings.push(format!(
+                    "isolcpus is not set: {} {verb} not isolated",
+                    cores.join(" and ")
+                ));
+            }
+            None => {}
+        }
+        if let Some(hot) = hot {
+            let prefix = format!("cpu{hot} thread siblings: ");
+            let siblings = self
+                .section("smt")
+                .and_then(|body| body.lines().find_map(|l| l.strip_prefix(prefix.as_str())));
+            if let Some(siblings) = siblings {
+                if siblings.contains([',', '-']) {
+                    warnings.push(format!(
+                        "hot core {hot} shares its physical core with another thread (siblings {siblings})"
+                    ));
+                }
+            }
+        }
+        warnings
     }
 
     /// Whether the operator appended the manual RTT section. The harness
@@ -217,20 +280,21 @@ pub enum HostFactsNote {
 }
 
 impl HostFactsNote {
-    /// The note for a checked capture.
+    /// The note for a checked capture, with warnings about the cores the run
+    /// pins its feeder and hot thread to.
     #[must_use]
     pub fn captured(
         path: &Path,
         facts: &HostFacts,
-        _feeder_core: Option<usize>,
-        _hot_core: Option<usize>,
+        feeder_core: Option<usize>,
+        hot_core: Option<usize>,
     ) -> Self {
         Self::Captured {
             path: path.display().to_string(),
             captured_utc: facts.captured_utc().to_owned(),
             unavailable: facts.unavailable().into_iter().map(str::to_owned).collect(),
             manual_rtt: facts.has_manual_rtt(),
-            warnings: Vec::new(),
+            warnings: facts.core_warnings(feeder_core, hot_core),
         }
     }
 }
