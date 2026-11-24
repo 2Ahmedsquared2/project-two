@@ -5,6 +5,9 @@
 
 use hl_latency::{CompleteLine, Observation};
 
+#[cfg(not(feature = "prototype-signer"))]
+use crate::real_signer::HlOrderSigner;
+#[cfg(feature = "prototype-signer")]
 use crate::signer::PrototypeSigner;
 use crate::{Clock, ReplayError};
 
@@ -287,9 +290,15 @@ pub type ActiveParser = HeaderScanParser;
 pub type ActiveBook = StubBook;
 /// The decision stage the harness runs.
 pub type ActiveDecision = StubDecision;
-/// The signer the harness runs. **This line is the swap point**: point it at
-/// the real signer's [`Signer`] impl once it passes the SDK vectors, and the
-/// report's `signer=` label follows from that type's [`Stage::LABEL`].
+/// The signer the harness runs. **This line is the swap point**: the real
+/// [`HlOrderSigner`], whose `real` label rests on the SDK golden vectors
+/// (`tests/real_signer.rs`). The report's `signer=` label follows from the
+/// type's [`Stage::LABEL`].
+#[cfg(not(feature = "prototype-signer"))]
+pub type ActiveSigner = HlOrderSigner;
+/// The signer the harness runs: with `--features prototype-signer`, the
+/// prototype, to compare its cost with the real signer's.
+#[cfg(feature = "prototype-signer")]
 pub type ActiveSigner = PrototypeSigner;
 
 /// The pipeline every arm runs.
