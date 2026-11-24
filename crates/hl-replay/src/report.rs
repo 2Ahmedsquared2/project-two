@@ -102,6 +102,7 @@ fn render_host_facts(s: &mut String, note: &HostFactsNote) {
             captured_utc,
             unavailable,
             manual_rtt,
+            warnings: _,
         } => {
             let gaps = if unavailable.is_empty() {
                 "none".to_owned()

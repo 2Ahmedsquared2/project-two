@@ -78,6 +78,8 @@ fn the_required_sections_are_the_agreed_list() {
             "thp",
             "swappiness",
             "chrony",
+            "hugepages-mlock",
+            "smt",
         ]
     );
 }
@@ -177,6 +179,133 @@ fn the_capture_script_writes_a_file_the_harness_accepts() {
 // The capture script is for Linux hosts (/proc, /sys, bash 4.2+).
 #[cfg(target_os = "linux")]
 #[test]
+fn the_capture_script_writes_the_facts_latency_asked_for() {
+    let f = HostFacts::parse(&capture("wide", None)).unwrap();
+    let has = |section: &str, wants: &[&str]| {
+        let body = f.section(section).unwrap();
+        for want in wants {
+            assert!(
+                body.lines().any(|l| l.starts_with(want)),
+                "{section}: no line starting {want:?} in:\n{body}"
+            );
+        }
+    };
+    has(
+        "kernel-cmdline",
+        &[
+            "isolcpus: ",
+            "nohz_full: ",
+            "rcu_nocbs: ",
+            "intel_idle.max_cstate: ",
+            "processor.max_cstate: ",
+        ],
+    );
+    has(
+        "busy-poll-sysctls",
+        &[
+            "net.core.busy_poll: ",
+            "net.core.busy_read: ",
+            "net.core.netdev_budget: ",
+            "net.core.netdev_budget_usecs: ",
+            "kernel.sched_rt_runtime_us: ",
+            "kernel.numa_balancing: ",
+            "kernel.timer_migration: ",
+            "vm.stat_interval: ",
+        ],
+    );
+    // Every online CPU, not only cpu0.
+    has("cstates", &["cpu0 ", "cpu1 ", "cpu_dma_latency: "]);
+    has(
+        "hugepages-mlock",
+        &["HugePages_Total: ", "max locked memory (ulimit -l): "],
+    );
+    has(
+        "smt",
+        &[
+            "active: ",
+            "cpu0 thread siblings: ",
+            "cpu1 thread siblings: ",
+        ],
+    );
+}
+
+/// A complete file whose kernel-cmdline and smt sections hold `cmdline` and `smt`.
+fn file_with_cores(cmdline: &str, smt: &str) -> HostFacts {
+    let text = file_with(None, "x")
+        .replace(
+            "== begin kernel-cmdline\nx\n",
+            &format!("== begin kernel-cmdline\n{cmdline}\n"),
+        )
+        .replace("== begin smt\nx\n", &format!("== begin smt\n{smt}\n"));
+    HostFacts::parse(&text).unwrap()
+}
+fn warnings(f: &HostFacts, feeder: Option<usize>, hot: Option<usize>) -> Vec<String> {
+    match HostFactsNote::captured(Path::new("f"), f, feeder, hot) {
+        HostFactsNote::Captured { warnings, .. } => warnings,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn isolcpus_is_parsed_with_flags_ranges_and_singles() {
+    let f = file_with_cores(
+        "quiet isolcpus=domain,managed_irq,2-3,6\nisolcpus: domain,managed_irq,2-3,6\nnohz_full: 2-3",
+        "active: 0",
+    );
+    assert_eq!(f.isolated_cpus(), Some(vec![2, 3, 6]));
+    let f = file_with_cores("quiet\nisolcpus: not set", "active: 0");
+    assert_eq!(f.isolated_cpus(), None);
+    let f = file_with_cores("quiet", "active: 0");
+    assert_eq!(f.isolated_cpus(), None);
+}
+
+#[test]
+fn cores_outside_the_isolated_set_are_a_warning_not_a_failure() {
+    let smt = "active: 0\ncpu2 thread siblings: 2\ncpu3 thread siblings: 3";
+    let f = file_with_cores("isolcpus: 2-3", smt);
+    assert_eq!(warnings(&f, Some(2), Some(3)), Vec::<String>::new());
+    assert_eq!(
+        warnings(&f, Some(0), Some(3)),
+        ["feeder core 0 is not in isolcpus (2-3)"]
+    );
+    assert_eq!(
+        warnings(&f, Some(2), Some(1)),
+        ["hot core 1 is not in isolcpus (2-3)"]
+    );
+    // Unpinned threads have no core to check.
+    assert_eq!(warnings(&f, None, None), Vec::<String>::new());
+    let f = file_with_cores("isolcpus: not set", smt);
+    assert_eq!(
+        warnings(&f, Some(2), Some(3)),
+        ["isolcpus is not set: feeder core 2 and hot core 3 are not isolated"]
+    );
+}
+
+#[test]
+fn a_sibling_thread_on_the_hot_core_is_a_warning() {
+    let f = file_with_cores(
+        "isolcpus: 2-3",
+        "active: 1\ncpu2 thread siblings: 2,50\ncpu3 thread siblings: 3,51",
+    );
+    assert_eq!(
+        warnings(&f, Some(2), Some(3)),
+        ["hot core 3 shares its physical core with another thread (siblings 3,51)"]
+    );
+}
+
+#[test]
+fn the_report_prints_host_fact_warnings() {
+    let f = file_with_cores("isolcpus: 2-3", "active: 0\ncpu1 thread siblings: 1");
+    let note = HostFactsNote::captured(Path::new("f"), &f, Some(2), Some(1));
+    let report = render_report(&meta(note), &[]);
+    assert!(
+        report.contains("  warning: hot core 1 is not in isolcpus (2-3)"),
+        "{report}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn with_no_tools_at_all_every_section_is_still_written() {
     // No `lscpu`, `ethtool`, `chronyc` or anything else on PATH: what cannot
     // be read says so and nothing is left out.
@@ -242,7 +371,7 @@ fn the_report_says_which_host_facts_a_run_carries() {
         "== begin chrony\nunavailable (chronyc: not installed)\n",
     );
     let f = HostFacts::parse(&text).unwrap();
-    let note = HostFactsNote::captured(Path::new("/tmp/facts.txt"), &f);
+    let note = HostFactsNote::captured(Path::new("/tmp/facts.txt"), &f, None, None);
     assert_eq!(
         note,
         HostFactsNote::Captured {
@@ -250,12 +379,13 @@ fn the_report_says_which_host_facts_a_run_carries() {
             captured_utc: "2026-11-24T02:00:00Z".to_owned(),
             unavailable: vec!["chrony".to_owned()],
             manual_rtt: false,
+            warnings: Vec::new(),
         }
     );
     let report = render_report(&meta(note), &[]);
     assert!(
         report.contains(
-            "host facts: /tmp/facts.txt, captured 2026-11-24T02:00:00Z, 16 sections checked, unavailable in: chrony"
+            "host facts: /tmp/facts.txt, captured 2026-11-24T02:00:00Z, 18 sections checked, unavailable in: chrony"
         ),
         "{report}"
     );

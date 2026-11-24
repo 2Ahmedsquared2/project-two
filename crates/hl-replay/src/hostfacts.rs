@@ -19,7 +19,7 @@ pub struct HostFacts {
 
 impl HostFacts {
     /// The sections the capture script always writes and the harness requires.
-    pub const REQUIRED: [&'static str; 16] = [
+    pub const REQUIRED: [&'static str; 18] = [
         "kernel-cmdline",
         "lscpu",
         "numa",
@@ -36,6 +36,8 @@ impl HostFacts {
         "thp",
         "swappiness",
         "chrony",
+        "hugepages-mlock",
+        "smt",
     ];
     /// The section an operator appends by hand; the harness never requires it.
     pub const MANUAL_RTT: &'static str = "rtt-manual";
@@ -164,6 +166,12 @@ impl HostFacts {
             .collect()
     }
 
+    /// The CPUs the kernel command line isolates (`isolcpus=`), if any.
+    #[must_use]
+    pub fn isolated_cpus(&self) -> Option<Vec<usize>> {
+        None
+    }
+
     /// Whether the operator appended the manual RTT section. The harness
     /// reports this and never requires or reads it.
     #[must_use]
@@ -203,18 +211,26 @@ pub enum HostFactsNote {
         unavailable: Vec<String>,
         /// Whether the manual RTT section is there.
         manual_rtt: bool,
+        /// Things about the host a reader must weigh; never a failure.
+        warnings: Vec<String>,
     },
 }
 
 impl HostFactsNote {
     /// The note for a checked capture.
     #[must_use]
-    pub fn captured(path: &Path, facts: &HostFacts) -> Self {
+    pub fn captured(
+        path: &Path,
+        facts: &HostFacts,
+        _feeder_core: Option<usize>,
+        _hot_core: Option<usize>,
+    ) -> Self {
         Self::Captured {
             path: path.display().to_string(),
             captured_utc: facts.captured_utc().to_owned(),
             unavailable: facts.unavailable().into_iter().map(str::to_owned).collect(),
             manual_rtt: facts.has_manual_rtt(),
+            warnings: Vec::new(),
         }
     }
 }

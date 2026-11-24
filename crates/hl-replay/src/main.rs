@@ -212,7 +212,12 @@ fn host_facts_note(args: &Args, host: &HostInfo) -> Result<HostFactsNote, Replay
         Some(path) => {
             let facts = HostFacts::load(path)?;
             facts.check_kernel(&host.kernel)?;
-            Ok(HostFactsNote::captured(path, &facts))
+            Ok(HostFactsNote::captured(
+                path,
+                &facts,
+                args.feeder_core,
+                args.hot_core,
+            ))
         }
         None if args.allow_missing_host_facts => Ok(HostFactsNote::Waived),
         None => Ok(HostFactsNote::NotRequired),

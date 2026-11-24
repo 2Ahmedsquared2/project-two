@@ -154,7 +154,7 @@ fn a_run_with_host_facts_reports_them_and_keeps_a_copy() {
         text.contains(&format!("host facts: {}, captured ", facts.display())),
         "{text}"
     );
-    assert!(text.contains("16 sections checked"), "{text}");
+    assert!(text.contains("18 sections checked"), "{text}");
     assert!(text.contains("rtt-manual: absent"), "{text}");
     assert!(!text.contains("NOT CAPTURED"), "{text}");
     assert_eq!(
