@@ -361,17 +361,20 @@ fn warm_trial(a: &Args) -> ExitCode {
         sink ^= c;
         times.push(ns);
     }
-    let usage_delta = match (before, hl_warm::ThreadUsage::now().ok()) {
-        (Some(b), Some(n)) => n.since(&b),
-        _ => hl_warm::UsageDelta::default(),
+    // Off Linux there is no per-thread getrusage: print "na", never zeros.
+    let usage = match (before, hl_warm::ThreadUsage::now().ok()) {
+        (Some(b), Some(n)) => {
+            let d = n.since(&b);
+            format!(
+                "{},{},{}",
+                d.minor_faults, d.major_faults, d.involuntary_switches
+            )
+        }
+        _ => "na,na,na".to_owned(),
     };
     let mut out = String::new();
     for (i, t) in times.iter().enumerate() {
-        let _ = writeln!(
-            out,
-            "{config},{i},{t},{pin_state},{backing},{},{},{},{sink}",
-            usage_delta.minor_faults, usage_delta.major_faults, usage_delta.involuntary_switches
-        );
+        let _ = writeln!(out, "{config},{i},{t},{pin_state},{backing},{usage},{sink}");
     }
     print!("{out}");
     ExitCode::SUCCESS

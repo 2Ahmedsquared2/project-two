@@ -1,6 +1,6 @@
 //! Pre-touched, huge-page-backed memory for hot-path buffers.
 
-use memmap2::{Advice, MmapMut, MmapOptions};
+use memmap2::{MmapMut, MmapOptions};
 
 const HUGE: usize = 2 << 20;
 const PAGE: usize = 4096;
@@ -26,23 +26,33 @@ pub struct Arena {
     touched: usize,
 }
 
+#[cfg(target_os = "linux")]
+fn map_backed(len: usize) -> std::io::Result<(MmapMut, Backing)> {
+    if let Ok(m) = MmapOptions::new().len(len).huge(Some(21)).map_anon() {
+        return Ok((m, Backing::HugeTlb));
+    }
+    let m = MmapOptions::new().len(len).map_anon()?;
+    let b = if m.advise(memmap2::Advice::HugePage).is_ok() {
+        Backing::ThpAdvised
+    } else {
+        Backing::Normal
+    };
+    Ok((m, b))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn map_backed(len: usize) -> std::io::Result<(MmapMut, Backing)> {
+    Ok((MmapOptions::new().len(len).map_anon()?, Backing::Normal))
+}
+
 impl Arena {
     /// Maps at least `len` bytes (rounded up to 2 MiB), trying `MAP_HUGETLB`,
     /// then THP advice, then normal pages; then writes every 4 KiB page.
+    /// Off Linux only normal pages are tried (memmap2 defines `MAP_HUGETLB`
+    /// as 0 there, so a "huge" mapping would silently be a normal one).
     pub fn new(len: usize) -> std::io::Result<Self> {
         let len = len.div_ceil(HUGE).max(1) * HUGE;
-        let (mut map, backing) =
-            if let Ok(m) = MmapOptions::new().len(len).huge(Some(21)).map_anon() {
-                (m, Backing::HugeTlb)
-            } else {
-                let m = MmapOptions::new().len(len).map_anon()?;
-                let b = if m.advise(Advice::HugePage).is_ok() {
-                    Backing::ThpAdvised
-                } else {
-                    Backing::Normal
-                };
-                (m, b)
-            };
+        let (mut map, backing) = map_backed(len)?;
         let mut touched = 0;
         for i in (0..map.len()).step_by(PAGE) {
             // A write, not a read: a read of a fresh anonymous page maps the

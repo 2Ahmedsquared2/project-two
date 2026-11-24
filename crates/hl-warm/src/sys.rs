@@ -1,8 +1,12 @@
 //! Thread pinning, memory locking, per-thread resource usage.
+//!
+//! All three are Linux-only (`sched_setaffinity`, `mlockall`,
+//! `getrusage(RUSAGE_THREAD)`). On any other OS they refuse with an
+//! "unsupported on this OS" result instead of succeeding as a no-op, so a
+//! warm gate can never report a step that did nothing as passed.
 
 use std::fmt;
-
-use nix::sys::resource::{getrusage, UsageWho};
+use std::io;
 
 /// Pinning failed.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -13,9 +17,13 @@ pub enum PinError {
     /// `sched_setaffinity` refused.
     #[error("could not pin to core {0}")]
     Refused(usize),
+    /// Not Linux: there is no hard thread-to-core pinning to use.
+    #[error("pinning a thread to a core is unsupported on this OS ({0}); Linux only")]
+    Unsupported(&'static str),
 }
 
 /// Pins the calling thread to `core` (an id from the process's allowed set).
+#[cfg(target_os = "linux")]
 pub fn pin_current_thread(core: usize) -> Result<(), PinError> {
     let ids = core_affinity::get_core_ids().unwrap_or_default();
     let id = ids
@@ -29,12 +37,19 @@ pub fn pin_current_thread(core: usize) -> Result<(), PinError> {
     }
 }
 
+/// Pins the calling thread to `core`: unsupported on this OS.
+#[cfg(not(target_os = "linux"))]
+pub fn pin_current_thread(_core: usize) -> Result<(), PinError> {
+    Err(PinError::Unsupported(std::env::consts::OS))
+}
+
 /// What `mlockall(MCL_CURRENT | MCL_FUTURE)` did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LockOutcome {
     /// All current and future pages are locked.
     Locked,
-    /// Refused, with the errno text (`ENOMEM`: `RLIMIT_MEMLOCK` too low; `EPERM`: no privilege).
+    /// Refused, with the reason (`ENOMEM`: `RLIMIT_MEMLOCK` too low; `EPERM`:
+    /// no privilege; or "unsupported on this OS").
     Refused(String),
 }
 
@@ -53,8 +68,9 @@ impl fmt::Display for LockOutcome {
 /// `MCL_FUTURE` makes every later allocation past the limit fail (seen on the
 /// dev box, 8 MiB limit: the process aborted on its next allocations). So a
 /// finite limit is reported as refused without calling `mlockall`. A refused
-/// call is undone with `munlockall`.
+/// call is undone with `munlockall`. On a non-Linux OS: refused, unsupported.
 #[must_use]
+#[cfg(target_os = "linux")]
 pub fn lock_memory() -> LockOutcome {
     use nix::sys::resource::{getrlimit, Resource, RLIM_INFINITY};
     use rustix::mm::{mlockall, MlockAllFlags};
@@ -76,9 +92,37 @@ pub fn lock_memory() -> LockOutcome {
     }
 }
 
+/// Locks all current and future pages: unsupported on this OS, so refused.
+#[must_use]
+#[cfg(not(target_os = "linux"))]
+pub fn lock_memory() -> LockOutcome {
+    LockOutcome::Refused(format!(
+        "mlockall is unsupported on this OS ({}); Linux only",
+        std::env::consts::OS
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unsupported(what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "{what} is unsupported on this OS ({}); Linux only",
+            std::env::consts::OS
+        ),
+    )
+}
+
 /// `munlockall()`: unlocks every page and clears `MCL_FUTURE`.
-pub fn unlock_memory() -> rustix::io::Result<()> {
-    rustix::mm::munlockall()
+pub fn unlock_memory() -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        rustix::mm::munlockall().map_err(io::Error::from)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(unsupported("munlockall"))
+    }
 }
 
 /// `getrusage(RUSAGE_THREAD)` counters of the calling thread.
@@ -104,15 +148,24 @@ pub struct UsageDelta {
 }
 
 impl ThreadUsage {
-    /// Reads the calling thread's counters.
-    pub fn now() -> nix::Result<Self> {
-        let u = getrusage(UsageWho::RUSAGE_THREAD)?;
-        Ok(Self {
-            minor: u.minor_page_faults(),
-            major: u.major_page_faults(),
-            voluntary: u.voluntary_context_switches(),
-            involuntary: u.involuntary_context_switches(),
-        })
+    /// Reads the calling thread's counters. On a non-Linux OS an
+    /// `ErrorKind::Unsupported` error, never zeros.
+    pub fn now() -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            use nix::sys::resource::{getrusage, UsageWho};
+            let u = getrusage(UsageWho::RUSAGE_THREAD).map_err(io::Error::from)?;
+            Ok(Self {
+                minor: u.minor_page_faults(),
+                major: u.major_page_faults(),
+                voluntary: u.voluntary_context_switches(),
+                involuntary: u.involuntary_context_switches(),
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(unsupported("getrusage(RUSAGE_THREAD)"))
+        }
     }
 
     /// `self - earlier`.

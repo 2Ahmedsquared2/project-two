@@ -6,6 +6,46 @@
 
 use hl_warm::{lock_memory, pin_current_thread, Arena, Backing, ThreadUsage};
 
+/// Off Linux every warm step refuses instead of passing as a no-op: a gate
+/// that reported "warm" where nothing was pinned or locked would be wrong.
+#[cfg(not(target_os = "linux"))]
+mod unsupported_os {
+    use hl_warm::{
+        lock_memory, pin_current_thread, Arena, Backing, LockOutcome, PinError, ThreadUsage,
+    };
+
+    #[test]
+    fn pin_refuses_as_unsupported() {
+        let e = pin_current_thread(0).unwrap_err();
+        assert!(matches!(e, PinError::Unsupported(_)), "{e:?}");
+        assert!(e.to_string().contains("unsupported on this OS"), "{e}");
+    }
+
+    #[test]
+    fn mlockall_refuses_as_unsupported() {
+        let l = lock_memory();
+        assert!(
+            matches!(&l, LockOutcome::Refused(m) if m.contains("unsupported on this OS")),
+            "{l:?}"
+        );
+        assert!(hl_warm::unlock_memory().is_err());
+    }
+
+    #[test]
+    fn thread_usage_is_an_error_not_zeros() {
+        let e = ThreadUsage::now().unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::Unsupported, "{e}");
+    }
+
+    #[test]
+    fn arena_never_claims_huge_pages() {
+        // memmap2 defines MAP_HUGETLB as 0 off Linux: a "huge" map would be normal.
+        let a = Arena::new(4 << 20).unwrap();
+        assert_eq!(a.backing(), Backing::Normal);
+        assert!(a.touched_pages() >= (4 << 20) / 4096);
+    }
+}
+
 #[test]
 fn arena_is_pretouched_and_reports_backing() {
     let a = Arena::new(8 << 20).unwrap();
@@ -19,6 +59,10 @@ fn arena_is_pretouched_and_reports_backing() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Linux only: getrusage(RUSAGE_THREAD)"
+)]
 fn touching_a_pretouched_arena_takes_no_faults() {
     std::thread::spawn(|| {
         let mut a = Arena::new(16 << 20).unwrap();
@@ -36,6 +80,10 @@ fn touching_a_pretouched_arena_takes_no_faults() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Linux only: getrusage(RUSAGE_THREAD)"
+)]
 fn a_fresh_mapping_does_fault_so_the_measurement_is_live() {
     // Mutation check for the test above: without pre-touch, writes fault.
     std::thread::spawn(|| {
@@ -55,6 +103,10 @@ fn a_fresh_mapping_does_fault_so_the_measurement_is_live() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Linux only: getrusage(RUSAGE_THREAD)"
+)]
 fn hot_loop_after_warmup_zero_faults_zero_allocs() {
     std::thread::spawn(|| {
         let mut arena = Arena::new(4 << 20).unwrap();
@@ -86,6 +138,10 @@ fn hot_loop_after_warmup_zero_faults_zero_allocs() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Linux only: sched_setaffinity, mlockall"
+)]
 fn pin_and_lock_report_outcome() {
     let pinned = pin_current_thread(0);
     assert!(pinned.is_ok(), "{pinned:?}");
@@ -96,23 +152,30 @@ fn pin_and_lock_report_outcome() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Linux only: RLIMIT_MEMLOCK, mlockall"
+)]
 fn finite_memlock_limit_is_refused_and_allocation_still_works() {
-    let (soft, _) =
-        nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_MEMLOCK).unwrap();
-    let l = lock_memory();
-    if soft != nix::sys::resource::RLIM_INFINITY {
-        assert!(
-            matches!(&l, hl_warm::LockOutcome::Refused(m) if m.contains("RLIMIT_MEMLOCK")),
+    #[cfg(target_os = "linux")]
+    {
+        let (soft, _) =
+            nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_MEMLOCK).unwrap();
+        let l = lock_memory();
+        if soft != nix::sys::resource::RLIM_INFINITY {
+            assert!(
+                matches!(&l, hl_warm::LockOutcome::Refused(m) if m.contains("RLIMIT_MEMLOCK")),
+                "{l:?}"
+            );
+        }
+        let v: Vec<u8> = vec![1u8; 64 << 20];
+        assert_eq!(
+            v.iter().map(|&b| u64::from(b)).sum::<u64>(),
+            64 << 20,
             "{l:?}"
         );
-    }
-    let v: Vec<u8> = vec![1u8; 64 << 20];
-    assert_eq!(
-        v.iter().map(|&b| u64::from(b)).sum::<u64>(),
-        64 << 20,
-        "{l:?}"
-    );
-    if matches!(l, hl_warm::LockOutcome::Locked) {
-        let _ = hl_warm::unlock_memory();
+        if matches!(l, hl_warm::LockOutcome::Locked) {
+            let _ = hl_warm::unlock_memory();
+        }
     }
 }

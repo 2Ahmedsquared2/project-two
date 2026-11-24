@@ -20,6 +20,11 @@
 //! [`ThreadUsage`] reads `getrusage(RUSAGE_THREAD)` so a test can show 0
 //! faults on the hot thread over a measured window.
 //!
+//! Platforms: pinning, `mlockall`, huge pages and `getrusage(RUSAGE_THREAD)`
+//! are Linux-only. Elsewhere pinning and locking refuse with "unsupported on
+//! this OS", [`ThreadUsage::now`] returns an `Unsupported` error and an
+//! [`Arena`] records [`Backing::Normal`]; nothing reports a step it did not do.
+//!
 //! No `unsafe` here: `rustix`, `nix` and `memmap2` hold it.
 
 mod arena;

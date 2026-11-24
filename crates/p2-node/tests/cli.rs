@@ -39,7 +39,14 @@ fn replay_null_engine_reports_coverage_and_writes_outputs() {
             "--window-blocks",
             "0",
         ])
-        .args(["--core", "0", "--out", out.to_str().unwrap()])
+        // Pinning is Linux-only; elsewhere it is not requested here (see
+        // pin_off_linux_closes_the_gate).
+        .args(if cfg!(target_os = "linux") {
+            &["--core", "0"][..]
+        } else {
+            &[][..]
+        })
+        .args(["--out", out.to_str().unwrap()])
         .output()
         .unwrap();
     let so = String::from_utf8_lossy(&o.stdout);
@@ -60,6 +67,31 @@ fn replay_null_engine_reports_coverage_and_writes_outputs() {
     assert!(warm.contains("pin passed"), "{warm}");
     assert!(warm.contains("mlockall"), "{warm}");
     std::fs::remove_dir_all(out).unwrap();
+}
+
+/// Off Linux a requested pin is refused as unsupported and the warm gate
+/// stays closed: nothing is timed, the run fails.
+#[test]
+#[cfg(not(target_os = "linux"))]
+fn pin_off_linux_closes_the_gate() {
+    let out = tmp("pin-unsupported");
+    let o = bin()
+        .args([
+            "replay",
+            "--blocks",
+            &data("three_blocks.jsonl"),
+            "--diffs",
+            &data("diffs_1000.jsonl"),
+        ])
+        .args(["--snapshot-height", "999", "--passes", "5", "--core", "0"])
+        .args(["--out", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let se = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(1), "{se}");
+    assert!(se.contains("warm gate closed"), "{se}");
+    assert!(se.contains("unsupported on this OS"), "{se}");
+    let _ = std::fs::remove_dir_all(out);
 }
 
 #[test]
