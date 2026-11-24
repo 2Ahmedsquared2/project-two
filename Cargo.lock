@@ -865,6 +865,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hl-capture"
+version = "0.1.0"
+dependencies = [
+ "hl-latency",
+ "proptest",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "hl-dataset"
 version = "0.1.0"
 dependencies = [
@@ -917,6 +927,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hl-race"
+version = "0.1.0"
+dependencies = [
+ "hl-alloc-gate",
+ "hl-latency",
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hl-replay"
 version = "0.1.0"
 dependencies = [
@@ -925,6 +946,7 @@ dependencies = [
  "hdrhistogram",
  "hl-alloc-gate",
  "hl-latency",
+ "hl-order",
  "inotify",
  "proptest",
  "rmp-serde",

@@ -44,6 +44,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hl-capture"
+version = "0.1.0"
+dependencies = [
+ "hl-latency",
+ "serde_json",
+]
+
+[[package]]
 name = "hl-latency"
 version = "0.1.0"
 dependencies = [
@@ -103,6 +111,7 @@ dependencies = [
 name = "project-two-fuzz"
 version = "0.0.0"
 dependencies = [
+ "hl-capture",
  "hl-latency",
  "libfuzzer-sys",
  "serde",

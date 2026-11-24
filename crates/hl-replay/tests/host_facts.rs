@@ -162,7 +162,12 @@ fn capture(dir: &str, path_env: Option<&str>) -> String {
         c.env("PATH", p);
     }
     let o = c.output().unwrap();
-    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        o.status.success(),
+        "capture-host.sh ended with {:?}; stderr: {:?}",
+        o.status,
+        String::from_utf8_lossy(&o.stderr)
+    );
     std::fs::read_to_string(out).unwrap()
 }
 
@@ -229,6 +234,9 @@ fn the_capture_script_writes_the_facts_latency_asked_for() {
     );
 }
 
+/// Command-line lines under which no core is outside `nohz_full` or `rcu_nocbs`.
+const QUIET: &str = "nohz_full: all\nrcu_nocbs: all";
+
 /// A complete file whose kernel-cmdline and smt sections hold `cmdline` and `smt`.
 fn file_with_cores(cmdline: &str, smt: &str) -> HostFacts {
     let text = file_with(None, "x")
@@ -262,7 +270,7 @@ fn isolcpus_is_parsed_with_flags_ranges_and_singles() {
 #[test]
 fn cores_outside_the_isolated_set_are_a_warning_not_a_failure() {
     let smt = "active: 0\ncpu2 thread siblings: 2\ncpu3 thread siblings: 3";
-    let f = file_with_cores("isolcpus: 2-3", smt);
+    let f = file_with_cores(&format!("isolcpus: 2-3\n{QUIET}"), smt);
     assert_eq!(warnings(&f, Some(2), Some(3)), Vec::<String>::new());
     assert_eq!(
         warnings(&f, Some(0), Some(3)),
@@ -274,7 +282,7 @@ fn cores_outside_the_isolated_set_are_a_warning_not_a_failure() {
     );
     // Unpinned threads have no core to check.
     assert_eq!(warnings(&f, None, None), Vec::<String>::new());
-    let f = file_with_cores("isolcpus: not set", smt);
+    let f = file_with_cores(&format!("isolcpus: not set\n{QUIET}"), smt);
     assert_eq!(
         warnings(&f, Some(2), Some(3)),
         ["isolcpus is not set: feeder core 2 and hot core 3 are not isolated"]
@@ -284,7 +292,7 @@ fn cores_outside_the_isolated_set_are_a_warning_not_a_failure() {
 #[test]
 fn a_sibling_thread_on_the_hot_core_is_a_warning() {
     let f = file_with_cores(
-        "isolcpus: 2-3",
+        &format!("isolcpus: 2-3\n{QUIET}"),
         "active: 1\ncpu2 thread siblings: 2,50\ncpu3 thread siblings: 3,51",
     );
     assert_eq!(
@@ -295,13 +303,152 @@ fn a_sibling_thread_on_the_hot_core_is_a_warning() {
 
 #[test]
 fn the_report_prints_host_fact_warnings() {
-    let f = file_with_cores("isolcpus: 2-3", "active: 0\ncpu1 thread siblings: 1");
+    let f = file_with_cores(
+        "isolcpus: 2-3\nnohz_full: 2-3\nrcu_nocbs: 2-3",
+        "active: 0\ncpu1 thread siblings: 1",
+    );
     let note = HostFactsNote::captured(Path::new("f"), &f, Some(2), Some(1));
     let report = render_report(&meta(note), &[]);
-    assert!(
-        report.contains("  warning: hot core 1 is not in isolcpus (2-3)"),
-        "{report}"
+    for want in [
+        "  warning: hot core 1 is not in isolcpus (2-3)",
+        "  warning: hot core 1 is not in nohz_full (2-3)",
+        "  warning: hot core 1 is not in rcu_nocbs (2-3)",
+    ] {
+        assert!(report.contains(want), "no {want:?} in:\n{report}");
+    }
+}
+
+/// The warnings for a capture whose parsed command-line lines are `lines`.
+fn list_warnings(lines: &str, feeder: Option<usize>, hot: Option<usize>) -> Vec<String> {
+    let smt = "active: 0\ncpu2 thread siblings: 2\ncpu3 thread siblings: 3";
+    warnings(&file_with_cores(lines, smt), feeder, hot)
+}
+
+#[test]
+fn cores_outside_nohz_full_warn_as_isolcpus_does() {
+    let rest = "isolcpus: 0-7\nrcu_nocbs: all";
+    let none = Vec::<String>::new();
+    assert_eq!(
+        list_warnings(&format!("{rest}\nnohz_full: 2-3"), Some(2), Some(3)),
+        none
     );
+    assert_eq!(
+        list_warnings(&format!("{rest}\nnohz_full: 2-3"), Some(0), Some(3)),
+        ["feeder core 0 is not in nohz_full (2-3)"]
+    );
+    assert_eq!(
+        list_warnings(&format!("{rest}\nnohz_full: 2-3"), Some(2), Some(1)),
+        ["hot core 1 is not in nohz_full (2-3)"]
+    );
+    assert_eq!(
+        list_warnings(&format!("{rest}\nnohz_full: not set"), Some(2), Some(3)),
+        ["nohz_full is not set: feeder core 2 and hot core 3 are not tickless"]
+    );
+    assert_eq!(
+        list_warnings(&format!("{rest}\nnohz_full: not set"), None, Some(3)),
+        ["nohz_full is not set: hot core 3 is not tickless"]
+    );
+    // A capture from before the script wrote the line reads as not set.
+    assert_eq!(
+        list_warnings(rest, None, Some(3)),
+        ["nohz_full is not set: hot core 3 is not tickless"]
+    );
+    // Unpinned threads have no core to check.
+    assert_eq!(
+        list_warnings(&format!("{rest}\nnohz_full: not set"), None, None),
+        none
+    );
+}
+
+#[test]
+fn cores_outside_rcu_nocbs_warn_as_isolcpus_does() {
+    // nohz_full names neither pinned core, so rcu_nocbs alone decides; the
+    // nohz_full warnings that come with that are left out here.
+    let rest = "isolcpus: 0-7\nnohz_full: 6-7";
+    let rcu = |nocbs: &str, feeder, hot| -> Vec<String> {
+        list_warnings(&format!("{rest}\nrcu_nocbs: {nocbs}"), feeder, hot)
+            .into_iter()
+            .filter(|w| w.contains("rcu_nocbs"))
+            .collect()
+    };
+    let none = Vec::<String>::new();
+    assert_eq!(rcu("2-3", Some(2), Some(3)), none);
+    assert_eq!(
+        rcu("2-3", Some(0), Some(3)),
+        ["feeder core 0 is not in rcu_nocbs (2-3)"]
+    );
+    assert_eq!(
+        rcu("2-3", Some(2), Some(1)),
+        ["hot core 1 is not in rcu_nocbs (2-3)"]
+    );
+    assert_eq!(
+        rcu("not set", Some(2), Some(3)),
+        ["rcu_nocbs is not set: feeder core 2 and hot core 3 are not offloaded from RCU callbacks"]
+    );
+    assert_eq!(rcu("all", Some(2), Some(3)), none);
+    // The order in the report: isolcpus, then nohz_full, then rcu_nocbs.
+    assert_eq!(
+        list_warnings(&format!("{rest}\nrcu_nocbs: 2-3"), Some(0), Some(3)),
+        [
+            "feeder core 0 is not in nohz_full (6-7)",
+            "hot core 3 is not in nohz_full (6-7)",
+            "feeder core 0 is not in rcu_nocbs (2-3)"
+        ]
+    );
+    // `all` and a stepped range (CPUs 0, 1, 4, 5) are CPU lists too.
+    let stepped = "isolcpus: 0-7\nnohz_full: 0-7:2/4\nrcu_nocbs: all";
+    assert_eq!(list_warnings(stepped, Some(0), Some(5)), none);
+    assert_eq!(
+        list_warnings(stepped, Some(2), Some(5)),
+        ["feeder core 2 is not in nohz_full (0-7:2/4)"]
+    );
+}
+
+#[test]
+fn a_nohz_full_core_has_its_rcu_callbacks_offloaded_already() {
+    // The kernel offloads RCU callbacks on every nohz_full CPU, so a core in
+    // nohz_full is not reported as missing from rcu_nocbs.
+    let none = Vec::<String>::new();
+    assert_eq!(
+        list_warnings(
+            "isolcpus: 2-3\nnohz_full: 2-3\nrcu_nocbs: not set",
+            Some(2),
+            Some(3)
+        ),
+        none
+    );
+    assert_eq!(
+        list_warnings(
+            "isolcpus: 2-3\nnohz_full: 2\nrcu_nocbs: not set",
+            Some(2),
+            Some(3)
+        ),
+        [
+            "hot core 3 is not in nohz_full (2)",
+            "rcu_nocbs is not set: hot core 3 is not offloaded from RCU callbacks"
+        ]
+    );
+}
+
+#[test]
+fn a_list_the_harness_cannot_read_is_not_called_unset() {
+    // `N` (the last CPU) is valid to the kernel and not resolved here.
+    assert_eq!(
+        list_warnings("isolcpus: 2-3\nnohz_full: 2-N\nrcu_nocbs: ALL", Some(2), Some(3)),
+        ["nohz_full (2-N) names no CPU this harness can read: pinned cores not checked against it"]
+    );
+}
+
+#[test]
+fn a_run_with_every_list_unset_still_gets_a_report() {
+    // Warnings never stop a run: the note is built and the report renders.
+    let f = file_with_cores(
+        "isolcpus: not set\nnohz_full: not set\nrcu_nocbs: not set",
+        "active: 0",
+    );
+    let note = HostFactsNote::captured(Path::new("f"), &f, Some(2), Some(3));
+    let report = render_report(&meta(note), &[]);
+    assert_eq!(report.matches("  warning: ").count(), 3, "{report}");
 }
 
 #[cfg(target_os = "linux")]

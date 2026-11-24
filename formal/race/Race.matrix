@@ -1,0 +1,14 @@
+# TLC runs for Race.tla: 2 and 3 sources; windows 1, 2, 3; 3 and 5 keys;
+# loss on some sources with one complete source; duplicates; divergent bytes.
+# Lost/Dup/Bad codes are 10 * source + key (sources are 1..S).
+spec Race.tla
+check INVARIANTS TypeOK InOrderOnce ReleasedIsWinner DivergenceAlarmed NoFalseAlarm HeldNotLost
+check PROPERTIES AllReleased
+reach Alarmed | bad
+reach GapHeld | gap
+run w1 n3 2src clean | S=2 N=3 W=1 Lost={} Dup={} Bad={}
+run w2 n5 2src gap dup | S=2 N=5 W=2 Lost={11,12} Dup={20,13} Bad={}
+run w3 n5 2src gap bad | S=2 N=5 W=3 Lost={10} Dup={22} Bad={23}
+run w2 n3 3src gap bad dup | S=3 N=3 W=2 Lost={10,21} Dup={30,12} Bad={22}
+run w1 n3 3src bad | S=3 N=3 W=1 Lost={11,20} Dup={} Bad={12,30}
+run w2 n3 3src gap2 bad | S=3 N=3 W=2 Lost={10,20} Dup={} Bad={21}

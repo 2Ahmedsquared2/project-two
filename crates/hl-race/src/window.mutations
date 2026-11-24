@@ -1,0 +1,54 @@
+mutation off-by-one: the key w ahead is accepted into a slot still holding an unreleased key
+detects window::proofs::exact_w3
+-     } else if seq - next < w {
++     } else if seq - next <= w {
+
+mutation the window is computed as next + w, which wraps near u64::MAX
+detects window::proofs::exact_w1024
+-     } else if seq - next < w {
++     } else if seq < next.wrapping_add(w) {
+
+mutation slot taken from the offset instead of the key, so a key moves slot as next advances
+detects window::proofs::exact_w3
+-     let slot = usize::try_from(seq.checked_rem(w)?).ok()?;
++     let slot = usize::try_from(seq.wrapping_sub(next).checked_rem(w)?).ok()?;
+
+mutation a zero window divides by zero instead of being rejected
+detects window::proofs::zero_window_is_rejected
+-     let slot = usize::try_from(seq.checked_rem(w)?).ok()?;
++     let slot = usize::try_from(seq % w.max(1)).ok()?;
+
+mutation off-by-one window, checked by exact_w1
+detects window::proofs::exact_w1
+-     } else if seq - next < w {
++     } else if seq - next <= w {
+
+mutation off-by-one window, checked by exact_w2
+detects window::proofs::exact_w2
+-     } else if seq - next < w {
++     } else if seq - next <= w {
+
+mutation off-by-one window, checked by exact_w2p32
+detects window::proofs::exact_w2p32
+-     } else if seq - next < w {
++     } else if seq - next <= w {
+
+mutation off-by-one window, checked by distinct_w2
+detects window::proofs::distinct_w2
+-     } else if seq - next < w {
++     } else if seq - next <= w {
+
+mutation off-by-one window, checked by distinct_w3
+detects window::proofs::distinct_w3
+-     } else if seq - next < w {
++     } else if seq - next <= w {
+
+mutation off-by-one window, checked by distinct_w1024
+detects window::proofs::distinct_w1024
+-     } else if seq - next < w {
++     } else if seq - next <= w {
+
+mutation off-by-one window, checked by distinct_w2p32
+detects window::proofs::distinct_w2p32
+-     } else if seq - next < w {
++     } else if seq - next <= w {

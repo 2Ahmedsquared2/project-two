@@ -80,6 +80,22 @@ impl Arm {
         matches!(self, Arm::Compio | Arm::CompioSqpoll)
     }
 
+    /// Why this arm cannot run at all on the platform named `os` (a value of
+    /// [`std::env::consts::OS`]), or `None` if the platform does not rule it
+    /// out. Such an arm is reported as unavailable with this reason, like an
+    /// `io_uring` arm on a host that blocks `io_uring`.
+    #[must_use]
+    pub fn unsupported_on(self, os: &str) -> Option<String> {
+        (self == Arm::FileInotify && os != "linux")
+            .then(|| format!("inotify is Linux-only and this build is for {os}"))
+    }
+
+    /// [`Arm::unsupported_on`] for the platform this binary was built for.
+    #[must_use]
+    pub fn unsupported_here(self) -> Option<String> {
+        self.unsupported_on(std::env::consts::OS)
+    }
+
     fn is_file(self) -> bool {
         Arm::DETECT.contains(&self)
     }
@@ -188,6 +204,50 @@ fn busy_arm(
     Ok(tick.into_core().into_hists())
 }
 
+/// Sleeps until the tailed file is next modified.
+#[cfg(target_os = "linux")]
+struct ModifyWatch {
+    inotify: inotify::Inotify,
+    events: [u8; 4096],
+}
+
+#[cfg(target_os = "linux")]
+impl ModifyWatch {
+    fn open(path: &Path) -> Result<Self, ReplayError> {
+        let inotify = inotify::Inotify::init()?;
+        inotify.watches().add(path, inotify::WatchMask::MODIFY)?;
+        Ok(Self {
+            inotify,
+            events: [0; 4096],
+        })
+    }
+
+    /// Events queue, so a write between the caller's empty read and this
+    /// call still wakes it.
+    fn wait(&mut self) -> Result<(), ReplayError> {
+        drop(self.inotify.read_events_blocking(&mut self.events)?);
+        Ok(())
+    }
+}
+
+/// There is no inotify off Linux, so one is never made: `file_arm` reports
+/// the arm unavailable ([`Arm::unsupported_on`]) before it would open one.
+#[cfg(not(target_os = "linux"))]
+struct ModifyWatch(std::convert::Infallible);
+
+#[cfg(not(target_os = "linux"))]
+impl ModifyWatch {
+    fn open(_path: &Path) -> Result<Self, ReplayError> {
+        Err(ReplayError::Config(
+            "inotify is Linux-only: the file-inotify arm cannot run on this platform".to_owned(),
+        ))
+    }
+
+    fn wait(&mut self) -> Result<(), ReplayError> {
+        match self.0 {}
+    }
+}
+
 fn file_arm(
     arm: Arm,
     path: &Path,
@@ -196,16 +256,17 @@ fn file_arm(
     total: u64,
     ready: &SyncSender<Ready>,
     abort: &AtomicBool,
-) -> Result<Hists, ReplayError> {
+) -> Result<Option<Hists>, ReplayError> {
+    if let Some(why) = arm.unsupported_here() {
+        let _ = ready.send(Ready::Unavailable(why));
+        return Ok(None);
+    }
     let file = File::open(path)?;
     let mut watch = if arm == Arm::FileInotify {
-        let ino = inotify::Inotify::init()?;
-        ino.watches().add(path, inotify::WatchMask::MODIFY)?;
-        Some(ino)
+        Some(ModifyWatch::open(path)?)
     } else {
         None
     };
-    let mut events = [0_u8; 4096];
     let mut tick = BusyTick::tail(file, sink, core);
     let _ = ready.send(Ready::Go);
     while tick.core().lines_seen() < total {
@@ -218,13 +279,11 @@ fn file_arm(
         match (arm, watch.as_mut()) {
             (Arm::FilePoll10us, _) => std::thread::sleep(Duration::from_micros(10)),
             (Arm::FilePoll100us, _) => std::thread::sleep(Duration::from_micros(100)),
-            // Events queue, so a write between the empty read above and this
-            // call still wakes it.
-            (Arm::FileInotify, Some(ino)) => drop(ino.read_events_blocking(&mut events)?),
+            (Arm::FileInotify, Some(watch)) => watch.wait()?,
             _ => std::hint::spin_loop(),
         }
     }
-    Ok(tick.into_core().into_hists())
+    Ok(Some(tick.into_core().into_hists()))
 }
 
 async fn tokio_conn(
@@ -409,7 +468,7 @@ fn hot_main(
         }
         (Arm::Compio, Source::Tcp(s)) => compio_arm(false, s, sink, core, total, &ready)?,
         (Arm::CompioSqpoll, Source::Tcp(s)) => compio_arm(true, s, sink, core, total, &ready)?,
-        (_, Source::File(path)) => Some(file_arm(arm, &path, sink, core, total, &ready, abort)?),
+        (_, Source::File(path)) => file_arm(arm, &path, sink, core, total, &ready, abort)?,
         (_, Source::Tcp(_)) => {
             return Err(ReplayError::Config(format!(
                 "{} reads a file, not a socket",

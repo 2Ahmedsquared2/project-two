@@ -1,0 +1,20 @@
+[package]
+name = "hl-capture"
+description = "Capture side of the same-block latency probe: tails our node's hourly output files and filters public WebSocket frames, stamping each arrival at read time."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+hl-latency = { path = "../hl-latency", version = "0.1.0" }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = "3"
+
+[lints]
+workspace = true

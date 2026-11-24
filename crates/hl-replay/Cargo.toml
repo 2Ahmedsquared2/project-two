@@ -14,9 +14,16 @@ default = ["compio"]
 # The two io_uring arms. On by default; build with `--no-default-features` if
 # compio does not build on a host, and those arms report "unavailable".
 compio = ["dep:compio"]
+# Runs `PrototypeSigner` (libsecp256k1, placeholder domain) as the signer stage
+# instead of the real `HlOrderSigner`, to compare their cost. The report then
+# says `signer=prototype`.
+prototype-signer = []
 
 [dependencies]
 hl-latency = { path = "../hl-latency" }
+# The real signer. Only its signing and body-building functions are called;
+# the crate ships no transport, so this adds no network code.
+hl-order = { path = "../hl-order" }
 hdrhistogram = "7.6"
 thiserror = { workspace = true }
 serde = { workspace = true }
@@ -24,9 +31,13 @@ rmp-serde = "1.3"
 sha3 = "0.10"
 secp256k1 = { version = "0.29", features = ["recovery"] }
 core_affinity = "0.8"
-inotify = { version = "0.11", default-features = false }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util"] }
 compio = { version = "=0.19.2", features = ["net", "runtime", "io-uring"], optional = true }
+
+# inotify is a Linux kernel interface and the crate does not build elsewhere.
+# Off Linux the file-inotify arm reports "unavailable" (`Arm::unsupported_on`).
+[target.'cfg(target_os = "linux")'.dependencies]
+inotify = { version = "0.11", default-features = false }
 
 [dev-dependencies]
 hl-alloc-gate = { path = "../hl-alloc-gate" }
