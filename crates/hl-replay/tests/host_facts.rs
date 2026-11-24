@@ -397,7 +397,7 @@ fn cores_outside_rcu_nocbs_warn_as_isolcpus_does() {
     );
     // `all` and a stepped range (CPUs 0, 1, 4, 5) are CPU lists too.
     let stepped = "isolcpus: 0-7\nnohz_full: 0-7:2/4\nrcu_nocbs: all";
-    assert_eq!(list_warnings(stepped, Some(0), Some(5)), none);
+    assert_eq!(list_warnings(stepped, Some(1), Some(5)), none);
     assert_eq!(
         list_warnings(stepped, Some(2), Some(5)),
         ["feeder core 2 is not in nohz_full (0-7:2/4)"]
