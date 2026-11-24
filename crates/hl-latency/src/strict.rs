@@ -302,6 +302,9 @@ impl<'de> Visitor<'de> for DataField<'_> {
                             block_time_ms: t,
                             block_number: None,
                             recv_ns: self.recv_ns,
+                            file_date: None,
+                            file_hour: None,
+                            line_offset: None,
                         });
                     }
                 }

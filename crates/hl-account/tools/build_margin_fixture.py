@@ -94,6 +94,7 @@ def main():
     ap.add_argument('--fills', required=True); ap.add_argument('--out', required=True)
     ap.add_argument('--default-leverage', type=int, default=20)
     ap.add_argument('--seed-height', type=int, default=1232430000)
+    ap.add_argument('--abstraction', help='json user -> state ust entry at the seed (exchange/locus/ust); adds account.abstraction')
     a = ap.parse_args()
 
     # Pass 1 over the replica: perp legs with their user, and each user's first non-order touch.
@@ -128,6 +129,7 @@ def main():
     def ticks(asset, px):
         return int(F(px) * 10 ** (6 - uni[asset]['szDecimals']))
 
+    ab = json.load(open(a.abstraction)) if a.abstraction else {}
     cases = []; seen = set(); gi = 0
     for (H, q, j, u, o, s) in legs:
         while gi < len(sga) and (sga[gi][0], sga[gi][1]) < (H, q):
@@ -167,7 +169,7 @@ def main():
         assets = sorted({p['asset'] for p in positions} | {o['a']})
         cases.append({
             'height': H, 'user': u,
-            'account': {'usdc': ust.get('u', 0), 'spot_usdc': spot, 'positions': positions,
+            'account': {'abstraction': ab.get(u, {}).get('a'), 'usdc': ust.get('u', 0), 'spot_usdc': spot, 'positions': positions,
                         'leverage': lev_settings, 'orders': orders},
             'marks': [[k, mark[k]] for k in assets],
             'order': {'asset': o['a'], 'is_buy': o['b'], 'px_ticks': ticks(o['a'], o['p']),

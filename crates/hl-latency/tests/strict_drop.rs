@@ -16,6 +16,9 @@ fn node(height: u64, time: u64, recv_ns: u64) -> Observation {
         block_time_ms: time,
         block_number: Some(height),
         recv_ns,
+        file_date: None,
+        file_hour: None,
+        line_offset: None,
     }
 }
 fn ws(time: u64, recv_ns: u64) -> Observation {
@@ -24,6 +27,9 @@ fn ws(time: u64, recv_ns: u64) -> Observation {
         block_time_ms: time,
         block_number: None,
         recv_ns,
+        file_date: None,
+        file_hour: None,
+        line_offset: None,
     }
 }
 
@@ -75,6 +81,9 @@ fn a_block_written_as_several_lines_is_dropped_whole() {
             strict_failures_unmatched: 0,
             strict_failures_omitted: 0,
             strict_drop_incomplete: false,
+            strict_drop_by_line: false,
+            strict_shifted_first_arrival: 0,
+            ..StrictDrop::default()
         }
     );
     let s = summarize(&pair(kept));

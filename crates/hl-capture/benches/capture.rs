@@ -1,6 +1,7 @@
 //! Timing harness for the capture loop: per-tick cost, write-to-stamp delay
 //! per detect mode, and the cost of the directory walk that looks for a
-//! newer hourly file.
+//! newer hourly file, and the writer's drain rate. An `n-detect` of 0 runs
+//! only the tick and drain parts.
 //!
 //! ```text
 //! cargo bench -p hl-capture --bench capture -- [n-tick] [n-detect]
@@ -176,12 +177,51 @@ fn walk(dates: u32, n: u64) {
     report(&format!("walk/{dates}-dates-x-24-files"), samples);
 }
 
+/// The writer's side: how fast it serialises what the ring holds. A file of
+/// `n` lines is read into the ring (not timed), then written out as JSON
+/// lines to memory (timed). Prints records per second per round.
+fn drain(n: u64, rounds: usize) {
+    let mut rates = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        let t = tempfile::tempdir_in(tmp_root()).unwrap();
+        let mut file = hourly_file(t.path());
+        let mut tail = NodeTailer::new(t.path());
+        let mut clock = || 1_795_075_200_070_123_456_u64;
+        let (mut sink, mut source) = ring(usize::try_from(n).unwrap());
+        tail.poll_into(&mut clock, &mut sink).unwrap();
+        let body: Vec<u8> = (0..n).flat_map(|h| node_line(h, 2)).collect();
+        file.write_all(&body).unwrap();
+        while {
+            tail.poll_into(&mut clock, &mut sink).unwrap();
+            tail.backlogged()
+        } {}
+        assert_eq!(sink.dropped(), 0);
+        let mut out = Vec::with_capacity(usize::try_from(n).unwrap() * 160);
+        let start = Instant::now();
+        let written = source.write_available(&mut out).unwrap();
+        let took = start.elapsed();
+        assert_eq!(written, n);
+        rates.push(written * 1_000_000_000 / ns(took).max(1));
+    }
+    rates.sort_unstable();
+    println!(
+        "drain/write_available/{n}-records   rounds={rounds} min={} median={} max={} records/s",
+        rates[0],
+        rates[rates.len() / 2],
+        rates[rates.len() - 1]
+    );
+}
+
 fn main() {
     let mut args = std::env::args().skip(1).filter(|a| !a.starts_with("--"));
     let n_tick: u64 = args.next().map_or(20_000, |a| a.parse().unwrap());
     let n_detect: u64 = args.next().map_or(5000, |a| a.parse().unwrap());
     tick(2, n_tick);
     tick(600, n_tick / 10);
+    drain(50_000, 21);
+    if n_detect == 0 {
+        return;
+    }
     detect(Detect::BusyPoll, Duration::ZERO, n_detect);
     detect(Detect::Inotify, Duration::ZERO, n_detect);
     detect(Detect::Poll, Duration::from_micros(100), n_detect);

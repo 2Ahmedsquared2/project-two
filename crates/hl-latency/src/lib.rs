@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 mod strict;
 mod strict_drop;
 
-pub use strict_drop::{StrictDrop, StrictFailures, StrictReadError};
+pub use strict_drop::{StrictDrop, StrictDropError, StrictFailures, StrictReadError};
 
 /// Where an arrival was observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -59,6 +59,20 @@ pub struct Observation {
     pub block_number: Option<u64>,
     /// Probe receive time, nanoseconds on the probe's clock.
     pub recv_ns: u64,
+    /// Date (`YYYYMMDD`) of the hourly node file the line was read from.
+    /// With [`Self::file_hour`] and [`Self::line_offset`] it names exactly
+    /// one line of the node's output, so an offline check of those files
+    /// (`hl-strict-pass`) can be matched to this observation. `hl-capture`
+    /// writes all three or none; absent for `WebSocket` arrivals and in
+    /// files captured before the fields existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_date: Option<u32>,
+    /// Hour (0 to 23) of that hourly file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_hour: Option<u8>,
+    /// Byte offset, from 0, of the line's first byte in that file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_offset: Option<u64>,
 }
 
 /// Errors from parsing a source line.
@@ -191,6 +205,9 @@ pub fn parse_node_line(line: &str, recv_ns: u64) -> Result<Observation, ParseErr
         block_time_ms: block_time?,
         block_number: Some(block_number),
         recv_ns,
+        file_date: None,
+        file_hour: None,
+        line_offset: None,
     })
 }
 
@@ -402,6 +419,9 @@ pub fn parse_ws_message_into(
                         block_time_ms: time,
                         block_number: None,
                         recv_ns,
+                        file_date: None,
+                        file_hour: None,
+                        line_offset: None,
                     });
                     Ok(())
                 }
@@ -646,7 +666,9 @@ pub enum ReadError {
     },
 }
 
-/// Reads [`Observation`]s from JSON Lines (blank lines skipped).
+/// Reads [`Observation`]s from JSON Lines (blank lines skipped). A line with
+/// only some of `file_date`, `file_hour` and `line_offset` is refused:
+/// together they name one line of the node's output, apart they name none.
 pub fn read_observations<R: std::io::BufRead>(r: R) -> Result<Vec<Observation>, ReadError> {
     let mut out = Vec::new();
     for (i, line) in r.lines().enumerate() {
@@ -654,10 +676,18 @@ pub fn read_observations<R: std::io::BufRead>(r: R) -> Result<Vec<Observation>, 
         if line.trim().is_empty() {
             continue;
         }
-        let o = serde_json::from_str(&line).map_err(|e| ReadError::Bad {
-            line: i + 1,
-            msg: e.to_string(),
-        })?;
+        let bad = |msg: String| ReadError::Bad { line: i + 1, msg };
+        let o: Observation = serde_json::from_str(&line).map_err(|e| bad(e.to_string()))?;
+        let located = [
+            o.file_date.is_some(),
+            o.file_hour.is_some(),
+            o.line_offset.is_some(),
+        ];
+        if located != [located[0]; 3] {
+            return Err(bad(
+                "file_date, file_hour and line_offset must all be present or all absent".to_owned(),
+            ));
+        }
         out.push(o);
     }
     Ok(out)

@@ -1,8 +1,10 @@
 //! Signer existence ("User or API Wallet 0x… does not exist."), from our node's
-//! data: every one of the 2,092 such errors in blocks 1232430001..1232440000 is a
-//! noop whose recovered signer is the address in native's message and is absent
-//! from the snapshot's user and agent sets; 3,000 of 3,000 sampled accepted noops
-//! recover to a signer in those sets. Addresses below are real.
+//! data, blocks 1232430001..1232440000, every noop recovered (85,748):
+//! all 2,092 such errors are noops whose recovered signer is the address in
+//! native's message and appears nowhere in the 1232430000 state; all 83,656
+//! accepted noops recover to a seeded signer (17,079 of 17,079 in the first
+//! 2,000 blocks, 66,577 of 66,577 in the 8,000 after, rule frozen). No accepted
+//! noop needed an agent approved inside the window. Addresses below are real.
 #![allow(clippy::unwrap_used)]
 
 use hl_account::Signers;

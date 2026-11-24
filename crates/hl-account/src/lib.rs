@@ -15,8 +15,18 @@
 //! side that grows the position pays its full notional and the side that
 //! shrinks it pays only for lots beyond `2 * |szi|`. An order is accepted when
 //! it does not raise its asset's charge, or when
-//! `AV - IM - E + spot USDC >= the raise`. A position or order with no leverage
-//! setting is charged at the default leverage capped at the asset maximum.
+//! `AV - IM - E (+ free spot USDC if the account is unified) >= the raise`.
+//! A position or order with no leverage setting is charged at the default
+//! leverage capped at the asset maximum.
+//!
+//! # Evolving state
+//! The ledger is driven by the engine's effects in execution order:
+//! [`Ledger::rest`] / [`Ledger::unrest`] for resting-order lots (placement,
+//! cancel, the maker side of a fill), [`Ledger::fill`] for each side of a trade,
+//! [`Ledger::set_leverage`], [`Ledger::set_abstraction`],
+//! [`Ledger::usd_class_transfer`] and [`Ledger::set_mark`]. [`Ledger::position`]
+//! is the read a reduce-only check needs. Portfolio-margin and isolated-margin
+//! accounts are not modelled.
 use std::collections::{BTreeMap, HashMap};
 
 /// Spot USDC has 8 decimals, perp USDC 6.
@@ -29,6 +39,34 @@ pub enum Decision {
     Accept,
     /// Native's "Insufficient margin to place order."
     InsufficientMargin,
+}
+
+/// The account's collateral mode, `exchange/locus/ust[addr].a` in the state and
+/// set by `userSetAbstraction` / `agentSetAbstraction`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Abstraction {
+    /// No `a` field.
+    #[default]
+    Unset,
+    /// `"u"`: one USDC balance; free spot USDC is perp collateral.
+    Unified,
+    /// `"i"`: spot USDC is not perp collateral.
+    Independent,
+    /// `"p"`: portfolio margin (not modelled; checked as if independent).
+    Portfolio,
+}
+
+impl Abstraction {
+    /// From the state's `ust.a` field.
+    #[must_use]
+    pub fn from_state(a: Option<&str>) -> Self {
+        match a {
+            Some("u") => Self::Unified,
+            Some("i") => Self::Independent,
+            Some("p") => Self::Portfolio,
+            _ => Self::Unset,
+        }
+    }
 }
 
 /// Per-asset market data.
@@ -67,6 +105,10 @@ pub struct OrderAgg {
 /// One user's account.
 #[derive(Debug, Clone, Default)]
 pub struct Account {
+    /// Collateral mode.
+    pub abstraction: Abstraction,
+    /// Assets on isolated margin (not modelled).
+    pub isolated: std::collections::BTreeSet<u32>,
     /// Perp cross USDC, micro.
     pub usdc: i64,
     /// Free spot USDC (total minus hold), 1e-8.
@@ -213,12 +255,134 @@ impl Ledger {
             .iter()
             .map(|(&a, o)| asset_order_margin(o, szi_of(a)))
             .sum();
-        let free =
-            (value - position_margin - order_margin) * SPOT_PER_MICRO + i128::from(acc.spot_usdc);
+        let spot = if acc.abstraction == Abstraction::Unified {
+            i128::from(acc.spot_usdc)
+        } else {
+            0
+        };
+        let free = (value - position_margin - order_margin) * SPOT_PER_MICRO + spot;
         if free >= need * SPOT_PER_MICRO {
             Decision::Accept
         } else {
             Decision::InsufficientMargin
+        }
+    }
+}
+
+impl Ledger {
+    fn acc_mut(&mut self, user: &str) -> &mut Account {
+        if !self.users.contains_key(user) {
+            self.users.insert(user.to_owned(), Account::default());
+        }
+        self.users.get_mut(user).unwrap_or_else(|| unreachable!())
+    }
+
+    /// Signed position of `user` on `asset`, in lots (0 if none).
+    #[must_use]
+    pub fn position(&self, user: &str, asset: u32) -> i64 {
+        self.users
+            .get(user)
+            .and_then(|a| a.positions.get(&asset))
+            .map_or(0, |p| p.szi)
+    }
+
+    /// One side of a trade: `lots` at `px_ticks`, paying `fee_micro` (negative
+    /// for a rebate). Cash moves by the notional and the fee; the position by
+    /// the lots. The maker's resting lots are released with [`Ledger::unrest`].
+    pub fn fill(
+        &mut self,
+        user: &str,
+        asset: u32,
+        is_buy: bool,
+        px_ticks: u64,
+        lots: i64,
+        fee_micro: i64,
+    ) {
+        let signed = if is_buy { lots } else { -lots };
+        let ntl = i128::from(signed) * i128::from(px_ticks);
+        let acc = self.acc_mut(user);
+        let cash = i128::from(acc.usdc) - ntl - i128::from(fee_micro);
+        acc.usdc = i64::try_from(cash).unwrap_or(if cash < 0 { i64::MIN } else { i64::MAX });
+        let p = acc.positions.entry(asset).or_insert(Position {
+            szi: 0,
+            entry_ntl: 0,
+        });
+        p.szi = p.szi.saturating_add(signed);
+        if p.szi == 0 {
+            acc.positions.remove(&asset);
+        }
+    }
+
+    /// Adds resting lots (a placement that rests, or its unfilled remainder).
+    /// New orders on an asset are margined at the account's leverage for it.
+    pub fn rest(&mut self, user: &str, asset: u32, is_buy: bool, px_ticks: u64, lots: i64) {
+        self.acc_mut(user);
+        let lev = {
+            let acc = &self.users[user];
+            self.leverage(acc, asset)
+        };
+        let acc = self.acc_mut(user);
+        let g = acc.orders.entry(asset).or_insert(OrderAgg {
+            leverage: lev,
+            ..OrderAgg::default()
+        });
+        let ntl = i64::try_from(i128::from(px_ticks) * i128::from(lots)).unwrap_or(i64::MAX);
+        if is_buy {
+            g.bid_ntl = g.bid_ntl.saturating_add(ntl);
+            g.bid_lots = g.bid_lots.saturating_add(lots);
+        } else {
+            g.ask_ntl = g.ask_ntl.saturating_add(ntl);
+            g.ask_lots = g.ask_lots.saturating_add(lots);
+        }
+    }
+
+    /// Removes resting lots (a cancel, or the maker side of a fill).
+    pub fn unrest(&mut self, user: &str, asset: u32, is_buy: bool, px_ticks: u64, lots: i64) {
+        let Some(acc) = self.users.get_mut(user) else {
+            return;
+        };
+        let Some(g) = acc.orders.get_mut(&asset) else {
+            return;
+        };
+        let ntl = i64::try_from(i128::from(px_ticks) * i128::from(lots)).unwrap_or(i64::MAX);
+        if is_buy {
+            g.bid_ntl = g.bid_ntl.saturating_sub(ntl).max(0);
+            g.bid_lots = g.bid_lots.saturating_sub(lots).max(0);
+        } else {
+            g.ask_ntl = g.ask_ntl.saturating_sub(ntl).max(0);
+            g.ask_lots = g.ask_lots.saturating_sub(lots).max(0);
+        }
+        if g.bid_lots == 0 && g.ask_lots == 0 {
+            acc.orders.remove(&asset);
+        }
+    }
+
+    /// `updateLeverage` that native accepted.
+    pub fn set_leverage(&mut self, user: &str, asset: u32, leverage: u32, is_cross: bool) {
+        let acc = self.acc_mut(user);
+        acc.leverage.insert(asset, leverage);
+        if is_cross {
+            acc.isolated.remove(&asset);
+        } else {
+            acc.isolated.insert(asset);
+        }
+    }
+
+    /// `userSetAbstraction` / `agentSetAbstraction` that native accepted.
+    pub fn set_abstraction(&mut self, user: &str, abstraction: Abstraction) {
+        self.acc_mut(user).abstraction = abstraction;
+    }
+
+    /// `usdClassTransfer`: `micro` USDC between spot and perp.
+    pub fn usd_class_transfer(&mut self, user: &str, micro: i64, to_perp: bool) {
+        let acc = self.acc_mut(user);
+        let spot = micro.saturating_mul(100);
+        if to_perp {
+            acc.usdc = acc.usdc.saturating_add(micro);
+            acc.spot_usdc = acc.spot_usdc.saturating_sub(spot);
+        } else {
+            acc.usdc = acc.usdc.saturating_sub(micro);
+            acc.spot_usdc = acc.spot_usdc.saturating_add(spot);
         }
     }
 }

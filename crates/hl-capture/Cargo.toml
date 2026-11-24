@@ -10,6 +10,8 @@ authors.workspace = true
 
 [dependencies]
 hl-latency = { path = "../hl-latency", version = "0.1.0" }
+# Integer formatting for the writer thread's hand-written JSON lines.
+itoa = "1"
 memchr = "2"
 rtrb = "0.3"
 serde_json = { workspace = true }
@@ -24,6 +26,8 @@ rustix = { version = "1", features = ["event"] }
 
 [dev-dependencies]
 hl-alloc-gate = { path = "../hl-alloc-gate" }
+# tests/offset.rs: a captured line's offset is the strict pass's offset.
+hl-strict-pass = { path = "../hl-strict-pass" }
 proptest = { workspace = true }
 tempfile = "3"
 
@@ -38,6 +42,13 @@ harness = false
 
 [[bench]]
 name = "legacy"
+harness = false
+
+# Issue #31: the reader's cost of a due look, and a new file's first-line
+# delay through the real binary:
+#   cargo bench -p hl-capture --bench rotation
+[[bench]]
+name = "rotation"
 harness = false
 
 [lints]

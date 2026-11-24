@@ -461,8 +461,8 @@ fn a_list_with_one_unreadable_part_is_unreadable_as_a_whole() {
             Some(2),
             Some(3)
         ),
-        Vec::<String>::new(),
-        "every nohz_full core is offloaded, so rcu_nocbs is not consulted"
+        [rcu_refused("2,x")],
+        "the operator is told the list was replaced, whatever nohz_full offloads"
     );
     assert_eq!(
         list_warnings(
@@ -472,7 +472,7 @@ fn a_list_with_one_unreadable_part_is_unreadable_as_a_whole() {
         ),
         [
             "feeder core 2 is not in nohz_full (6-7)".to_owned(),
-            unread("rcu_nocbs", "2,x")
+            rcu_refused("2,x")
         ]
     );
     // isolcpus takes the kernel's three flags before its list and no other word.
@@ -495,7 +495,11 @@ fn a_list_with_one_unreadable_part_is_unreadable_as_a_whole() {
             Some(2),
             Some(3)
         ),
-        [unread("nohz_full", "domain,2-3")]
+        [ignored(
+            "nohz_full",
+            "domain,2-3",
+            "feeder core 2 and hot core 3 are not tickless"
+        )]
     );
     let f = file_with_cores("isolcpus: 2,3-N", "active: 0");
     assert_eq!(
@@ -627,6 +631,7 @@ fn meta(host_facts: HostFactsNote) -> RunMeta {
         host: HostInfo::default(),
         feeder_core: None,
         hot_core: None,
+        sqpoll_core: None,
         rounds: 1,
         measured_per_round: 1,
         warmup_per_round: 0,
@@ -703,15 +708,12 @@ fn the_checked_bytes_are_what_gets_written_beside_the_report() {
 }
 
 #[test]
-fn a_cpu_number_no_kernel_can_hold_makes_the_list_unreadable() {
+fn a_cpu_number_no_kernel_can_hold_is_a_list_the_kernel_refuses() {
     // The kernel refuses a list naming a CPU at or past its mask width
     // (-ERANGE, Linux v6.8 lib/bitmap-str.c bitmap_check_region), and no
     // x86-64 or arm64 kernel is built wider than 8192 CPUs (v6.8
     // arch/x86/Kconfig NR_CPUS_RANGE_END; arm64 stops at 4096). Such a range
     // is never expanded CPU by CPU.
-    let unread = |key: &str, raw: &str| {
-        format!("{key} ({raw}) is not a CPU list this harness can read: pinned cores not checked against it")
-    };
     let none = Vec::<String>::new();
     for raw in [
         "0-18446744073709551615",
@@ -725,11 +727,15 @@ fn a_cpu_number_no_kernel_can_hold_makes_the_list_unreadable() {
                 Some(2),
                 Some(3)
             ),
-            [unread("nohz_full", raw)],
+            [ignored(
+                "nohz_full",
+                raw,
+                "feeder core 2 and hot core 3 are not tickless"
+            )],
             "{raw}"
         );
         let f = file_with_cores(&format!("isolcpus: {raw}"), "active: 0");
-        assert_eq!(f.isolated_cpus(), None, "{raw}");
+        assert_eq!(f.isolated_cpus(), Some(Vec::new()), "{raw}");
     }
     // The last CPU number such a kernel can have is still read.
     assert_eq!(
@@ -759,13 +765,10 @@ fn isolated_cpus_are_listed_once_each_in_ascending_order() {
 }
 
 #[test]
-fn a_stride_using_more_than_its_group_is_unreadable() {
+fn a_stride_using_more_than_its_group_is_a_list_the_kernel_refuses() {
     // The kernel rejects the whole list when "used size" exceeds "group
     // size" (-EINVAL: `r->off > r->group_len`, Linux v6.8 lib/bitmap-str.c
-    // bitmap_check_region), so it is not a CPU list to read either.
-    let unread = |key: &str, raw: &str| {
-        format!("{key} ({raw}) is not a CPU list this harness can read: pinned cores not checked against it")
-    };
+    // bitmap_check_region), so the kernel ignores nohz_full= and isolcpus=.
     for raw in ["0-7:3/2", "2-3,0-7:5/4"] {
         assert_eq!(
             list_warnings(
@@ -773,11 +776,15 @@ fn a_stride_using_more_than_its_group_is_unreadable() {
                 Some(2),
                 Some(3)
             ),
-            [unread("nohz_full", raw)],
+            [ignored(
+                "nohz_full",
+                raw,
+                "feeder core 2 and hot core 3 are not tickless"
+            )],
             "{raw}"
         );
         let f = file_with_cores(&format!("isolcpus: {raw}"), "active: 0");
-        assert_eq!(f.isolated_cpus(), None, "{raw}");
+        assert_eq!(f.isolated_cpus(), Some(Vec::new()), "{raw}");
     }
     // Used equal to the group is the whole range, which the kernel accepts.
     assert_eq!(
@@ -839,21 +846,32 @@ fn a_list_that_selects_no_cpu_is_a_readable_empty_list() {
 }
 
 #[test]
-fn isolcpus_flags_without_a_list_isolate_no_cpu() {
-    // `isolcpus=domain` hands the kernel an empty list, which
-    // `bitmap_parselist` accepts as an empty mask (it returns 0 when no
-    // region is found, Linux v6.8 lib/bitmap-str.c).
+fn isolcpus_flags_without_their_last_comma_are_not_read() {
+    // `isolcpus=domain,` hands the kernel an empty list, which
+    // `bitmap_parselist` accepts as an empty mask. Without the last comma the
+    // kernel does not take the last word as a flag (it matches "domain," and
+    // "managed_irq,", Linux v6.8 kernel/sched/isolation.c
+    // housekeeping_isolcpus_setup): the word falls into the unknown-flag
+    // loop, which steps past the end of the value. What the kernel then
+    // reads is not settled by the value, so the harness does not read it.
     assert_eq!(
         list_warnings(
             "isolcpus: domain,managed_irq\nnohz_full: 2-3\nrcu_nocbs: all",
             Some(2),
             Some(3)
         ),
-        [
-            "feeder core 2 is not in isolcpus (domain,managed_irq)",
-            "hot core 3 is not in isolcpus (domain,managed_irq)",
-        ]
+        [unread("isolcpus", "domain,managed_irq")]
     );
+}
+
+/// The line written when the kernel refuses `rcu_nocbs=`.
+fn rcu_refused(raw: &str) -> String {
+    format!("rcu_nocbs ({raw}) is a CPU list the kernel refuses: the kernel offloads every CPU from RCU callbacks instead; pinned cores are offloaded")
+}
+
+/// The line written when the kernel refuses `nohz_full=` or `isolcpus=`.
+fn ignored(key: &str, raw: &str, consequence: &str) -> String {
+    format!("{key} ({raw}) is a CPU list the kernel refuses and ignores: {consequence}")
 }
 
 /// The line written when a list is set and a part of it is not read.
@@ -998,10 +1016,670 @@ fn isolcpus_flags_are_read_only_where_the_kernel_reads_them() {
     for raw in [",domain,2", "2,domain", "domain,,managed_irq,2"] {
         assert_eq!(
             list_warnings(&format!("isolcpus: {raw}\n{QUIET}"), Some(2), Some(3)),
-            [unread("isolcpus", raw)],
+            [ignored(
+                "isolcpus",
+                raw,
+                "feeder core 2 and hot core 3 are not isolated"
+            )],
             "{raw}"
         );
         let f = file_with_cores(&format!("isolcpus: {raw}\n{QUIET}"), "active: 0");
+        assert_eq!(f.isolated_cpus(), Some(Vec::new()), "{raw}");
+    }
+}
+
+/// Lists the kernel refuses on any host (Linux v6.8 lib/bitmap-str.c,
+/// `bitmap_parse_region` and `bitmap_check_region`; the same code is in v5.15,
+/// v6.1 and v6.12): a part that starts with no digit, `N` or `all`, a
+/// descending range, a group of 0, a number that does not fit 32 bits, a
+/// sign, a stride cut short.
+const REFUSED: [&str; 10] = [
+    "2-x",
+    "x",
+    "3-2",
+    "2,7-4",
+    "0-7:1/0",
+    "+2",
+    "2-",
+    "0-7:1",
+    "0-7/2",
+    "2-3,4294967296",
+];
+
+#[test]
+fn a_refused_rcu_nocbs_offloads_every_cpu() {
+    // kernel/rcu/tree_nocb.h rcu_nocb_setup: on a cpulist_parse error it
+    // prints "rcu_nocbs= bad CPU range, all CPUs set" and calls
+    // cpumask_setall. One refused part refuses the whole list.
+    for raw in REFUSED {
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: 2-3\nnohz_full: not set\nrcu_nocbs: {raw}"),
+                Some(2),
+                Some(3)
+            ),
+            [
+                "nohz_full is not set: feeder core 2 and hot core 3 are not tickless".to_owned(),
+                rcu_refused(raw)
+            ],
+            "{raw}"
+        );
+    }
+    // With nohz_full unread, a refused rcu_nocbs still settles the offload.
+    assert_eq!(
+        list_warnings(
+            "isolcpus: 2-3\nnohz_full: 2-N\nrcu_nocbs: 3-2",
+            Some(2),
+            Some(3)
+        ),
+        [unread("nohz_full", "2-N"), rcu_refused("3-2")]
+    );
+    // No pinned core, no line.
+    assert_eq!(
+        list_warnings("isolcpus: 2-3\nnohz_full: 2-3\nrcu_nocbs: 3-2", None, None),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_refused_nohz_full_or_isolcpus_is_ignored_by_the_kernel() {
+    // kernel/sched/isolation.c housekeeping_setup: on a cpulist_parse error
+    // it prints "Housekeeping: nohz_full= or isolcpus= incorrect CPU range"
+    // and sets nothing.
+    for raw in REFUSED {
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: 2-3\nnohz_full: {raw}\nrcu_nocbs: all"),
+                Some(2),
+                Some(3)
+            ),
+            [ignored(
+                "nohz_full",
+                raw,
+                "feeder core 2 and hot core 3 are not tickless"
+            )],
+            "{raw}"
+        );
+        // The roles and cores are the pinned ones.
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: 2-3\nnohz_full: {raw}\nrcu_nocbs: all"),
+                None,
+                Some(5)
+            ),
+            [
+                "hot core 5 is not in isolcpus (2-3)".to_owned(),
+                ignored("nohz_full", raw, "hot core 5 is not tickless")
+            ],
+            "{raw}"
+        );
+    }
+    // In isolcpus a part starting with a letter is a flag, so only the
+    // lists that start with a digit or a sign reach cpulist_parse.
+    for raw in ["3-2", "2-x", "+2", "domain,3-2"] {
+        assert_eq!(
+            list_warnings(&format!("isolcpus: {raw}\n{QUIET}"), Some(4), None),
+            [ignored("isolcpus", raw, "feeder core 4 is not isolated")],
+            "{raw}"
+        );
+        let f = file_with_cores(&format!("isolcpus: {raw}"), "active: 0");
+        assert_eq!(f.isolated_cpus(), Some(Vec::new()), "{raw}");
+    }
+    // A refused part wins over a part only the host can settle.
+    assert_eq!(
+        list_warnings(
+            "isolcpus: 2-3\nnohz_full: 2-N,x\nrcu_nocbs: all",
+            Some(2),
+            None
+        ),
+        [ignored(
+            "nohz_full",
+            "2-N,x",
+            "feeder core 2 is not tickless"
+        )]
+    );
+}
+
+#[test]
+fn a_refused_nohz_full_offloads_no_core_so_rcu_nocbs_alone_decides() {
+    // A refused nohz_full sets no CPU, so it implies no RCU offload: the
+    // reading is known, not undetermined.
+    assert_eq!(
+        list_warnings(
+            "isolcpus: 2-3\nnohz_full: 3-2\nrcu_nocbs: 2",
+            Some(2),
+            Some(3)
+        ),
+        [
+            ignored(
+                "nohz_full",
+                "3-2",
+                "feeder core 2 and hot core 3 are not tickless"
+            ),
+            "hot core 3 is not in rcu_nocbs (2)".to_owned(),
+        ]
+    );
+    assert_eq!(
+        list_warnings("isolcpus: 2-3\nnohz_full: 3-2\nrcu_nocbs: not set", Some(2), Some(3)),
+        [
+            ignored(
+                "nohz_full",
+                "3-2",
+                "feeder core 2 and hot core 3 are not tickless"
+            ),
+            "rcu_nocbs is not set: feeder core 2 and hot core 3 are not offloaded from RCU callbacks"
+                .to_owned(),
+        ]
+    );
+    // A refused nohz_full names no CPU 0 either.
+    assert_eq!(
+        list_warnings(
+            "isolcpus: 0-3\nnohz_full: 0,x\nrcu_nocbs: all",
+            Some(0),
+            None
+        ),
+        [ignored("nohz_full", "0,x", "feeder core 0 is not tickless")]
+    );
+}
+
+#[test]
+fn a_list_only_the_host_can_settle_stays_unreadable() {
+    // `N` is the last CPU, so whether `N-2` descends or `0-N:1/N` holds
+    // depends on the host's CPU count; `all` with a stride likewise.
+    for raw in ["N-2", "2,N", "0-N:1/N", "all:1/2", "0-7:1/2N"] {
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: 2-3\nnohz_full: all\nrcu_nocbs: {raw}"),
+                Some(2),
+                Some(3)
+            ),
+            Vec::<String>::new(),
+            "{raw}"
+        );
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: 2-3\nnohz_full: {raw}\nrcu_nocbs: all"),
+                Some(2),
+                Some(3)
+            ),
+            [unread("nohz_full", raw)],
+            "{raw}"
+        );
+    }
+    // A stride no host accepts is refused even beside `N`.
+    for raw in ["0-N:3/2", "0-N:1/0", "Nx", "all:x"] {
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: 2-3\nnohz_full: {raw}\nrcu_nocbs: all"),
+                Some(2),
+                None
+            ),
+            [ignored("nohz_full", raw, "feeder core 2 is not tickless")],
+            "{raw}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_isolcpus_flag_with_its_comma_is_skipped() {
+    // housekeeping_isolcpus_setup: a word of letters and underscores that is
+    // none of the three flags is skipped up to its comma ("isolcpus: Skipped
+    // unknown flag") and the kernel reads on. `all` and `N` start with a
+    // letter, so before the list they are such words too.
+    for (raw, cpus) in [
+        ("foo,2-3", vec![2, 3]),
+        ("domain,some_flag,managed_irq,2", vec![2]),
+        ("all,2", vec![2]),
+        ("N,3", vec![3]),
+        ("foo,", vec![]),
+        ("domain,", vec![]),
+        ("nohz,domain,managed_irq,", vec![]),
+    ] {
+        let f = file_with_cores(&format!("isolcpus: {raw}\n{QUIET}"), "active: 0");
+        assert_eq!(f.isolated_cpus(), Some(cpus), "{raw}");
+    }
+    assert_eq!(
+        list_warnings(&format!("isolcpus: foo,2\n{QUIET}"), Some(2), Some(3)),
+        ["hot core 3 is not in isolcpus (foo,2)"]
+    );
+}
+
+#[test]
+fn an_isolcpus_flag_with_a_character_no_flag_has_is_refused() {
+    // housekeeping_isolcpus_setup: a word in flag position holding anything
+    // but letters and underscores is "isolcpus: Invalid flag"; the function
+    // returns 0 and nothing is isolated. The check runs before the end of
+    // the word matters, so it holds for a last word too.
+    for raw in ["no2hz,2-3", "domain,a-b,2", "x9", "domain,foo=1"] {
+        assert_eq!(
+            list_warnings(&format!("isolcpus: {raw}\n{QUIET}"), Some(2), Some(3)),
+            [ignored(
+                "isolcpus",
+                raw,
+                "feeder core 2 and hot core 3 are not isolated"
+            )],
+            "{raw}"
+        );
+        let f = file_with_cores(&format!("isolcpus: {raw}"), "active: 0");
+        assert_eq!(f.isolated_cpus(), Some(Vec::new()), "{raw}");
+    }
+}
+
+#[test]
+fn a_last_isolcpus_word_without_its_comma_is_not_read() {
+    // The kernel matches each flag with its comma, so a last word (a known
+    // flag, an unknown one, `all`) falls into the unknown-flag loop, whose
+    // `str++` then steps past the end of the value. Source alone does not
+    // settle what follows, so the harness says unreadable and does not guess.
+    for raw in [
+        "domain",
+        "nohz,domain",
+        "foo",
+        "domain,foo",
+        "all",
+        "domain,all",
+        "N",
+    ] {
+        assert_eq!(
+            list_warnings(&format!("isolcpus: {raw}\n{QUIET}"), Some(2), Some(3)),
+            [unread("isolcpus", raw)],
+            "{raw}"
+        );
+        let f = file_with_cores(&format!("isolcpus: {raw}"), "active: 0");
         assert_eq!(f.isolated_cpus(), None, "{raw}");
     }
+}
+
+#[test]
+fn a_refused_region_refuses_the_list_before_what_follows_its_stride_is_read() {
+    // lib/bitmap-str.c bitmap_parselist (Linux v6.8): each region goes
+    // through bitmap_check_region before the next one is parsed, so a region
+    // refused on any host refuses the list whatever follows its stride, an
+    // `N` included.
+    for raw in [
+        "0-3:3/2N",
+        "5-3:1/2N",
+        "0-3:1/0N",
+        "0-3:3/2all",
+        "0-3:3/2N-2",
+    ] {
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: 2-3\nnohz_full: {raw}\nrcu_nocbs: all"),
+                Some(2),
+                Some(3)
+            ),
+            [ignored(
+                "nohz_full",
+                raw,
+                "feeder core 2 and hot core 3 are not tickless"
+            )],
+            "{raw}"
+        );
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: 2-3\nnohz_full: not set\nrcu_nocbs: {raw}"),
+                Some(2),
+                Some(3)
+            ),
+            [
+                "nohz_full is not set: feeder core 2 and hot core 3 are not tickless".to_owned(),
+                rcu_refused(raw)
+            ],
+            "{raw}"
+        );
+    }
+}
+
+#[test]
+fn a_stride_using_nothing_before_an_n_is_still_for_the_host_to_settle() {
+    // bitmap_check_region refuses `off > group_len` and `group_len == 0`,
+    // not `off == 0`: `0-3:0/2` is accepted and sets no bit, so with an `N`
+    // after it the list is the host's last CPU, which only the host knows.
+    for raw in ["0-3:0/2N", "0-3:2/2N"] {
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: 2-3\nnohz_full: {raw}\nrcu_nocbs: all"),
+                Some(2),
+                Some(3)
+            ),
+            [unread("nohz_full", raw)],
+            "{raw}"
+        );
+    }
+}
+
+#[test]
+fn a_group_of_zero_is_refused_whatever_it_uses() {
+    // bitmap_check_region: `group_len == 0` is -EINVAL on its own, also when
+    // `off` is 0 and so not above it.
+    for raw in ["0-7:0/0", "2,0-7:0/0"] {
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: 2-3\nnohz_full: {raw}\nrcu_nocbs: all"),
+                Some(2),
+                Some(3)
+            ),
+            [ignored(
+                "nohz_full",
+                raw,
+                "feeder core 2 and hot core 3 are not tickless"
+            )],
+            "{raw}"
+        );
+    }
+}
+
+#[test]
+fn a_refused_region_after_a_stride_refuses_the_list() {
+    // bitmap_parse_region returns the text after the group as the next
+    // region, with no comma needed; bitmap_getnum refuses one that starts
+    // with no digit and no `N`, and bitmap_check_region a descending one.
+    for raw in [
+        "0-7:1/2x",
+        "0-7:1/2-",
+        "0-7:1/25-3",
+        "0-7:1/2N-",
+        "0-7:1/2:",
+    ] {
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: 2-3\nnohz_full: {raw}\nrcu_nocbs: all"),
+                Some(2),
+                Some(3)
+            ),
+            [ignored(
+                "nohz_full",
+                raw,
+                "feeder core 2 and hot core 3 are not tickless"
+            )],
+            "{raw}"
+        );
+    }
+}
+
+// ---- the core of the compio-sqpoll arm's kernel polling thread (#64) ----
+
+/// Sixteen CPUs whose thread siblings are n and n+8, as on the Tokyo box.
+fn smt_pairs() -> String {
+    let mut s = String::from("active: 1");
+    for cpu in 0..16 {
+        let _ = write!(s, "\ncpu{cpu} thread siblings: {},{}", cpu % 8, cpu % 8 + 8);
+    }
+    s
+}
+
+/// A complete file with these kernel-cmdline, smt and numa sections.
+fn file_with_topology(cmdline: &str, smt: &str, numa: &str) -> HostFacts {
+    let text = file_with(None, "x")
+        .replace(
+            "== begin kernel-cmdline\nx\n",
+            &format!("== begin kernel-cmdline\n{cmdline}\n"),
+        )
+        .replace("== begin smt\nx\n", &format!("== begin smt\n{smt}\n"))
+        .replace("== begin numa\nx\n", &format!("== begin numa\n{numa}\n"));
+    HostFacts::parse(&text).unwrap()
+}
+
+fn sqpoll_warnings(
+    f: &HostFacts,
+    feeder: Option<usize>,
+    hot: Option<usize>,
+    sqpoll: Option<usize>,
+) -> Vec<String> {
+    match HostFactsNote::captured_with_sqpoll(Path::new("f"), f, feeder, hot, sqpoll) {
+        HostFactsNote::Captured { warnings, .. } => warnings,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Every core isolated, one NUMA node, siblings n and n+8.
+fn quiet_box() -> HostFacts {
+    file_with_topology(
+        &format!("isolcpus: 0-15\n{QUIET}"),
+        &smt_pairs(),
+        "node0 cpus: 0-15",
+    )
+}
+const HOT_15_SIBLING: &str =
+    "hot core 15 shares its physical core with another thread (siblings 7,15)";
+
+#[test]
+fn a_polling_thread_on_its_own_isolated_physical_core_adds_no_warning() {
+    // The Tokyo Step 2 choice: feeder 14, hot 15, polling thread 13.
+    assert_eq!(
+        sqpoll_warnings(&quiet_box(), Some(14), Some(15), Some(13)),
+        [HOT_15_SIBLING]
+    );
+    // No polling-thread core: exactly what `captured` says.
+    let f = quiet_box();
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), None),
+        warnings(&f, Some(14), Some(15))
+    );
+}
+
+#[test]
+fn a_polling_thread_on_the_feeder_or_hot_core_is_a_warning() {
+    let f = quiet_box();
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(14)),
+        [
+            HOT_15_SIBLING,
+            "sqpoll core 14 is the feeder core: the kernel polling thread spins there against the feeder and sink",
+        ]
+    );
+    // The binary refuses this one as a usage error; the note still says it.
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(15)),
+        [
+            HOT_15_SIBLING,
+            "sqpoll core 15 is the hot core: the kernel polling thread spins there against the hot thread",
+        ]
+    );
+}
+
+#[test]
+fn a_polling_thread_on_a_sibling_of_the_hot_or_feeder_core_is_a_warning() {
+    let f = quiet_box();
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(7)),
+        [
+            HOT_15_SIBLING,
+            "sqpoll core 7 shares its physical core with hot core 15 (siblings 7,15)",
+        ]
+    );
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(6)),
+        [
+            HOT_15_SIBLING,
+            "sqpoll core 6 shares its physical core with feeder core 14 (siblings 6,14)",
+        ]
+    );
+    // Siblings written as a range, and a feeder and hot thread that are
+    // siblings of each other and of the polling thread.
+    let f = file_with_topology(
+        &format!("isolcpus: 0-15\n{QUIET}"),
+        "active: 1\ncpu1 thread siblings: 1-3\ncpu2 thread siblings: 1-3\ncpu3 thread siblings: 1-3",
+        "node0 cpus: 0-15",
+    );
+    assert_eq!(
+        sqpoll_warnings(&f, Some(1), Some(2), Some(3)),
+        [
+            "hot core 2 shares its physical core with another thread (siblings 1-3)",
+            "sqpoll core 3 shares its physical core with feeder core 1 (siblings 1-3)",
+            "sqpoll core 3 shares its physical core with hot core 2 (siblings 1-3)",
+        ]
+    );
+    // An unpinned feeder or hot thread has no core to share.
+    assert_eq!(
+        sqpoll_warnings(&quiet_box(), None, None, Some(7)),
+        Vec::<String>::new()
+    );
+    // A capture without the polling thread's sibling line says nothing.
+    let f = file_with_topology(
+        &format!("isolcpus: 0-15\n{QUIET}"),
+        "active: unavailable (not readable)",
+        "node0 cpus: 0-15",
+    );
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(7)),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_polling_thread_outside_the_isolated_set_warns_as_the_other_cores_do() {
+    let numa = "node0 cpus: 0-15";
+    let f = file_with_topology(&format!("isolcpus: 14-15\n{QUIET}"), "active: 0", numa);
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(13)),
+        ["sqpoll core 13 is not in isolcpus (14-15)"]
+    );
+    // Tokyo: nothing is isolated.
+    let f = file_with_topology(&format!("isolcpus: not set\n{QUIET}"), "active: 0", numa);
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(13)),
+        ["isolcpus is not set: feeder core 14, hot core 15 and sqpoll core 13 are not isolated"]
+    );
+    assert_eq!(
+        sqpoll_warnings(&f, None, None, Some(13)),
+        ["isolcpus is not set: sqpoll core 13 is not isolated"]
+    );
+}
+
+/// Latency's rule: the polling thread spins and picks up submissions, so the
+/// tick and RCU callbacks on its core delay them as they delay the hot
+/// thread. All three pinned cores are judged by the same lists.
+#[test]
+fn a_polling_thread_outside_nohz_full_or_rcu_nocbs_warns_as_the_other_cores_do() {
+    let topo = |cmdline: &str| file_with_topology(cmdline, "active: 0", "node0 cpus: 0-15");
+    let f = topo("isolcpus: 13-15\nnohz_full: 14-15\nrcu_nocbs: 14-15");
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(13)),
+        [
+            "sqpoll core 13 is not in nohz_full (14-15)",
+            "sqpoll core 13 is not in rcu_nocbs (14-15)",
+        ]
+    );
+    // In nohz_full its RCU callbacks are offloaded already.
+    let f = topo("isolcpus: 13-15\nnohz_full: 13-15\nrcu_nocbs: 14-15");
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(13)),
+        Vec::<String>::new()
+    );
+    // Offloaded but not tickless.
+    let f = topo("isolcpus: 13-15\nnohz_full: 14-15\nrcu_nocbs: 13-15");
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(13)),
+        ["sqpoll core 13 is not in nohz_full (14-15)"]
+    );
+    // Tokyo: none of the three is set.
+    let f = topo("isolcpus: not set\nnohz_full: not set\nrcu_nocbs: not set");
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(13)),
+        [
+            "isolcpus is not set: feeder core 14, hot core 15 and sqpoll core 13 are not isolated",
+            "nohz_full is not set: feeder core 14, hot core 15 and sqpoll core 13 are not tickless",
+            "rcu_nocbs is not set: feeder core 14, hot core 15 and sqpoll core 13 are not offloaded from RCU callbacks",
+        ]
+    );
+    // A polling thread on CPU 0 that nohz_full names: the boot CPU keeps the tick.
+    let f = topo("isolcpus: 0-15\nnohz_full: 0-15\nrcu_nocbs: 0-15");
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(0)),
+        ["sqpoll core 0 is in nohz_full (0-15), but the kernel forces the boot CPU (normally CPU 0) outside nohz_full: it may still take the tick"]
+    );
+    // An unreadable nohz_full leaves its offload undetermined too.
+    let f = topo("isolcpus: 13-15\nnohz_full: 2-N\nrcu_nocbs: 14-15");
+    let got = sqpoll_warnings(&f, Some(14), Some(15), Some(13));
+    assert!(
+        got.contains(&"sqpoll core 13 is not in rcu_nocbs (14-15) and nohz_full (2-N) could not be parsed: whether it is offloaded from RCU callbacks is undetermined".to_owned()),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn a_polling_thread_on_another_numa_node_than_the_hot_core_is_a_warning() {
+    let cmdline = format!("isolcpus: 0-15\n{QUIET}");
+    let f = file_with_topology(
+        &cmdline,
+        "active: 0",
+        "node0 cpus: 0-7\nnode1 cpus: 8-11,12-15",
+    );
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(3)),
+        ["sqpoll core 3 is on NUMA node 0 and hot core 15 is on NUMA node 1"]
+    );
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(13)),
+        Vec::<String>::new()
+    );
+    // The feeder's node is not compared, and an unpinned hot thread has none.
+    assert_eq!(
+        sqpoll_warnings(&f, Some(3), Some(15), Some(13)),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), None, Some(3)),
+        Vec::<String>::new()
+    );
+    // A host that could not give its nodes is not called single-node or split.
+    let f = file_with_topology(
+        &cmdline,
+        "active: 0",
+        "unavailable (no /sys/devices/system/node/node*)",
+    );
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(3)),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn the_report_prints_the_polling_threads_warnings() {
+    let f = file_with_topology(
+        &format!("isolcpus: 14-15\n{QUIET}"),
+        &smt_pairs(),
+        "node0 cpus: 0-7\nnode1 cpus: 8-15",
+    );
+    let note = HostFactsNote::captured_with_sqpoll(Path::new("f"), &f, Some(14), Some(15), Some(7));
+    let report = render_report(&meta(note), &[]);
+    for want in [
+        "  warning: sqpoll core 7 is not in isolcpus (14-15)",
+        "  warning: sqpoll core 7 shares its physical core with hot core 15 (siblings 7,15)",
+        "  warning: sqpoll core 7 is on NUMA node 0 and hot core 15 is on NUMA node 1",
+    ] {
+        assert!(report.contains(want), "no {want:?} in:\n{report}");
+    }
+}
+
+/// The binary passes `--sqpoll-core` to the host-facts check.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_binary_warns_about_the_polling_threads_core() {
+    let dir = tmp("sqpoll-warn");
+    let kernel =
+        String::from_utf8(Command::new("uname").arg("-r").output().unwrap().stdout).unwrap();
+    let text = file_with(None, "x")
+        .replace("kernel: 6.8.0-test", &format!("kernel: {}", kernel.trim()))
+        .replace(
+            "== begin kernel-cmdline\nx\n",
+            &format!("== begin kernel-cmdline\nisolcpus: 0\n{QUIET}\n"),
+        );
+    let facts = dir.join("facts.txt");
+    std::fs::write(&facts, text).unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_hl-replay"))
+        .args(["--rounds", "1", "--lines", "100", "--warmup", "10"])
+        .args(["--interval-us", "30", "--arms", "busy-poll"])
+        .args(["--hot-core", "0", "--sqpoll-core", "1", "--host-facts"])
+        .arg(&facts)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let report = String::from_utf8(o.stdout).unwrap();
+    assert!(
+        report.contains("  warning: sqpoll core 1 is not in isolcpus (0)"),
+        "{report}"
+    );
 }

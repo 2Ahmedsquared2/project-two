@@ -33,6 +33,10 @@ loopback socket (t2), per arm, rounds interleaved.
   --distinct N       distinct generated lines (default 64)
   --feeder-core N    core for the feeder and sink (default 0)
   --hot-core N       core for the hot thread (default 1)
+  --sqpoll-core N    core for the kernel polling thread of compio-sqpoll; not
+                     the hot core. A pinned run without it reports that arm
+                     unavailable: the thread would start, and spin, beside
+                     the hot thread
   --no-pin           pin nothing
   --tail-dir DIR     where detect arms tail their file (default /dev/shm)
   --sink-bind ADDR   sink listen address; loopback only (default 127.0.0.1:0)
@@ -58,6 +62,7 @@ struct Args {
     distinct: usize,
     feeder_core: Option<usize>,
     hot_core: Option<usize>,
+    sqpoll_core: Option<usize>,
     tail_dir: PathBuf,
     sink_bind: LoopbackAddr,
     out: Option<PathBuf>,
@@ -134,6 +139,7 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
         distinct: 64,
         feeder_core: Some(0),
         hot_core: Some(1),
+        sqpoll_core: None,
         tail_dir: PathBuf::from("/dev/shm"),
         sink_bind: LoopbackAddr::ephemeral(),
         out: None,
@@ -170,6 +176,7 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
             "--distinct",
             "--feeder-core",
             "--hot-core",
+            "--sqpoll-core",
             "--tail-dir",
             "--sink-bind",
             "--out",
@@ -192,6 +199,7 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
             "--distinct" => a.distinct = num(flag, v)?,
             "--feeder-core" => a.feeder_core = Some(num(flag, v)?),
             "--hot-core" => a.hot_core = Some(num(flag, v)?),
+            "--sqpoll-core" => a.sqpoll_core = Some(num(flag, v)?),
             "--tail-dir" => a.tail_dir = PathBuf::from(v),
             "--host-facts" => a.host_facts = Some(PathBuf::from(v)),
             "--sink-bind" => a.sink_bind = v.parse().map_err(|e| format!("--sink-bind: {e}"))?,
@@ -201,6 +209,12 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
     if no_pin {
         a.feeder_core = None;
         a.hot_core = None;
+    }
+    if a.sqpoll_core.is_some() && a.sqpoll_core == a.hot_core {
+        return Err(
+            "--sqpoll-core must not be the --hot-core: the kernel polling thread would spin against the hot thread"
+                .to_owned(),
+        );
     }
     validate(&a)?;
     Ok(Some(a))
@@ -217,7 +231,13 @@ fn check_host_facts(
         Some(path) => {
             let facts = HostFacts::load(path)?;
             facts.check_kernel(&host.kernel)?;
-            let note = HostFactsNote::captured(path, &facts, args.feeder_core, args.hot_core);
+            let note = HostFactsNote::captured_with_sqpoll(
+                path,
+                &facts,
+                args.feeder_core,
+                args.hot_core,
+                args.sqpoll_core,
+            );
             Ok((note, Some(facts)))
         }
         None if args.allow_missing_host_facts => Ok((HostFactsNote::Waived, None)),
@@ -274,6 +294,7 @@ fn main() -> ExitCode {
         interval: Duration::from_micros(args.interval_us),
         feeder_core: args.feeder_core,
         hot_core: args.hot_core,
+        sqpoll_core: args.sqpoll_core,
         tail_dir: args.tail_dir,
         sink_bind: args.sink_bind,
     };
@@ -289,6 +310,7 @@ fn main() -> ExitCode {
         host,
         feeder_core: cfg.feeder_core,
         hot_core: cfg.hot_core,
+        sqpoll_core: cfg.sqpoll_core,
         rounds: args.rounds,
         measured_per_round: cfg.measured,
         warmup_per_round: cfg.warmup,

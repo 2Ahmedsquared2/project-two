@@ -13,6 +13,9 @@ fn node(t: u64, h: u64, ns: u64) -> Observation {
         block_time_ms: t,
         block_number: Some(h),
         recv_ns: ns,
+        file_date: None,
+        file_hour: None,
+        line_offset: None,
     }
 }
 fn ws(t: u64, ns: u64) -> Observation {
@@ -21,6 +24,9 @@ fn ws(t: u64, ns: u64) -> Observation {
         block_time_ms: t,
         block_number: None,
         recv_ns: ns,
+        file_date: None,
+        file_hour: None,
+        line_offset: None,
     }
 }
 

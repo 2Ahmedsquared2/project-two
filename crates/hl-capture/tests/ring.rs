@@ -12,6 +12,9 @@ fn obs(h: u64) -> Observation {
         block_time_ms: 1_795_075_200_000 + h,
         block_number: Some(h),
         recv_ns: 10 * h,
+        file_date: None,
+        file_hour: None,
+        line_offset: None,
     }
 }
 
@@ -101,4 +104,119 @@ fn the_sink_sees_a_writer_that_died() {
     sink.observe(obs(1));
     assert!(writer.join().unwrap().is_err());
     assert!(sink.abandoned());
+}
+
+mod encoding {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn any_observation() -> impl Strategy<Value = Observation> {
+        (
+            any::<bool>(),
+            any::<u64>(),
+            proptest::option::of(any::<u64>()),
+            any::<u64>(),
+            proptest::option::of((any::<u32>(), any::<u8>(), any::<u64>())),
+        )
+            .prop_map(
+                |(ws, block_time_ms, block_number, recv_ns, file)| Observation {
+                    source: if ws { Source::PublicWs } else { Source::Node },
+                    block_time_ms,
+                    block_number,
+                    recv_ns,
+                    file_date: file.map(|f| f.0),
+                    file_hour: file.map(|f| f.1),
+                    line_offset: file.map(|f| f.2),
+                },
+            )
+    }
+
+    proptest! {
+        /// The writer formats its lines by hand; they must be exactly what
+        /// `serde_json` writes for the same observations, and read back as
+        /// the observations pushed.
+        #[test]
+        fn output_lines_are_serde_jsons_byte_for_byte(
+            obs in prop::collection::vec(any_observation(), 0..40),
+        ) {
+            let (mut sink, mut source) = ring(64);
+            let mut want = Vec::new();
+            for o in &obs {
+                sink.observe(*o);
+                serde_json::to_writer(&mut want, o).unwrap();
+                want.push(b'\n');
+            }
+            let mut out = Vec::new();
+            source.write_available(&mut out).unwrap();
+            prop_assert_eq!(String::from_utf8(out.clone()).unwrap(), String::from_utf8(want).unwrap());
+            prop_assert_eq!(read_observations(&out[..]).unwrap(), obs);
+        }
+    }
+
+    /// The three file fields with each one present or absent on its own.
+    fn any_file_fields() -> impl Strategy<Value = Observation> {
+        (
+            any_observation(),
+            proptest::option::of(any::<u32>()),
+            proptest::option::of(any::<u8>()),
+            proptest::option::of(any::<u64>()),
+        )
+            .prop_map(|(o, file_date, file_hour, line_offset)| Observation {
+                file_date,
+                file_hour,
+                line_offset,
+                ..o
+            })
+    }
+
+    proptest! {
+        /// The file fields are all three or none. An observation with only
+        /// one or two of them is written with none, the other fields
+        /// unchanged; with all three it is written as it is.
+        #[test]
+        fn some_but_not_all_file_fields_are_written_as_none(
+            obs in prop::collection::vec(any_file_fields(), 0..40),
+        ) {
+            let (mut sink, mut source) = ring(64);
+            let mut want_obs = Vec::new();
+            let mut want = Vec::new();
+            for o in &obs {
+                sink.observe(*o);
+                let whole = o.file_date.is_some() && o.file_hour.is_some() && o.line_offset.is_some();
+                let written = if whole {
+                    *o
+                } else {
+                    Observation { file_date: None, file_hour: None, line_offset: None, ..*o }
+                };
+                serde_json::to_writer(&mut want, &written).unwrap();
+                want.push(b'\n');
+                want_obs.push(written);
+            }
+            let mut out = Vec::new();
+            source.write_available(&mut out).unwrap();
+            prop_assert_eq!(String::from_utf8(out.clone()).unwrap(), String::from_utf8(want).unwrap());
+            prop_assert_eq!(read_observations(&out[..]).unwrap(), want_obs);
+        }
+    }
+
+    /// Every number at its widest still fits the line buffer.
+    #[test]
+    fn the_widest_line_is_written_whole() {
+        let widest = Observation {
+            source: Source::PublicWs,
+            block_time_ms: u64::MAX,
+            block_number: Some(u64::MAX),
+            recv_ns: u64::MAX,
+            file_date: Some(u32::MAX),
+            file_hour: Some(u8::MAX),
+            line_offset: Some(u64::MAX),
+        };
+        let (mut sink, mut source) = ring(2);
+        sink.observe(widest);
+        let mut out = Vec::new();
+        source.write_available(&mut out).unwrap();
+        assert_eq!(out.len(), 201);
+        assert_eq!(read_observations(&out[..]).unwrap(), vec![widest]);
+    }
 }

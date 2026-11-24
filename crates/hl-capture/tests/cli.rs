@@ -283,6 +283,9 @@ fn counters_report_what_was_written_and_what_qualifies_it() {
         ("rotations", 0),
         ("post_rotation_lines", 0),
         ("height_breaks", 0),
+        ("height_repeats", 0),
+        ("height_gaps", 0),
+        ("height_backwards", 0),
     ] {
         assert_eq!(c[key], want, "{key} in {c}");
     }

@@ -39,6 +39,9 @@ fn dirty() -> Vec<Observation> {
             block_time_ms: 1,
             block_number: Some(2),
             recv_ns: 3,
+            file_date: None,
+            file_hour: None,
+            line_offset: None,
         };
         3
     ]

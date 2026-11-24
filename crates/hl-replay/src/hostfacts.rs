@@ -203,56 +203,63 @@ impl HostFacts {
                     .filter(|cpu| ranges.iter().any(|r| r.contains(*cpu)))
                     .collect(),
             ),
+            // The kernel ignores a refused `isolcpus=`: nothing is isolated.
+            CpuList::Refused => Some(Vec::new()),
             CpuList::All | CpuList::Unreadable => None,
         }
     }
 
-    /// The CPUs a kernel command-line list names, if it is set. One part this
-    /// harness cannot read (the kernel's `N` for the last CPU, an unknown
-    /// word) or the kernel itself refuses (a CPU number at or past
-    /// [`MAX_CPUS`], a stride using more than its group) makes the whole list
-    /// unreadable: a partly read list would report a core as outside a list
-    /// that holds it. Ranges are kept as ranges, never expanded CPU by CPU.
+    /// The CPUs a kernel command-line list names, if it is set, read the way
+    /// the kernel reads it. Source read at Linux v6.8; the lines relied on
+    /// are the same in v5.15, v6.1 and v6.12. Nothing here was checked on a
+    /// booted host.
     ///
-    /// A list that selects no CPU (`0-7:0/2`, or `isolcpus=` flags with no
-    /// list) is read, as an empty list: the kernel accepts it and sets no
-    /// bit (Linux v6.8 `lib/bitmap-str.c`: `bitmap_check_region` refuses only
-    /// `off > group_len`, and `bitmap_set_region` sets `min(.., off)` bits).
+    /// - A list the kernel refuses on any host is [`CpuList::Refused`]: one
+    ///   refused part refuses the whole list, since `bitmap_parselist`
+    ///   returns at the first error (`lib/bitmap-str.c`; see
+    ///   [`Region::parse`] for what is refused). What the kernel then does
+    ///   depends on the key: `rcu_nocb_setup` (`kernel/rcu/tree_nocb.h`)
+    ///   prints `rcu_nocbs= bad CPU range, all CPUs set` and sets every CPU;
+    ///   `housekeeping_setup` (`kernel/sched/isolation.c`) prints
+    ///   `nohz_full= or isolcpus= incorrect CPU range` and sets nothing.
+    /// - A list with a part only the host can settle (the kernel's `N` for
+    ///   the last CPU, `all` with a stride) and no refused part is
+    ///   [`CpuList::Unreadable`] as a whole: a partly read list would report
+    ///   a core as outside a list that holds it.
+    /// - A list that selects no CPU (`0-7:0/2`, `isolcpus=domain,`) is read
+    ///   as an empty list: `bitmap_check_region` refuses only
+    ///   `off > group_len`, and `bitmap_set_region` sets `min(.., off)` bits.
+    /// - Empty parts are skipped and a key with nothing after it is an empty
+    ///   list: `bitmap_parselist` calls `bitmap_find_region` before each
+    ///   region, which steps over any run of commas and ends the list with
+    ///   success at the terminator.
     ///
-    /// Empty parts are skipped and a key with nothing after it is an empty
-    /// list, as in the kernel: `bitmap_parselist` calls `bitmap_find_region`
-    /// before each region, which steps over any run of commas and ends the
-    /// list with success at the terminator, so `2,,3`, `,2,3` and `2,3,` name
-    /// CPUs 2 and 3 and an empty string names none (v6.8 `lib/bitmap-str.c`;
-    /// `nohz_full=` and `isolcpus=` reach it through `housekeeping_setup` in
-    /// `kernel/sched/isolation.c`, `rcu_nocbs=` through `rcu_nocb_setup` in
-    /// `kernel/rcu/tree_nocb.h`, each by `cpulist_parse`).
+    /// `nohz_full=` and `isolcpus=` reach `bitmap_parselist` through
+    /// `housekeeping_setup`, `rcu_nocbs=` through `rcu_nocb_setup`, each by
+    /// `cpulist_parse`. Ranges are kept as ranges, never expanded.
     fn cpu_list(&self, key: &str) -> Option<CpuList> {
+        let value = self.cmdline_value(key)?;
+        let list = if key == "isolcpus" {
+            match isolcpus_list(value) {
+                Ok(list) => list,
+                Err(unread) => return Some(unread),
+            }
+        } else {
+            value
+        };
         let mut ranges = Vec::new();
-        let mut all = false;
-        // `isolcpus=` alone takes flags, and only before its list: the kernel
-        // takes them while the value starts with a letter and hands the rest
-        // to `cpulist_parse` whole (v6.8 `housekeeping_isolcpus_setup`), so
-        // an empty part or a CPU ends them.
-        let mut flags = key == "isolcpus";
-        for part in self.cmdline_value(key)?.split(',') {
-            if flags && ISOLCPUS_FLAGS.contains(&part) {
-                continue;
-            }
-            flags = false;
-            if part.is_empty() {
-                continue;
-            }
-            if part.eq_ignore_ascii_case("all") {
-                all = true;
-                continue;
-            }
-            match CpuRange::parse(part) {
-                Some(range) => ranges.push(range),
-                None => return Some(CpuList::Unreadable),
+        let (mut all, mut host_dependent) = (false, false);
+        for part in list.split(',').filter(|part| !part.is_empty()) {
+            match Region::parse(part) {
+                Region::Range(range) => ranges.push(range),
+                Region::All => all = true,
+                Region::HostDependent => host_dependent = true,
+                Region::Refused => return Some(CpuList::Refused),
             }
         }
-        Some(if all {
+        Some(if host_dependent {
+            CpuList::Unreadable
+        } else if all {
             CpuList::All
         } else {
             CpuList::Listed(ranges)
@@ -293,6 +300,15 @@ impl HostFacts {
             Some(CpuList::Unreadable) => vec![format!(
                 "{key} ({raw}) is not a CPU list this harness can read: pinned cores not checked against it"
             )],
+            Some(CpuList::Refused) if key == "rcu_nocbs" => vec![format!(
+                "{key} ({raw}) is a CPU list the kernel refuses: the kernel offloads every CPU from RCU callbacks instead; pinned cores are offloaded"
+            )],
+            Some(CpuList::Refused) => {
+                let (cores, verb) = name_cores(pinned);
+                vec![format!(
+                    "{key} ({raw}) is a CPU list the kernel refuses and ignores: {cores} {verb} not {lacking}"
+                )]
+            }
             None => {
                 let (cores, verb) = name_cores(pinned);
                 vec![format!("{key} is not set: {cores} {verb} not {lacking}")]
@@ -323,19 +339,35 @@ impl HostFacts {
                     "rcu_nocbs is not set and nohz_full ({tickless}) could not be parsed: whether {cores} {verb} offloaded from RCU callbacks is undetermined"
                 )]
             }
-            // `all` offloads every core; an unreadable rcu_nocbs gets its own line.
+            // `all` and a refused list offload every core; a refused or
+            // unreadable rcu_nocbs gets its own line.
             _ => self.list_warnings("rcu_nocbs", "offloaded from RCU callbacks", pinned),
         }
     }
 
-    /// What a reader must weigh about the cores a run pinned to: a core
-    /// outside `isolcpus`, `nohz_full` or `rcu_nocbs`, a pinned CPU 0 that
-    /// `nohz_full` names, or a hot core that shares its physical core.
+    /// What a reader must weigh about the cores a run pinned to (feeder, hot
+    /// thread and the `compio-sqpoll` polling thread): a core outside
+    /// `isolcpus`, `nohz_full` or `rcu_nocbs`, a pinned CPU 0 that
+    /// `nohz_full` names, a hot core that shares its physical core, and
+    /// [`Self::sqpoll_warnings`].
     /// Warnings only; none of this stops a run.
-    fn core_warnings(&self, feeder: Option<usize>, hot: Option<usize>) -> Vec<String> {
-        let pinned: Vec<(&str, usize)> = [("feeder", feeder), ("hot", hot)]
+    fn core_warnings(
+        &self,
+        feeder: Option<usize>,
+        hot: Option<usize>,
+        sqpoll: Option<usize>,
+    ) -> Vec<String> {
+        let threads: Vec<(&str, usize)> = [("feeder", feeder), ("hot", hot)]
             .into_iter()
             .filter_map(|(role, core)| Some((role, core?)))
+            .collect();
+        // The polling thread's core is judged by the same three lists: it
+        // spins and picks up submissions, so another task, the tick or RCU
+        // callbacks there delay them as they delay the hot thread.
+        let pinned: Vec<(&str, usize)> = threads
+            .iter()
+            .copied()
+            .chain(sqpoll.map(|core| ("sqpoll", core)))
             .collect();
         let mut warnings = self.list_warnings("isolcpus", "isolated", &pinned);
         warnings.extend(self.list_warnings("nohz_full", "tickless", &pinned));
@@ -346,7 +378,7 @@ impl HostFacts {
         let names_cpu_0 = match &tickless {
             Some(CpuList::All) => true,
             Some(CpuList::Listed(listed)) => listed.iter().any(|r| r.contains(0)),
-            Some(CpuList::Unreadable) | None => false,
+            Some(CpuList::Unreadable | CpuList::Refused) | None => false,
         };
         if names_cpu_0 {
             let raw = self.cmdline_value("nohz_full").unwrap_or_default();
@@ -367,13 +399,21 @@ impl HostFacts {
                 .filter(|(_, core)| match &tickless {
                     Some(CpuList::All) => false,
                     Some(CpuList::Listed(listed)) => !listed.iter().any(|r| r.contains(*core)),
-                    Some(CpuList::Unreadable) | None => true,
+                    // A refused nohz_full sets no CPU, so it offloads none.
+                    Some(CpuList::Unreadable | CpuList::Refused) | None => true,
                 })
                 .collect();
+            // A refused rcu_nocbs is reported whatever nohz_full offloads:
+            // the operator wrote a list and got every CPU instead.
+            let checked = if matches!(self.cpu_list("rcu_nocbs"), Some(CpuList::Refused)) {
+                &pinned
+            } else {
+                &not_offloaded
+            };
             warnings.extend(self.list_warnings(
                 "rcu_nocbs",
                 "offloaded from RCU callbacks",
-                &not_offloaded,
+                checked,
             ));
         }
         if let Some(hot) = hot {
@@ -389,7 +429,61 @@ impl HostFacts {
                 }
             }
         }
+        if let Some(sqpoll) = sqpoll {
+            warnings.extend(self.sqpoll_warnings(&threads, sqpoll));
+        }
         warnings
+    }
+
+    /// What a reader must weigh about the core given to the `compio-sqpoll`
+    /// arm's kernel polling thread, beside the three lists: the thread spins at
+    /// close to 100%, so it takes about half of whatever shares its physical
+    /// core, and it works on the hot thread's ring, so another NUMA node puts
+    /// that memory a node away from one of the two.
+    fn sqpoll_warnings(&self, pinned: &[(&str, usize)], sqpoll: usize) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let prefix = format!("cpu{sqpoll} thread siblings: ");
+        let siblings = self
+            .section("smt")
+            .and_then(|body| body.lines().find_map(|l| l.strip_prefix(prefix.as_str())));
+        for &(role, core) in pinned {
+            if core == sqpoll {
+                let against = if role == "hot" {
+                    "the hot thread"
+                } else {
+                    "the feeder and sink"
+                };
+                warnings.push(format!(
+                    "sqpoll core {sqpoll} is the {role} core: the kernel polling thread spins there against {against}"
+                ));
+            } else if let Some(siblings) = siblings {
+                if sysfs_list_contains(siblings, core) {
+                    warnings.push(format!(
+                        "sqpoll core {sqpoll} shares its physical core with {role} core {core} (siblings {siblings})"
+                    ));
+                }
+            }
+        }
+        let hot = pinned.iter().find(|(role, _)| *role == "hot");
+        if let Some(&(_, hot)) = hot {
+            if let (Some(ours), Some(theirs)) = (self.numa_node(sqpoll), self.numa_node(hot)) {
+                if ours != theirs {
+                    warnings.push(format!(
+                        "sqpoll core {sqpoll} is on NUMA node {ours} and hot core {hot} is on NUMA node {theirs}"
+                    ));
+                }
+            }
+        }
+        warnings
+    }
+
+    /// The NUMA node whose `nodeN cpus:` line lists `cpu`, if the capture
+    /// has one.
+    fn numa_node(&self, cpu: usize) -> Option<&str> {
+        self.section("numa")?.lines().find_map(|line| {
+            let (node, cpus) = line.strip_prefix("node")?.split_once(" cpus: ")?;
+            sysfs_list_contains(cpus, cpu).then_some(node)
+        })
     }
 
     /// Whether the operator appended the manual RTT section. The harness
@@ -413,9 +507,55 @@ impl HostFacts {
     }
 }
 
-/// The flags `isolcpus=` takes before its CPU list (Linux v6.8
-/// `Documentation/admin-guide/kernel-parameters.txt`).
-const ISOLCPUS_FLAGS: [&str; 3] = ["nohz", "domain", "managed_irq"];
+/// The flags `isolcpus=` takes before its CPU list, each with the comma the
+/// kernel matches it with (Linux v6.8 `kernel/sched/isolation.c`,
+/// `housekeeping_isolcpus_setup`: `strncmp(str, "domain,", 7)`).
+const ISOLCPUS_FLAGS: [&str; 3] = ["nohz,", "domain,", "managed_irq,"];
+
+/// The CPU list of an `isolcpus=` value, after its flags, as
+/// `housekeeping_isolcpus_setup` finds it (v6.8 `kernel/sched/isolation.c`).
+/// While the value starts with a letter the kernel takes a word:
+///
+/// - one of the three flags with its comma is taken;
+/// - any other word of letters and underscores is skipped up to its comma
+///   ("isolcpus: Skipped unknown flag"), so `all` and `N` are such words too;
+/// - a word with any other character is "isolcpus: Invalid flag": the
+///   function returns 0 and nothing is isolated ([`CpuList::Refused`]);
+/// - a last word with no comma after it, even a known flag, is skipped up to
+///   the terminator and the loop's `str++` then steps past it. What the
+///   kernel reads next is not settled by the value, so the harness does not
+///   read it ([`CpuList::Unreadable`]).
+///
+/// Whatever follows the flags goes to `cpulist_parse` whole.
+fn isolcpus_list(value: &str) -> Result<&str, CpuList> {
+    let mut rest = value;
+    while let Some(first) = rest.chars().next() {
+        if !first.is_ascii() {
+            // The kernel's isalpha is not ASCII-only.
+            return Err(CpuList::Unreadable);
+        }
+        if !first.is_ascii_alphabetic() {
+            break;
+        }
+        if let Some(after) = ISOLCPUS_FLAGS.iter().find_map(|f| rest.strip_prefix(f)) {
+            rest = after;
+            continue;
+        }
+        let (word, after) = match rest.split_once(',') {
+            Some((word, after)) => (word, Some(after)),
+            None => (rest, None),
+        };
+        if !word.chars().all(|c| c.is_ascii_alphabetic() || c == '_') {
+            return Err(if word.is_ascii() {
+                CpuList::Refused
+            } else {
+                CpuList::Unreadable
+            });
+        }
+        rest = after.ok_or(CpuList::Unreadable)?;
+    }
+    Ok(rest)
+}
 
 /// The CPUs a kernel command-line CPU list names.
 enum CpuList {
@@ -423,8 +563,11 @@ enum CpuList {
     All,
     /// The CPUs in any of these ranges.
     Listed(Vec<CpuRange>),
-    /// Set, with a part this harness cannot read.
+    /// Set, with a part only the host can settle, which this harness does
+    /// not read.
     Unreadable,
+    /// Set, and refused by the kernel on any host.
+    Refused,
 }
 
 /// One more than the largest CPU number a list may name: the widest CPU mask
@@ -446,43 +589,153 @@ struct CpuRange {
 }
 
 impl CpuRange {
-    /// Reads one part, or `None` for a part this harness cannot read or the
-    /// kernel refuses: `bitmap_check_region` returns -EINVAL for a descending
-    /// range, a group of 0 or `used > group`, and -ERANGE for a CPU past the
-    /// mask.
-    fn parse(part: &str) -> Option<Self> {
-        let (range, stride) = match part.split_once(':') {
-            None => (part, None),
-            Some((range, stride)) => {
-                let (used, group) = stride.split_once('/')?;
-                (range, Some((used.parse().ok()?, group.parse().ok()?)))
-            }
-        };
-        let (first, last) = range.split_once('-').unwrap_or((range, range));
-        let (first, last) = (first.parse::<usize>().ok()?, last.parse::<usize>().ok()?);
-        // A plain range is one group, all of it used.
-        let (used, group): (usize, usize) = stride.unwrap_or((1, 1));
-        (first <= last && last < MAX_CPUS && group > 0 && used <= group).then_some(Self {
-            first,
-            last,
-            used,
-            group,
-        })
-    }
-
     fn contains(&self, cpu: usize) -> bool {
         (self.first..=self.last).contains(&cpu) && (cpu - self.first) % self.group < self.used
     }
 }
 
-/// "feeder core 2 and hot core 3" with the verb that agrees with it.
+/// A number in a CPU list: digits, or the kernel's `N` for the last CPU.
+#[derive(Clone, Copy)]
+enum Num {
+    Is(usize),
+    LastCpu,
+}
+
+/// Reads one number as `bitmap_getnum` does (v6.8 `lib/bitmap-str.c`): `N`,
+/// or decimal digits with no sign that fit an `unsigned int`. `None` is the
+/// kernel's -EINVAL or -EOVERFLOW.
+fn getnum(s: &str) -> Option<(Num, &str)> {
+    if let Some(rest) = s.strip_prefix('N') {
+        return Some((Num::LastCpu, rest));
+    }
+    let len = s.bytes().take_while(u8::is_ascii_digit).count();
+    let (digits, rest) = s.split_at(len);
+    let n: u32 = digits.parse().ok()?;
+    Some((Num::Is(usize::try_from(n).ok()?), rest))
+}
+
+/// How one non-empty part of a CPU list reads.
+enum Region {
+    /// The CPUs of a range.
+    Range(CpuRange),
+    /// The word `all`.
+    All,
+    /// Accepted or refused depending on the host's CPU count: it uses `N`,
+    /// or `all` with a stride.
+    HostDependent,
+    /// Refused by the kernel whatever the host.
+    Refused,
+}
+
+impl Region {
+    /// Reads a part the way `bitmap_parse_region` and `bitmap_check_region`
+    /// do (v6.8 `lib/bitmap-str.c`). Refused on any host: a part that starts
+    /// with no digit, `N` or `all`; anything but `-`, `:` or the end after
+    /// the first number; a stride without its `/`; a number that does not
+    /// fit 32 bits; and, once the numbers are known, a descending range, a
+    /// group of 0, `used > group` (-EINVAL) or a CPU at or past [`MAX_CPUS`]
+    /// (-ERANGE).
+    fn parse(part: &str) -> Self {
+        use Num::{Is, LastCpu};
+        let (first, last, rest) = if part
+            .get(..3)
+            .is_some_and(|word| word.eq_ignore_ascii_case("all"))
+        {
+            (Is(0), LastCpu, &part[3..])
+        } else {
+            let Some((first, rest)) = getnum(part) else {
+                return Self::Refused;
+            };
+            match rest.strip_prefix('-') {
+                None if rest.is_empty() => (first, first, rest),
+                None => return Self::Refused,
+                Some(rest) => match getnum(rest) {
+                    Some((last, rest)) => (first, last, rest),
+                    None => return Self::Refused,
+                },
+            }
+        };
+        let (stride, rest) = if rest.is_empty() {
+            (None, rest)
+        } else {
+            let stride = rest.strip_prefix(':').and_then(|rest| {
+                let (used, rest) = getnum(rest)?;
+                let (group, rest) = getnum(rest.strip_prefix('/')?)?;
+                Some(((used, group), rest))
+            });
+            match stride {
+                Some((stride, rest)) => (Some(stride), rest),
+                None => return Self::Refused,
+            }
+        };
+        let own = Self::classify(first, last, stride);
+        if rest.is_empty() {
+            return own;
+        }
+        // What follows a stride starts the next region, with no comma
+        // needed. `bitmap_parselist` checks this region before it parses the
+        // next, so a refusal here stands whatever follows.
+        match (own, Self::parse(rest)) {
+            (Self::Refused, _) | (_, Self::Refused) => Self::Refused,
+            _ => Self::HostDependent,
+        }
+    }
+
+    /// What `bitmap_check_region` makes of one region's numbers.
+    fn classify(first: Num, last: Num, stride: Option<(Num, Num)>) -> Self {
+        use Num::{Is, LastCpu};
+        match stride {
+            Some((_, Is(0))) => return Self::Refused,
+            Some((Is(used), Is(group))) if used > group => return Self::Refused,
+            _ => {}
+        }
+        // A plain range is one group, all of it used.
+        match (first, last, stride.unwrap_or((Is(1), Is(1)))) {
+            (Is(0), LastCpu, _) if stride.is_none() => Self::All,
+            (Is(first), Is(last), (Is(used), Is(group))) => {
+                if first <= last && last < MAX_CPUS {
+                    Self::Range(CpuRange {
+                        first,
+                        last,
+                        used,
+                        group,
+                    })
+                } else {
+                    Self::Refused
+                }
+            }
+            (Is(first), Is(last), _) if first > last || last >= MAX_CPUS => Self::Refused,
+            _ => Self::HostDependent,
+        }
+    }
+}
+
+/// "feeder core 2 and hot core 3" (or "a, b and c") with the verb that
+/// agrees with it.
 fn name_cores(pinned: &[(&str, usize)]) -> (String, &'static str) {
     let cores: Vec<String> = pinned
         .iter()
         .map(|(role, core)| format!("{role} core {core}"))
         .collect();
     let verb = if cores.len() == 1 { "is" } else { "are" };
-    (cores.join(" and "), verb)
+    let named = match cores.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => cores.concat(),
+    };
+    (named, verb)
+}
+
+/// Whether a CPU list as sysfs prints one (`cpulist`,
+/// `thread_siblings_list`: `0-3,8` from `%*pbl`) names `cpu`. A part that is
+/// not a number or an ascending pair of numbers names nothing.
+fn sysfs_list_contains(list: &str, cpu: usize) -> bool {
+    list.trim().split(',').any(|part| {
+        let (from, to) = part.split_once('-').unwrap_or((part, part));
+        match (from.parse::<usize>(), to.parse::<usize>()) {
+            (Ok(from), Ok(to)) => (from..=to).contains(&cpu),
+            _ => false,
+        }
+    })
 }
 
 /// What a report says about host facts.
@@ -518,12 +771,25 @@ impl HostFactsNote {
         feeder_core: Option<usize>,
         hot_core: Option<usize>,
     ) -> Self {
+        Self::captured_with_sqpoll(path, facts, feeder_core, hot_core, None)
+    }
+
+    /// [`Self::captured`], with warnings too about the core the
+    /// `compio-sqpoll` arm's kernel polling thread was given (`--sqpoll-core`).
+    #[must_use]
+    pub fn captured_with_sqpoll(
+        path: &Path,
+        facts: &HostFacts,
+        feeder_core: Option<usize>,
+        hot_core: Option<usize>,
+        sqpoll_core: Option<usize>,
+    ) -> Self {
         Self::Captured {
             path: path.display().to_string(),
             captured_utc: facts.captured_utc().to_owned(),
             unavailable: facts.unavailable().into_iter().map(str::to_owned).collect(),
             manual_rtt: facts.has_manual_rtt(),
-            warnings: facts.core_warnings(feeder_core, hot_core),
+            warnings: facts.core_warnings(feeder_core, hot_core, sqpoll_core),
         }
     }
 }

@@ -5,7 +5,7 @@
 //! Built by `tools/build_margin_fixture.py` (inputs pinned by sha256 in the file).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use hl_account::{Account, Decision, Ledger, Market, OrderAgg, OrderReq, Position};
+use hl_account::{Abstraction, Account, Decision, Ledger, Market, OrderAgg, OrderReq, Position};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -30,6 +30,7 @@ struct Case {
 }
 #[derive(Deserialize)]
 struct FAccount {
+    abstraction: Option<String>,
     usdc: i64,
     spot_usdc: i64,
     positions: Vec<FPos>,
@@ -82,6 +83,7 @@ fn decide(f: &Fixture, c: &Case) -> Decision {
         ledger.set_mark(a, px);
     }
     let acc = Account {
+        abstraction: Abstraction::from_state(c.account.abstraction.as_deref()),
         usdc: c.account.usdc,
         spot_usdc: c.account.spot_usdc,
         positions: c
@@ -116,6 +118,7 @@ fn decide(f: &Fixture, c: &Case) -> Decision {
                 )
             })
             .collect(),
+        ..Account::default()
     };
     ledger.insert(c.user.clone(), acc);
     ledger.check_order(
@@ -182,17 +185,28 @@ fn unset_leverage_charges_the_default_not_the_maximum() {
     assert_eq!(decide(&f, c), Decision::InsufficientMargin);
 }
 
+/// Native rejection although spot USDC would cover: the account is not unified
+/// (`ust.a = "i"`), so spot USDC is not perp collateral. Was the open
+/// contradiction to "spot counts for everyone".
+#[test]
+fn independent_account_does_not_count_spot() {
+    let f = fixture();
+    let c = case(&f, 1_232_430_014, "0xd839e870");
+    assert_eq!(c.account.abstraction.as_deref(), Some("i"));
+    assert_eq!(native(c), Decision::InsufficientMargin);
+    assert_eq!(decide(&f, c), Decision::InsufficientMargin);
+}
+
 /// Whole fixture: the count is pinned, and every miss is a named, known case.
 #[test]
 fn reproduces_the_clean_sample() {
     let f = fixture();
-    let known_misses: [(u64, &str); 6] = [
-        (1_232_430_014, "0xd839e870"), // spot would cover; native rejects (unified-mode flag?)
-        (1_232_431_007, "0x955c35df"), // 0.51 USDC short; native accepts
-        (1_232_435_181, "0x5de8fab8"), // out of sample: native accepts
-        (1_232_435_831, "0xc42a7d06"),
-        (1_232_436_969, "0x07925188"),
-        (1_232_438_533, "0x89bec994"),
+    let known_misses: [(u64, &str); 5] = [
+        (1_232_431_007, "0x955c35df"), // portfolio margin (ust.a = p): not modelled
+        (1_232_435_181, "0x5de8fab8"), // out of sample, portfolio margin
+        (1_232_435_831, "0xc42a7d06"), // out of sample, portfolio margin
+        (1_232_436_969, "0x07925188"), // out of sample, portfolio margin
+        (1_232_438_533, "0x89bec994"), // out of sample, unified: 95.90 USDC short, native accepts
     ];
     let mut matched = 0;
     let mut misses = Vec::new();
@@ -208,5 +222,5 @@ fn reproduces_the_clean_sample() {
         .map(|&(h, u)| (h, u.to_string()))
         .collect();
     assert_eq!(misses, expected);
-    assert_eq!((matched, f.cases.len()), (281, 287));
+    assert_eq!((matched, f.cases.len()), (282, 287));
 }

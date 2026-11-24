@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use hl_latency::{parse_node_line, scan_node_header, CompleteLine, Observation, Source};
 
 use crate::lines::{LineSink, LineSplitter};
+use crate::scout::Arrivals;
 
 /// Sort key of an hourly file path `.../{YYYYMMDD}/{H}`: `(date, hour)`.
 /// `None` when the last two components are not a date and an hour 0..=23.
@@ -98,8 +99,19 @@ pub struct TailStats {
     /// Lines `hl_latency::scan_node_header` refused that the strict
     /// `hl_latency::parse_node_line` then accepted (included in `lines`).
     pub scan_fallbacks: u64,
-    /// Observations whose `block_number` is not the previous one plus one.
+    /// Observations whose `block_number` is not the previous one plus one:
+    /// the sum of the three counters below.
     pub height_breaks: u64,
+    /// Observations with the same `block_number` as the one before. With
+    /// `--stream-with-block-info` the node is thought to write several lines
+    /// per block, which would make these normal (inferred from the node's
+    /// README, not confirmed on real output).
+    pub height_repeats: u64,
+    /// Observations whose `block_number` is more than one above the one
+    /// before.
+    pub height_gaps: u64,
+    /// Observations whose `block_number` is below the one before.
+    pub height_backwards: u64,
     /// Observations read by the poll that switched to a file (see
     /// [`Switch`]); their stamps can be late by the rescan interval.
     pub post_rotation_lines: u64,
@@ -125,11 +137,13 @@ struct Parser<'a, S: ?Sized> {
     last_height: &'a mut Option<u64>,
     /// Set while the file just switched to is read for the first time.
     switch: Option<&'a mut Switch>,
+    /// `(date, hour)` of the file being read.
+    key: (u32, u8),
     sink: &'a mut S,
 }
 
 impl<S: ObservationSink + ?Sized> LineSink for Parser<'_, S> {
-    fn line(&mut self, bytes: &[u8], recv_ns: u64) {
+    fn line(&mut self, bytes: &[u8], recv_ns: u64, offset: u64) {
         // The splitter only hands out lines whose newline it has seen.
         let line = CompleteLine::assume_newline_seen(bytes);
         let obs = if let Some((block_time_ms, block_number)) = scan_node_header(line) {
@@ -138,6 +152,9 @@ impl<S: ObservationSink + ?Sized> LineSink for Parser<'_, S> {
                 block_time_ms,
                 block_number: Some(block_number),
                 recv_ns,
+                file_date: Some(self.key.0),
+                file_hour: Some(self.key.1),
+                line_offset: Some(offset),
             }
         } else {
             // Not hl-node's exact header shape: let the strict parse decide.
@@ -151,12 +168,29 @@ impl<S: ObservationSink + ?Sized> LineSink for Parser<'_, S> {
                 return;
             };
             self.stats.scan_fallbacks += 1;
-            obs
+            Observation {
+                file_date: Some(self.key.0),
+                file_hour: Some(self.key.1),
+                line_offset: Some(offset),
+                ..obs
+            }
         };
         self.stats.lines += 1;
         let height = obs.block_number;
-        if let Some(prev) = *self.last_height {
-            if height != prev.checked_add(1) {
+        if let (Some(prev), Some(now)) = (*self.last_height, height) {
+            // The definitions `hl-strict-pass` uses. Three compares on
+            // values already in registers; nothing else on this path.
+            let kind = if now == prev {
+                Some(&mut self.stats.height_repeats)
+            } else if now < prev {
+                Some(&mut self.stats.height_backwards)
+            } else if prev.checked_add(1) != Some(now) {
+                Some(&mut self.stats.height_gaps)
+            } else {
+                None
+            };
+            if let Some(counter) = kind {
+                *counter += 1;
                 self.stats.height_breaks += 1;
             }
         }
@@ -202,6 +236,21 @@ pub struct NodeTailer {
     rescan_due: bool,
     last_height: Option<u64>,
     switch: SwitchState,
+    /// When set, a [`crate::Scout`] on another thread looks for newer files
+    /// and this tailer only takes what it found.
+    arrivals: Option<Arrivals>,
+    /// A newer file taken from the scout whose switch waits for the old
+    /// file's backlog.
+    held: Option<Candidate>,
+}
+
+/// A file newer than the current one may be.
+#[derive(Debug)]
+struct Candidate {
+    path: PathBuf,
+    key: Option<(u32, u8)>,
+    /// Already open when the scout found it.
+    file: Option<File>,
 }
 
 /// Where the report of the latest switch stands.
@@ -239,7 +288,32 @@ impl NodeTailer {
             rescan_due: true,
             last_height: None,
             switch: SwitchState::None,
+            arrivals: None,
+            held: None,
         }
+    }
+
+    /// Like [`Self::with_max_line`], with the look for newer files done by
+    /// a [`crate::Scout`] on another thread. Only the first poll walks the
+    /// directory itself (nothing is being read yet, so that costs no stamp
+    /// accuracy). After it, a poll that reaches the end of the current file
+    /// takes what the scout found with one wait-free pop: no directory
+    /// walk, no `open`. [`Self::request_rescan`] becomes an atomic store
+    /// that asks the scout to look now.
+    #[must_use]
+    pub fn with_scout(root: impl Into<PathBuf>, max_line: usize, arrivals: Arrivals) -> Self {
+        Self {
+            arrivals: Some(arrivals),
+            ..Self::with_max_line(root, max_line)
+        }
+    }
+
+    /// True while a look asked for with [`Self::request_rescan`] has not
+    /// been finished by the scout: poll again soon, its answer is close.
+    /// Always false without a scout. One atomic load.
+    #[must_use]
+    pub fn look_pending(&self) -> bool {
+        self.arrivals.as_ref().is_some_and(Arrivals::pending)
     }
 
     /// [`Self::request_rescan`] then [`Self::poll_into`], collected into a
@@ -304,13 +378,41 @@ impl NodeTailer {
             return Ok(());
         }
         self.finish_switch();
-        if !std::mem::take(&mut self.rescan_due) {
-            return Ok(());
-        }
-        self.stats.rescans += 1;
-        let first = !std::mem::replace(&mut self.polled, true);
-        if let Some(newest) = find(&self.root)? {
-            let key = hourly_key(&newest);
+        let first = !self.polled;
+        let walk = if self.arrivals.is_some() {
+            // The scout walks; this thread only does so before it has
+            // anything to read.
+            first
+        } else {
+            std::mem::take(&mut self.rescan_due)
+        };
+        let candidate = if let Some(held) = self.held.take() {
+            Some(held)
+        } else if walk {
+            self.polled = true;
+            self.stats.rescans += 1;
+            find(&self.root)?.map(|path| Candidate {
+                key: hourly_key(&path),
+                path,
+                file: None,
+            })
+        } else {
+            // One wait-free pop: no system call, no allocation.
+            self.arrivals
+                .as_mut()
+                .and_then(Arrivals::pop)
+                .map(|f| Candidate {
+                    path: f.path,
+                    key: Some(f.key),
+                    file: Some(f.file),
+                })
+        };
+        if let Some(Candidate {
+            path: newest,
+            key,
+            file: opened,
+        }) = candidate
+        {
             let newer = match (&self.current, key) {
                 (None, Some(_)) => true,
                 (Some(c), Some(k)) => k > c.key,
@@ -326,24 +428,46 @@ impl NodeTailer {
                     self.drain(clock, sink, &mut budget)?;
                     if self.backlogged {
                         // More than this poll may read: finish the old file
-                        // first and look again.
-                        self.rescan_due = true;
+                        // first, then come back to this switch.
+                        if opened.is_some() {
+                            // The scout will not hand it over again.
+                            self.held = Some(Candidate {
+                                path: newest,
+                                key: Some(key),
+                                file: opened,
+                            });
+                        } else {
+                            self.rescan_due = true;
+                        }
                         return Ok(());
                     }
                 }
-                let mut file = File::open(&newest)?;
+                let mut file = match opened {
+                    Some(file) => file,
+                    None => File::open(&newest)?,
+                };
                 if self.current.is_some() {
                     self.stats.rotations += 1;
                     if self.splitter.clear() {
                         self.stats.bad_lines += 1;
                     }
                 }
-                if self.current.is_none() && first {
+                // Line offsets count from where reading starts in the file.
+                // If the node was in the middle of a line when the first
+                // file is entered at its end, the rest of that line comes
+                // out as a "line" whose offset is this position, not the
+                // line's true start. It has lost its header, so the scan
+                // and the strict parse both refuse it: it is counted in
+                // `bad_lines` and no observation carries that offset. The
+                // lines after it are at their true positions.
+                let position = if self.current.is_none() && first {
                     // History is not an arrival.
-                    file.seek(SeekFrom::End(0))?;
+                    file.seek(SeekFrom::End(0))?
                 } else {
                     self.switch = SwitchState::Reading(Switch::default());
-                }
+                    0
+                };
+                self.splitter.set_position(position);
                 self.current = Some(Current {
                     path: newest,
                     key,
@@ -374,6 +498,7 @@ impl NodeTailer {
                 SwitchState::Reading(sw) => Some(sw),
                 SwitchState::None | SwitchState::Ready(_) => None,
             },
+            key: cur.key,
             sink,
         };
         loop {
@@ -401,8 +526,14 @@ impl NodeTailer {
     /// The capture loop calls this on a coarse timer or on a directory
     /// event. Until that poll, lines in a newer file wait, which is why the
     /// poll that switches reports what it read as a [`Switch`].
+    ///
+    /// With a scout ([`Self::with_scout`]) this instead asks the scout to
+    /// look now: one atomic store.
     pub fn request_rescan(&mut self) {
-        self.rescan_due = true;
+        match self.arrivals.as_mut() {
+            Some(a) => a.ask(),
+            None => self.rescan_due = true,
+        }
     }
 
     /// The most recent switch to a file that was not yet reported, once the

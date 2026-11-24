@@ -9,7 +9,10 @@
 //! `node` follows the newest hourly file under `<dir>` (for example
 //! `~/hl/data/node_raw_book_diffs`) and appends one
 //! [`hl_latency::Observation`] per line to `--out`, stamped with
-//! `CLOCK_REALTIME` right after each `read`.
+//! `CLOCK_REALTIME` right after each `read`, with the hourly file
+//! (`file_date`, `file_hour`) and the byte offset of the line in it
+//! (`line_offset`), so an offline check of the node's files can be matched
+//! to one observation.
 //!
 //! Two threads. The reader reads, stamps, scans each line's header and
 //! pushes a fixed-size record into a bounded ring; it does not allocate,
@@ -52,12 +55,18 @@
 //!
 //! A newer hourly file is looked for every
 //! `--rescan-ms` milliseconds (default 1000) and, in `inotify` mode, as soon
-//! as a directory changes; never per poll. The look is a directory walk on
-//! the reader thread, which cannot read while it walks (measured 13 us with
-//! one date directory, 262 us with thirty, on a shared machine), so a line
-//! that lands during a walk is stamped that much late without any flag: keep
-//! the interval coarse and prune old date directories. While no file is
-//! followed yet there is nothing to read, so the look happens every 10 ms at
+//! as a directory changes; never per poll. The look is a directory walk,
+//! and a thread that walks cannot read, so it runs on the writer thread
+//! (the scout, `hl_capture::Scout`), which also opens the file it finds.
+//! The reader walks once, at its first poll, when it has nothing to read
+//! yet; after that it only takes what the scout found, with one wait-free
+//! pop when its file is at its end (0.2 us against 13 to 250 us for a walk,
+//! shared machine). In `inotify` mode a directory event makes the reader ask
+//! the scout to look at once; the writer thread notices within its 1 ms idle
+//! sleep, or one chunk of 1024 records while it writes a backlog. So a new
+//! file's first lines are stamped about 1 ms late (more on a loaded
+//! machine): they are the post-rotation lines below. Until it has found a
+//! file the scout looks every 10 ms at
 //! most. When a newer file is found, the old one is read to its end once
 //! more before the switch, so a line appended to it during the look is not
 //! lost. What the switching
@@ -79,13 +88,17 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use hl_capture::{ring, Detect, NodeTailer, Stop, Waiter};
+use hl_capture::{ring, scout, Detect, NodeTailer, Stop, Waiter};
 
 const USAGE: &str = "usage: hl-capture node <dir> --out <obs.jsonl> [--detect busy-poll|poll|inotify] [--poll-us N] [--duration-s N] [--max-line-bytes N] [--ring-records N] [--rescan-ms N]";
 
-/// Longest gap between looks for a first file, while none is followed: with
-/// nothing to read, the walk costs no stamp accuracy.
-const RESCAN_NO_FILE: Duration = Duration::from_millis(10);
+/// Longest wait of the reader while no file is followed, so the first file
+/// the scout finds (it looks every 10 ms until then) is taken promptly.
+const NO_FILE_CHECK: Duration = Duration::from_millis(10);
+
+/// Longest wait of the reader while a look it asked the scout for is not
+/// finished: the answer comes within about the writer's idle sleep.
+const LOOK_CHECK: Duration = Duration::from_micros(200);
 
 /// Longest single wait of the reader, so a sleeping reader (a long
 /// `--poll-us`, or `inotify` with nothing written) notices a stop signal
@@ -165,6 +178,29 @@ fn announce(requested: Detect, live: Detect, fallback: Option<&str>) {
     );
 }
 
+/// When the reader's next wait must end at the latest: never past the
+/// deadline, nor longer than a stop signal may go unnoticed, nor long while
+/// the scout's answer or a first file is expected.
+fn wait_until(
+    now: Instant,
+    deadline: Option<Instant>,
+    look_pending: bool,
+    following: bool,
+) -> Instant {
+    let cap = if look_pending {
+        LOOK_CHECK
+    } else if following {
+        STOP_CHECK
+    } else {
+        NO_FILE_CHECK
+    };
+    match (now.checked_add(cap), deadline) {
+        (Some(u), Some(d)) => u.min(d),
+        (Some(u), None) => u,
+        (None, d) => d.unwrap_or(now),
+    }
+}
+
 fn run(args: &Args) -> std::io::Result<()> {
     // First, so a signal at any later point stops the run cleanly.
     let stop = Stop::install()?;
@@ -176,14 +212,22 @@ fn run(args: &Args) -> std::io::Result<()> {
         .append(true)
         .open(&args.out)?;
     let (mut sink, source) = ring(args.ring_records);
+    // The look for a newer hourly file is a directory walk; it runs on the
+    // writer thread (on its coarse timer, and when the reader asks), so the
+    // reader never stops reading to walk.
+    let (mut scout, arrivals) = scout(&args.root, args.rescan);
     let writer = std::thread::Builder::new()
         .name("hl-capture-writer".into())
-        .spawn(move || source.run(std::io::BufWriter::new(file), WRITER_IDLE))?;
-    let mut tail = NodeTailer::with_max_line(&args.root, args.max_line);
+        .spawn(move || {
+            let written = source.run_with(std::io::BufWriter::new(file), WRITER_IDLE, || {
+                scout.tick(Instant::now()).map(drop)
+            })?;
+            Ok::<_, std::io::Error>((written, scout.looks()))
+        })?;
+    let mut tail = NodeTailer::with_scout(&args.root, args.max_line, arrivals);
     let mut clock = realtime_ns;
     let mut ready = false;
-    let mut next_rescan = Instant::now();
-    let deadline = args.duration.and_then(|d| next_rescan.checked_add(d));
+    let deadline = args.duration.and_then(|d| Instant::now().checked_add(d));
     let read = loop {
         let now = Instant::now();
         // The stop flag is read here, after everything the previous
@@ -191,17 +235,9 @@ fn run(args: &Args) -> std::io::Result<()> {
         if deadline.is_some_and(|d| now >= d) || stop.requested() {
             break Ok(());
         }
-        if now >= next_rescan {
-            // Coarse timer: the directory walk happens at most this often,
-            // and only once the current file is at its end.
-            tail.request_rescan();
-            let every = if tail.current_file().is_some() {
-                args.rescan
-            } else {
-                args.rescan.min(RESCAN_NO_FILE)
-            };
-            next_rescan = now.checked_add(every).unwrap_or(now);
-        }
+        // Read before the poll: if no look is pending now, whatever the
+        // scout found is already in the slot the poll takes from.
+        let look_pending = tail.look_pending();
         if let Err(e) = tail.poll_into(&mut clock, &mut sink) {
             break Err(e);
         }
@@ -232,10 +268,7 @@ fn run(args: &Args) -> std::io::Result<()> {
             // More data waits: check the deadline, then read on at once.
             continue;
         }
-        // Never wait past the deadline or the next rescan, nor longer than
-        // a stop signal may go unnoticed.
-        let until = deadline.map_or(next_rescan, |d| d.min(next_rescan));
-        let until = now.checked_add(STOP_CHECK).map_or(until, |s| s.min(until));
+        let until = wait_until(now, deadline, look_pending, tail.current_file().is_some());
         if waiter.wait(until).rescan {
             tail.request_rescan();
         }
@@ -257,8 +290,12 @@ fn run(args: &Args) -> std::io::Result<()> {
         .join()
         .unwrap_or_else(|_| Err(std::io::Error::other("writer thread panicked")));
     let s = tail.stats();
+    let (written, looks) = match written {
+        Ok((w, looks)) => (Ok(w), looks),
+        Err(e) => (Err(e), 0),
+    };
     eprintln!(
-        "{{\"lines\":{},\"written\":{},\"ring_dropped\":{},\"bad_lines\":{},\"oversized_lines\":{},\"scan_fallbacks\":{},\"height_breaks\":{},\"rotations\":{},\"post_rotation_lines\":{},\"rescans\":{},\"reads\":{},\"stop_signal\":{}}}",
+        "{{\"lines\":{},\"written\":{},\"ring_dropped\":{},\"bad_lines\":{},\"oversized_lines\":{},\"scan_fallbacks\":{},\"height_breaks\":{},\"height_repeats\":{},\"height_gaps\":{},\"height_backwards\":{},\"rotations\":{},\"post_rotation_lines\":{},\"rescans\":{},\"reads\":{},\"stop_signal\":{}}}",
         s.lines,
         written.as_ref().map_or(0, |w| *w),
         dropped,
@@ -266,9 +303,13 @@ fn run(args: &Args) -> std::io::Result<()> {
         s.oversized_lines,
         s.scan_fallbacks,
         s.height_breaks,
+        s.height_repeats,
+        s.height_gaps,
+        s.height_backwards,
         s.rotations,
         s.post_rotation_lines,
-        s.rescans,
+        // The reader's one walk at start plus the scout's.
+        s.rescans.saturating_add(looks),
         s.reads,
         signal.map_or_else(|| "null".to_owned(), |n| n.to_string())
     );

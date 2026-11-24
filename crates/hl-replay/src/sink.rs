@@ -101,17 +101,8 @@ impl Sink {
                 if let Some(id) = core {
                     core_affinity::set_for_current(core_affinity::CoreId { id });
                 }
-                let mut stream = loop {
-                    match listener.accept() {
-                        Ok((s, _)) => break s,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            if stopped.load(Ordering::Acquire) {
-                                return Ok(SinkStats::default());
-                            }
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        Err(e) => return Err(e),
-                    }
+                let Some(mut stream) = accept_one(&listener, &stopped, || {})? else {
+                    return Ok(SinkStats::default());
                 };
                 stream.set_nonblocking(false)?;
                 let mut stats = SinkStats::default();
@@ -157,6 +148,40 @@ impl Sink {
     }
 }
 
+/// Waits for the one connection on a non-blocking `listener`, or for `stop`.
+/// `None` means stop was set and nobody had connected.
+///
+/// `after_would_block` runs after each `accept` that found nothing and
+/// before `stop` is read. The sink passes a no-op; a test uses it to stand
+/// in the gap between those two steps.
+fn accept_one(
+    listener: &TcpListener,
+    stop: &AtomicBool,
+    mut after_would_block: impl FnMut(),
+) -> std::io::Result<Option<TcpStream>> {
+    loop {
+        match listener.accept() {
+            Ok((s, _)) => return Ok(Some(s)),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                after_would_block();
+                if stop.load(Ordering::Acquire) {
+                    // The empty accept above may predate a connection made
+                    // before stop was set: `finish()` sets stop only after
+                    // any earlier `connect()` returned, so that connection
+                    // is in the accept queue by now. Look once more.
+                    return match listener.accept() {
+                        Ok((s, _)) => Ok(Some(s)),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+                        Err(e) => Err(e),
+                    };
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// A connected TCP pair on `127.0.0.1` with Nagle off on both ends: the feed
 /// into a socket-reading arm.
 pub fn loopback_pair() -> Result<(TcpStream, TcpStream), ReplayError> {
@@ -171,7 +196,54 @@ pub fn loopback_pair() -> Result<(TcpStream, TcpStream), ReplayError> {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_loopback_peer;
+    use super::{accept_one, ensure_loopback_peer, LoopbackAddr};
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn listener() -> TcpListener {
+        let Ok(l) = TcpListener::bind(LoopbackAddr::ephemeral().addr()) else {
+            panic!("a loopback listener");
+        };
+        assert!(l.set_nonblocking(true).is_ok());
+        l
+    }
+
+    /// Issue #63: the accept that found nothing can predate a connection
+    /// made before `finish()` set stop. That connection must still be read.
+    #[test]
+    fn a_connection_made_between_the_empty_accept_and_stop_is_still_accepted() {
+        let l = listener();
+        let Ok(addr) = l.local_addr() else {
+            panic!("a local address");
+        };
+        let stop = AtomicBool::new(false);
+        let mut clients = Vec::new();
+        let got = accept_one(&l, &stop, || {
+            if clients.is_empty() {
+                let Ok(mut c) = TcpStream::connect(addr) else {
+                    panic!("connect to the listener");
+                };
+                assert!(c.write_all(b"x\n").is_ok());
+                clients.push(c);
+                stop.store(true, Ordering::Release);
+            }
+        });
+        assert!(
+            matches!(got, Ok(Some(_))),
+            "the connection was made before stop was set: {got:?}"
+        );
+    }
+
+    #[test]
+    fn stop_with_nobody_connected_gives_no_stream() {
+        let l = listener();
+        let stop = AtomicBool::new(true);
+        let mut calls = 0_u32;
+        let got = accept_one(&l, &stop, || calls += 1);
+        assert!(matches!(got, Ok(None)), "{got:?}");
+        assert_eq!(calls, 1);
+    }
 
     #[test]
     fn a_non_loopback_peer_is_refused() {

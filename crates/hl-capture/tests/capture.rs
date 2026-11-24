@@ -36,11 +36,13 @@ fn whole_lines_take_their_read_stamp() {
         vec![
             StampedLine {
                 bytes: b"a".to_vec(),
-                recv_ns: 7
+                recv_ns: 7,
+                offset: 0,
             },
             StampedLine {
                 bytes: b"bb".to_vec(),
-                recv_ns: 7
+                recv_ns: 7,
+                offset: 2,
             },
         ]
     );
@@ -54,7 +56,8 @@ fn split_line_takes_the_stamp_of_the_read_that_completed_it() {
         out,
         vec![StampedLine {
             bytes: b"{\"x\":1}".to_vec(),
-            recv_ns: 3
+            recv_ns: 3,
+            offset: 0,
         }]
     );
     assert_eq!(pending, 4, "`next` is held until its newline arrives");
@@ -87,10 +90,17 @@ proptest! {
             rest = &rest[n..];
         }
         let got: Vec<String> = out.iter().map(|l| String::from_utf8(l.bytes.clone()).unwrap()).collect();
-        prop_assert_eq!(got, lines);
+        prop_assert_eq!(&got, &lines);
         prop_assert_eq!(s.pending(), 0);
         // Stamps never go backwards.
         prop_assert!(out.windows(2).all(|w| w[0].recv_ns <= w[1].recv_ns));
+        // Each line's offset is where it starts in the stream, however the
+        // stream was cut.
+        let mut at = 0u64;
+        for (l, text) in out.iter().zip(&lines) {
+            prop_assert_eq!(l.offset, at);
+            at += u64::try_from(text.len()).unwrap() + 1;
+        }
     }
 }
 
@@ -169,6 +179,19 @@ fn node_obs(ms: u64, h: u64, ns: u64) -> Observation {
         block_time_ms: ms,
         block_number: Some(h),
         recv_ns: ns,
+        file_date: None,
+        file_hour: None,
+        line_offset: None,
+    }
+}
+
+/// The same, with where the line lies: file `20261119/8`, byte `offset`.
+fn node_obs_at(ms: u64, h: u64, ns: u64, offset: u64) -> Observation {
+    Observation {
+        file_date: Some(20_261_119),
+        file_hour: Some(8),
+        line_offset: Some(offset),
+        ..node_obs(ms, h, ns)
     }
 }
 
@@ -176,7 +199,8 @@ fn node_obs(ms: u64, h: u64, ns: u64) -> Observation {
 fn first_file_is_read_from_its_end_then_follows_appends() {
     let t = tempfile::tempdir().unwrap();
     let f = touch(t.path(), "20261119", "8");
-    append(&f, &node_line("2026-11-19T08:00:00.000", 1)); // history: not an arrival
+    let history = node_line("2026-11-19T08:00:00.000", 1);
+    append(&f, &history); // history: not an arrival
     let mut tail = NodeTailer::new(t.path());
     let (mut clock, calls) = ticking();
     assert!(tail.poll(&mut clock).unwrap().is_empty());
@@ -185,7 +209,11 @@ fn first_file_is_read_from_its_end_then_follows_appends() {
 
     append(&f, &node_line("2026-11-19T08:00:00.070", 2));
     let got = tail.poll(&mut clock).unwrap();
-    assert_eq!(got, vec![node_obs(1_795_075_200_070, 2, 100)]);
+    let after_history = u64::try_from(history.len()).unwrap();
+    assert_eq!(
+        got,
+        vec![node_obs_at(1_795_075_200_070, 2, 100, after_history)]
+    );
     assert_eq!(calls.get(), 1, "one stamp per read that returned data");
     assert!(tail.poll(&mut clock).unwrap().is_empty());
 }
@@ -205,7 +233,7 @@ fn partial_line_is_stamped_when_completed() {
     let got = tail.poll(&mut clock).unwrap();
     assert_eq!(
         got,
-        vec![node_obs(1_795_075_200_070, 2, 200)],
+        vec![node_obs_at(1_795_075_200_070, 2, 200, 0)],
         "second read's stamp"
     );
 }
@@ -447,6 +475,9 @@ fn ws_obs(ms: u64, ns: u64) -> Observation {
         block_time_ms: ms,
         block_number: None,
         recv_ns: ns,
+        file_date: None,
+        file_hour: None,
+        line_offset: None,
     }
 }
 
@@ -522,7 +553,9 @@ fn line_without_newline_is_bounded_and_counted() {
         out,
         vec![StampedLine {
             bytes: b"ok".to_vec(),
-            recv_ns: 3
+            recv_ns: 3,
+            // After the 30 bytes of the dropped line and its newline.
+            offset: 30,
         }]
     );
     assert_eq!(s.oversized(), 1);
