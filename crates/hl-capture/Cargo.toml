@@ -10,6 +10,8 @@ authors.workspace = true
 
 [dependencies]
 hl-latency = { path = "../hl-latency", version = "0.1.0" }
+# Integer formatting for the writer thread's hand-written JSON lines.
+itoa = "1"
 memchr = "2"
 rtrb = "0.3"
 serde_json = { workspace = true }

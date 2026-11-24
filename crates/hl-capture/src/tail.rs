@@ -152,10 +152,9 @@ impl<S: ObservationSink + ?Sized> LineSink for Parser<'_, S> {
                 block_time_ms,
                 block_number: Some(block_number),
                 recv_ns,
-                // Not implemented yet (red).
-                file_date: None,
-                file_hour: None,
-                line_offset: None,
+                file_date: Some(self.key.0),
+                file_hour: Some(self.key.1),
+                line_offset: Some(offset),
             }
         } else {
             // Not hl-node's exact header shape: let the strict parse decide.
@@ -169,8 +168,12 @@ impl<S: ObservationSink + ?Sized> LineSink for Parser<'_, S> {
                 return;
             };
             self.stats.scan_fallbacks += 1;
-            let _ = (offset, self.key);
-            obs
+            Observation {
+                file_date: Some(self.key.0),
+                file_hour: Some(self.key.1),
+                line_offset: Some(offset),
+                ..obs
+            }
         };
         self.stats.lines += 1;
         let height = obs.block_number;
@@ -450,6 +453,13 @@ impl NodeTailer {
                     }
                 }
                 // Line offsets count from where reading starts in the file.
+                // If the node was in the middle of a line when the first
+                // file is entered at its end, the rest of that line comes
+                // out as a "line" whose offset is this position, not the
+                // line's true start. It has lost its header, so the scan
+                // and the strict parse both refuse it: it is counted in
+                // `bad_lines` and no observation carries that offset. The
+                // lines after it are at their true positions.
                 let position = if self.current.is_none() && first {
                     // History is not an arrival.
                     file.seek(SeekFrom::End(0))?

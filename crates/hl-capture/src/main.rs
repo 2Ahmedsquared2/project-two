@@ -9,7 +9,10 @@
 //! `node` follows the newest hourly file under `<dir>` (for example
 //! `~/hl/data/node_raw_book_diffs`) and appends one
 //! [`hl_latency::Observation`] per line to `--out`, stamped with
-//! `CLOCK_REALTIME` right after each `read`.
+//! `CLOCK_REALTIME` right after each `read`, with the hourly file
+//! (`file_date`, `file_hour`) and the byte offset of the line in it
+//! (`line_offset`), so an offline check of the node's files can be matched
+//! to one observation.
 //!
 //! Two threads. The reader reads, stamps, scans each line's header and
 //! pushes a fixed-size record into a bounded ring; it does not allocate,

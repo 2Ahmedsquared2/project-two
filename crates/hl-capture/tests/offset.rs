@@ -57,13 +57,13 @@ fn places(obs: &[Observation]) -> Vec<(u64, u32, u8, u64)> {
 fn the_first_line_of_a_new_file_is_at_offset_0() {
     let t = tempfile::tempdir().unwrap();
     let mut tail = NodeTailer::new(t.path());
-    assert!(poll(&mut tail).is_empty());
+    assert_eq!(poll(&mut tail), Vec::new());
     let f = touch(t.path(), "20261119", "8");
-    let (a, b, c) = (node_line(1), node_line(22), node_line(333));
-    append(&f, &format!("{a}{b}{c}"));
+    let (one, two, three) = (node_line(1), node_line(22), node_line(333));
+    append(&f, &format!("{one}{two}{three}"));
     tail.request_rescan();
-    let la = a.len() as u64;
-    let lb = b.len() as u64;
+    let la = u64::try_from(one.len()).unwrap();
+    let lb = u64::try_from(two.len()).unwrap();
     assert_eq!(
         places(&poll(&mut tail)),
         vec![
@@ -81,20 +81,47 @@ fn a_file_followed_from_its_end_counts_from_the_real_file_position() {
     let history = format!("{}{}", node_line(1), node_line(2));
     append(&f, &history);
     let mut tail = NodeTailer::new(t.path());
-    assert!(poll(&mut tail).is_empty(), "history is not an arrival");
-    let (a, b) = (node_line(3), node_line(4));
-    append(&f, &a);
-    let h = history.len() as u64;
-    assert_eq!(places(&poll(&mut tail)), vec![(3, 20_261_119, 8, h)]);
+    assert_eq!(poll(&mut tail), Vec::new(), "history is not an arrival");
+    let (third, fourth) = (node_line(3), node_line(4));
+    append(&f, &third);
+    let before = u64::try_from(history.len()).unwrap();
+    assert_eq!(places(&poll(&mut tail)), vec![(3, 20_261_119, 8, before)]);
     // A line that arrives in two reads keeps the offset of its first byte.
-    let (b1, b2) = b.split_at(17);
-    append(&f, b1);
-    assert!(poll(&mut tail).is_empty());
-    append(&f, b2);
+    let (head, rest) = fourth.split_at(17);
+    append(&f, head);
+    assert_eq!(poll(&mut tail), Vec::new());
+    append(&f, rest);
     assert_eq!(
         places(&poll(&mut tail)),
-        vec![(4, 20_261_119, 8, h + a.len() as u64)]
+        vec![(
+            4,
+            20_261_119,
+            8,
+            before + u64::try_from(third.len()).unwrap()
+        )]
     );
+}
+
+/// The node can be in the middle of a line when the first file is entered
+/// at its end. The rest of that line is not an observation (its header is
+/// gone), so no observation carries an offset that is not a line start, and
+/// the next line is at its true position.
+#[test]
+fn a_line_the_node_was_writing_at_startup_gives_no_observation() {
+    let t = tempfile::tempdir().unwrap();
+    let f = touch(t.path(), "20261119", "8");
+    let whole = node_line(1);
+    let (written, rest) = whole.split_at(40);
+    append(&f, &node_line(0));
+    append(&f, written);
+    let mut tail = NodeTailer::new(t.path());
+    assert_eq!(poll(&mut tail), Vec::new(), "history is not an arrival");
+    append(&f, rest);
+    append(&f, &node_line(2));
+    let got = poll(&mut tail);
+    let true_start = u64::try_from(node_line(0).len() + whole.len()).unwrap();
+    assert_eq!(places(&got), vec![(2, 20_261_119, 8, true_start)]);
+    assert_eq!(tail.stats().bad_lines, 1, "the headless rest is counted");
 }
 
 #[test]
@@ -112,13 +139,13 @@ fn dropped_lines_still_advance_the_offset() {
     let good3 = node_line(3);
     append(&f, &format!("{good1}{oversized}{bad}{empty}{crlf}{good3}"));
     let got = poll(&mut tail);
-    let at2 = (good1.len() + oversized.len() + bad.len() + empty.len()) as u64;
+    let at2 = u64::try_from(good1.len() + oversized.len() + bad.len() + empty.len()).unwrap();
     assert_eq!(
         places(&got),
         vec![
             (1, 20_261_119, 8, 0),
             (2, 20_261_119, 8, at2),
-            (3, 20_261_119, 8, at2 + crlf.len() as u64)
+            (3, 20_261_119, 8, at2 + u64::try_from(crlf.len()).unwrap())
         ]
     );
     let s = tail.stats();
@@ -144,7 +171,7 @@ fn offsets_restart_in_the_next_file() {
         vec![
             (1, 20_261_119, 23, 0),
             (2, 20_261_120, 0, 0),
-            (3, 20_261_120, 0, node_line(2).len() as u64)
+            (3, 20_261_120, 0, u64::try_from(node_line(2).len()).unwrap())
         ]
     );
 }

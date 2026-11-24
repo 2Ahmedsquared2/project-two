@@ -105,3 +105,72 @@ fn the_sink_sees_a_writer_that_died() {
     assert!(writer.join().unwrap().is_err());
     assert!(sink.abandoned());
 }
+
+mod encoding {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn any_observation() -> impl Strategy<Value = Observation> {
+        (
+            any::<bool>(),
+            any::<u64>(),
+            proptest::option::of(any::<u64>()),
+            any::<u64>(),
+            proptest::option::of((any::<u32>(), any::<u8>(), any::<u64>())),
+        )
+            .prop_map(
+                |(ws, block_time_ms, block_number, recv_ns, file)| Observation {
+                    source: if ws { Source::PublicWs } else { Source::Node },
+                    block_time_ms,
+                    block_number,
+                    recv_ns,
+                    file_date: file.map(|f| f.0),
+                    file_hour: file.map(|f| f.1),
+                    line_offset: file.map(|f| f.2),
+                },
+            )
+    }
+
+    proptest! {
+        /// The writer formats its lines by hand; they must be exactly what
+        /// `serde_json` writes for the same observations, and read back as
+        /// the observations pushed.
+        #[test]
+        fn output_lines_are_serde_jsons_byte_for_byte(
+            obs in prop::collection::vec(any_observation(), 0..40),
+        ) {
+            let (mut sink, mut source) = ring(64);
+            let mut want = Vec::new();
+            for o in &obs {
+                sink.observe(*o);
+                serde_json::to_writer(&mut want, o).unwrap();
+                want.push(b'\n');
+            }
+            let mut out = Vec::new();
+            source.write_available(&mut out).unwrap();
+            prop_assert_eq!(String::from_utf8(out.clone()).unwrap(), String::from_utf8(want).unwrap());
+            prop_assert_eq!(read_observations(&out[..]).unwrap(), obs);
+        }
+    }
+
+    /// Every number at its widest still fits the line buffer.
+    #[test]
+    fn the_widest_line_is_written_whole() {
+        let widest = Observation {
+            source: Source::PublicWs,
+            block_time_ms: u64::MAX,
+            block_number: Some(u64::MAX),
+            recv_ns: u64::MAX,
+            file_date: Some(u32::MAX),
+            file_hour: Some(u8::MAX),
+            line_offset: Some(u64::MAX),
+        };
+        let (mut sink, mut source) = ring(2);
+        sink.observe(widest);
+        let mut out = Vec::new();
+        source.write_available(&mut out).unwrap();
+        assert_eq!(out.len(), 201);
+        assert_eq!(read_observations(&out[..]).unwrap(), vec![widest]);
+    }
+}

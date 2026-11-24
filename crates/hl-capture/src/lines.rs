@@ -36,6 +36,13 @@ impl LineSink for Vec<StampedLine> {
     }
 }
 
+/// A byte count as a stream position. Lossless wherever `usize` is at most
+/// 64 bits, where it compiles to nothing.
+#[inline]
+fn len64(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
 /// Default longest line kept, in bytes (1 MiB). A longer line is dropped and
 /// counted, so a stream without newlines cannot grow memory without bound.
 pub const DEFAULT_MAX_LINE: usize = 1024 * 1024;
@@ -115,7 +122,7 @@ impl LineSplitter {
             // One add per line: where this line began, and where the next
             // one does (past the newline).
             let offset = self.start;
-            self.next = self.next.wrapping_add(i as u64).wrapping_add(1);
+            self.next = self.next.wrapping_add(len64(i)).wrapping_add(1);
             self.start = self.next;
             if std::mem::take(&mut self.discarding) {
                 continue;
@@ -134,14 +141,12 @@ impl LineSplitter {
             };
             let line = line.strip_suffix(b"\r").unwrap_or(line);
             if !line.is_empty() {
-                // Not implemented yet (red): no offset.
-                let _ = offset;
-                out.line(line, recv_ns, 0);
+                out.line(line, recv_ns, offset);
             }
             self.partial.clear();
         }
         // The unfinished rest belongs to the line that began at `start`.
-        self.next = self.next.wrapping_add(rest.len() as u64);
+        self.next = self.next.wrapping_add(len64(rest.len()));
         if self.discarding {
             return;
         }

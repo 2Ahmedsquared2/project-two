@@ -126,6 +126,77 @@ pub fn ring(capacity: usize) -> (RingSink, RingSource) {
     (RingSink { tx, dropped: 0 }, RingSource { rx })
 }
 
+/// Longest JSON line a record can make, newline included: the fixed text
+/// and every number at its widest come to 201 bytes.
+const LINE_MAX: usize = 256;
+
+/// One output line being built on the stack.
+struct Line {
+    bytes: [u8; LINE_MAX],
+    len: usize,
+}
+
+impl Line {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; LINE_MAX],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn text(&mut self, s: &[u8]) {
+        let end = self.len.saturating_add(s.len());
+        // Never out of room (see `LINE_MAX`); if it were, the line would be
+        // cut short and fail to parse, loudly, instead of panicking here.
+        if let Some(dst) = self.bytes.get_mut(self.len..end) {
+            dst.copy_from_slice(s);
+            self.len = end;
+        }
+    }
+
+    #[inline]
+    fn number<I: itoa::Integer>(&mut self, n: I) {
+        self.text(itoa::Buffer::new().format(n).as_bytes());
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.bytes.get(..self.len).unwrap_or_default()
+    }
+}
+
+impl Record {
+    /// The record as its JSON line, byte for byte what `serde_json` writes
+    /// for the [`Observation`] plus a newline (a test holds the two equal).
+    /// Written by hand because the writer thread does little else: with the
+    /// three file fields the generic serialiser took about 75% longer per
+    /// record.
+    fn encode(&self, line: &mut Line) {
+        line.len = 0;
+        line.text(if self.flags & WS == 0 {
+            br#"{"source":"node","block_time_ms":"#
+        } else {
+            br#"{"source":"public_ws","block_time_ms":"#
+        });
+        line.number(self.block_time_ms);
+        if self.flags & HAS_HEIGHT != 0 {
+            line.text(br#","block_number":"#);
+            line.number(self.block_number);
+        }
+        line.text(br#","recv_ns":"#);
+        line.number(self.recv_ns);
+        if self.flags & HAS_FILE != 0 {
+            line.text(br#","file_date":"#);
+            line.number(self.file_date);
+            line.text(br#","file_hour":"#);
+            line.number(self.file_hour);
+            line.text(br#","line_offset":"#);
+            line.number(self.line_offset);
+        }
+        line.text(b"}\n");
+    }
+}
+
 impl ObservationSink for RingSink {
     /// Pushes the record, or drops and counts it when the ring is full.
     /// Never blocks, never allocates, makes no system call.
@@ -166,11 +237,12 @@ impl RingSource {
     pub fn write_up_to<W: Write>(&mut self, out: &mut W, max: usize) -> std::io::Result<u64> {
         let mut n = 0;
         let mut left = max;
+        let mut line = Line::new();
         while left > 0 {
-            let Some(obs) = self.pop() else { break };
+            let Ok(record) = self.rx.pop() else { break };
             left -= 1;
-            serde_json::to_writer(&mut *out, &obs)?;
-            out.write_all(b"\n")?;
+            record.encode(&mut line);
+            out.write_all(line.as_bytes())?;
             n += 1;
         }
         if n > 0 {

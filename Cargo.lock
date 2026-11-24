@@ -881,6 +881,7 @@ dependencies = [
  "hl-latency",
  "hl-strict-pass",
  "inotify",
+ "itoa",
  "memchr",
  "proptest",
  "rtrb",

@@ -99,7 +99,7 @@ proptest! {
         let mut at = 0u64;
         for (l, text) in out.iter().zip(&lines) {
             prop_assert_eq!(l.offset, at);
-            at += text.len() as u64 + 1;
+            at += u64::try_from(text.len()).unwrap() + 1;
         }
     }
 }
@@ -209,7 +209,7 @@ fn first_file_is_read_from_its_end_then_follows_appends() {
 
     append(&f, &node_line("2026-11-19T08:00:00.070", 2));
     let got = tail.poll(&mut clock).unwrap();
-    let after_history = history.len() as u64;
+    let after_history = u64::try_from(history.len()).unwrap();
     assert_eq!(
         got,
         vec![node_obs_at(1_795_075_200_070, 2, 100, after_history)]
