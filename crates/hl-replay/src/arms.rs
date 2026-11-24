@@ -80,6 +80,21 @@ impl Arm {
         matches!(self, Arm::Compio | Arm::CompioSqpoll)
     }
 
+    /// Why this arm cannot run at all on the platform named `os` (a value of
+    /// [`std::env::consts::OS`]), or `None` if the platform does not rule it
+    /// out.
+    #[must_use]
+    pub fn unsupported_on(self, os: &str) -> Option<String> {
+        let _ = (self, os);
+        None
+    }
+
+    /// [`Arm::unsupported_on`] for the platform this binary was built for.
+    #[must_use]
+    pub fn unsupported_here(self) -> Option<String> {
+        self.unsupported_on(std::env::consts::OS)
+    }
+
     fn is_file(self) -> bool {
         Arm::DETECT.contains(&self)
     }
