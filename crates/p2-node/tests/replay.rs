@@ -94,8 +94,9 @@ impl Engine for Scripted {
         out
     }
 
-    fn resync(&mut self, height: u64, _native_diffs: &[BookDiff]) {
+    fn resync(&mut self, height: u64, _d: &[BookDiff], _r: &[Value]) -> Result<(), String> {
         self.resyncs.push(height);
+        Ok(())
     }
 }
 
@@ -311,6 +312,122 @@ fn extra_results_never_exceed_actions() {
     assert!(r.actions_executed <= r.actions, "{}", r.to_text());
 }
 
+#[test]
+fn streaming_run_equals_slice_run() {
+    // The compare-only CLI streams blocks (decode, run, drop) so memory does
+    // not grow with N; its counts must equal the slice runner's.
+    let blocks = input();
+    for m in [
+        None,
+        Some((0, Mutation::Response)),
+        Some((2, Mutation::Unsupported)),
+    ] {
+        let mut a = Scripted::new(&blocks, m);
+        let ra = Replay::run(&mut a, &blocks, 999).unwrap();
+        let mut b = Scripted::new(&blocks, m);
+        let mut seen = Vec::new();
+        let rb = Replay::run_stream(
+            &mut b,
+            input().into_iter().map(Ok::<_, String>),
+            999,
+            |blk, _, _| seen.push(blk.height()),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                ra.reproduced,
+                ra.blocks,
+                &ra.causes,
+                &ra.mismatches,
+                ra.actions,
+                ra.actions_executed
+            ),
+            (
+                rb.reproduced,
+                rb.blocks,
+                &rb.causes,
+                &rb.mismatches,
+                rb.actions,
+                rb.actions_executed
+            )
+        );
+        assert_eq!(a.resyncs, b.resyncs);
+        assert_eq!(seen, vec![1000, 1001, 1002]);
+    }
+}
+
+#[test]
+fn streaming_run_refuses_f1_f2_and_bad_input() {
+    use p2_node::replay::StreamError;
+    let mut blocks = input();
+    let b = decode_block(BLOCKS.lines().nth(1).unwrap()).unwrap();
+    blocks[1] = ReplayBlock::new(1001, b, None).unwrap();
+    let mut e = Scripted::new(&input(), None);
+    let err = Replay::run_stream(
+        &mut e,
+        blocks.into_iter().map(Ok::<_, String>),
+        999,
+        |_, _, _| {},
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StreamError::Replay(ReplayError::NoNativeDiffs { height: 1001 })
+        ),
+        "{err}"
+    );
+    let mut e = Scripted::new(&input(), None);
+    let err = Replay::run_stream(
+        &mut e,
+        input().into_iter().map(Ok::<_, String>),
+        1000,
+        |_, _, _| {},
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, StreamError::Replay(ReplayError::Height { .. })),
+        "{err}"
+    );
+    let mut e = Scripted::new(&input(), None);
+    let err = Replay::run_stream(
+        &mut e,
+        vec![Err("line 1: bad json".to_owned())],
+        999,
+        |_, _, _| {},
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, StreamError::Input(ref s) if s == "line 1: bad json"),
+        "{err}"
+    );
+}
+
+#[test]
+fn empty_native_diffs_count_only_when_ours_are_empty_too() {
+    // Proof (PR #34): resync(&[]) reaches only the pre-block state, so a block
+    // with an empty native diff list must count only when our engine also
+    // wrote nothing; absent diffs refuse the run (F2). Heights 1001 and
+    // 1002 have empty native lists.
+    let blocks = input();
+    assert_eq!(blocks[1].native_diffs().len(), 0);
+    let mut e = Scripted::new(&blocks, None);
+    let r = Replay::run(&mut e, &blocks, 999).unwrap();
+    assert_eq!(r.reproduced_zero_native_diffs, vec![1001, 1002]);
+    assert!(
+        r.to_text().contains("reproduced with zero native diffs 2"),
+        "{}",
+        r.to_text()
+    );
+
+    // Our engine writes a diff where native wrote none: not reproduced.
+    let mut e = Scripted::new(&blocks, None);
+    e.native[1].1 = blocks[0].native_diffs().to_vec();
+    let r = Replay::run(&mut e, &blocks, 999).unwrap();
+    assert_eq!(r.reproduced_heights, vec![1000, 1002]);
+    assert_eq!(r.causes.get(&Cause::BookDiffs), Some(&1));
+    assert_eq!(r.reproduced_zero_native_diffs, vec![1002]);
+}
 /// CI/CD re-review blocker 2: `snapshot + 1 + index` must not overflow (a
 /// panic in debug, a wrap to a small height in release). A snapshot at or
 /// next to `u64::MAX` is refused as an error.

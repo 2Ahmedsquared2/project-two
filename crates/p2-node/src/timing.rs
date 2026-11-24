@@ -175,7 +175,7 @@ fn one_pass<E: Engine>(
         let t_parse = Instant::now();
         let block =
             hl_block::decode_block(line).map_err(|e| TimingError::Decode(i + 1, e.to_string()))?;
-        let acts: Vec<UserAction<'_>> = block.actions().map(UserAction::from_signed).collect();
+        let acts: Vec<UserAction<'_>> = UserAction::of_block(&block);
         let t_exec = Instant::now();
         let out = engine.execute_block(block.time_ns, &acts);
         let exec_ns = ns(t_exec);
@@ -195,7 +195,7 @@ fn one_pass<E: Engine>(
         }
         let phase = gate.on_event(0);
         let before = pass.replay.reproduced;
-        pass.replay.record(rb, &out, &mut engine);
+        pass.replay.record(rb, &out, &mut engine)?;
         let reproduced = pass.replay.reproduced > before;
         if phase == Phase::Warmup {
             pass.excluded_warmup += 1;

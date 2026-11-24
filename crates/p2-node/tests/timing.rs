@@ -61,7 +61,9 @@ impl Engine for Spinner {
             book_diffs: d,
         }
     }
-    fn resync(&mut self, _h: u64, _d: &[BookDiff]) {}
+    fn resync(&mut self, _h: u64, _d: &[BookDiff], _r: &[Value]) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 fn factory(

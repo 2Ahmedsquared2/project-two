@@ -2,20 +2,26 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::BufReader;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
 use hl_warm::{lock_memory, pin_current_thread, GateConfig, LockOutcome, WarmGate};
 use p2_node::engines::{EchoEngine, NullEngine};
-use p2_node::replay::{load_native_diffs, ReplayBlock};
+use p2_node::replay::{load_native_diffs, Replay, ReplayBlock, ReplayError};
 use p2_node::timing::{run_passes, Timed, TimingConfig};
+
+mod wallet_rule;
 
 const USAGE: &str = "usage:
   p2-node replay --blocks <replica_cmds file> --diffs <node_raw_book_diffs batch file> --snapshot-height <H>
-                 [--engine null|echo] [--passes N>=5] [--prewarm-passes N] [--window-blocks N]
+                 [--engine null|echo|hlexec --seed resting_<H>.jsonl|l4so_<H>.json
+                  (--asset-meta asset_meta.json | --meta-dir DIR) [--statuses F]]
+                 [--passes N>=5] [--prewarm-passes N] [--window-blocks N]
                  [--core C] [--require-mlock] [--out DIR]
+                 [--compare-only]  (stream decode, run, compare, drop per block: the k/N count
+                 with memory flat in N; no warm gate, nothing timed)
   p2-node gen --blocks N --actions K --seed S --out-blocks F --out-diffs F
   p2-node warm-trial --config cold|warm|warm-no-pin|warm-no-arena|warm-no-prewarm
                  --blocks F --diffs F --prewarm-blocks F --prewarm-diffs F --n N [--prewarm R] [--core C]
@@ -24,6 +30,24 @@ const USAGE: &str = "usage:
                  (native's own apply_duration per block: median/p90/p99/max/mean, ns)
 engines: null = executes nothing (driver overhead, honest coverage); echo = returns native's
 answers (harness oracle). Neither is an execution engine: no speed claim comes from them.
+hlexec = lane 1's hl-exec engine, seeded from lane 1's resting-order seed (resting_<H>.jsonl:
+perp books only, every perp asset in the meta seeded, empty books included) or l4 book seed
+(l4so_<H>.json: exactly the books it lists, perp, spot and outcome #E = asset 100000000+E).
+Actions on books the seed does not hold are unsupported and their native diffs are not adopted.
+--meta-dir reads meta.json, spotMeta.json, perpDexs.json and meta_<dex>.json. --statuses F
+(native's order_statuses_by_block file) gives resync native's oid counter, rejected orders'
+oids included, and every order's cloid. With --compare-only and hlexec, heights.tsv lists every cause per block, and
+--end-seed l4so_<last height>.json checks our final books against native's, per book kind
+(--end-unconfirmed COIN,.. reports coins whose seed map is unconfirmed apart; they do not
+decide the verdict), and whether our oid counter reaches the seed's next_oid (a lower bound).
+--blocks takes several files, comma-separated; any input may be gzip (.gz, read via gzip -dc).
+--reduce-only-as-plain (hlexec, off by default; an APPROXIMATION, labelled in the report):
+reduce-only Gtc/Alo/Ioc legs go to the engine as plain orders, no position check; trigger and
+FrontendMarket legs stay unsupported. --ro-legs-out F writes those legs' native and our status.
+--signers FILE (hlexec, off by default): lane 1's unknown-wallet rule as on PR #11 4154560, fed by
+the same file (one address per line, .gz allowed): an L1 action whose recovered signer is not in
+the set is a noop answered \"User or API Wallet <signer> does not exist.\" (evmRawTx, multiSig,
+user-signed and expired actions not ruled; accepted approveAgent adds its agent). Labelled when on.
 exit: 0 ok, 1 run error, 2 usage";
 
 struct Args(Vec<String>);
@@ -60,6 +84,7 @@ fn main() -> ExitCode {
         Some("gen") => gen(&a),
         Some("warm-trial") => warm_trial(&a),
         Some("native-times") => native_times(&a),
+        Some("render-check") => render_check(&a),
         _ => usage("no command"),
     }
 }
@@ -118,10 +143,24 @@ fn replay(a: &Args) -> ExitCode {
         return usage("--prewarm-passes too large");
     };
     let engine = a.get("--engine").unwrap_or("null");
-    if !matches!(engine, "null" | "echo") {
-        return usage("--engine must be null or echo (hl-exec adapter lands with lane 1)");
+    if !matches!(engine, "null" | "echo" | "hlexec") {
+        return usage("--engine must be null, echo or hlexec");
     }
+    let hl = if engine == "hlexec" {
+        match load_hlexec(a, snapshot) {
+            Ok(x) => Some(x),
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        None
+    };
 
+    if a.0.iter().any(|x| x == "--compare-only") {
+        return compare_only(a, bpath, dpath, snapshot, engine, hl.as_ref());
+    }
     // Warm-up steps; the gate stays closed (and nothing is timed) until all pass.
     let t0 = Instant::now();
     let mut gate = WarmGate::new(GateConfig {
@@ -198,10 +237,16 @@ fn replay(a: &Args) -> ExitCode {
     } else {
         let _ = gate.pass("mlock", now_ns(t0));
     }
-    let native: Vec<_> = blocks
-        .iter()
-        .map(|b| (b.native_responses().to_vec(), b.native_diffs().to_vec()))
-        .collect();
+    // Native's answers, copied only for the echo engine (they double the
+    // decoded input's memory).
+    let native: Vec<_> = if engine == "echo" {
+        blocks
+            .iter()
+            .map(|b| (b.native_responses().to_vec(), b.native_diffs().to_vec()))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let cfg = TimingConfig {
         passes,
         prewarm_passes: prewarm,
@@ -212,8 +257,19 @@ fn replay(a: &Args) -> ExitCode {
         eprintln!("warm gate closed:\n{}", gate.report());
         return ExitCode::from(1);
     }
-    let timed: Result<Timed, _> = match engine {
-        "echo" => run_passes(
+    let timed: Result<Timed, _> = match (engine, &hl) {
+        ("hlexec", Some((table, _, seeded, st))) => run_passes(
+            &mut || {
+                p2_node::hlexec::HlExecEngine::new(seeded.clone(), table.clone())
+                    .with_status_max_oids(st.max_oids.clone())
+                    .with_status_cloids(st.cloids.clone())
+            },
+            &lines,
+            &blocks,
+            snapshot,
+            &cfg,
+        ),
+        ("echo", _) => run_passes(
             &mut || EchoEngine::new(native.clone()),
             &lines,
             &blocks,
@@ -234,6 +290,33 @@ fn replay(a: &Args) -> ExitCode {
     let mut report = String::new();
     let _ = writeln!(report, "engine {engine}  blocks {}  passes {passes}  prewarm {prewarm}  window {window}  core {core:?}", blocks.len());
     report.push_str(&first_pass.to_text());
+    if let Some((table, _, _, _)) = &hl {
+        // Mismatched blocks by class; a block that touches a book the seed
+        // does not hold is "unseeded-book" whatever else differs.
+        let unseeded: std::collections::HashSet<u64> = blocks
+            .iter()
+            .filter(|b| p2_node::hlexec::touches_unseeded(table, b))
+            .map(ReplayBlock::height)
+            .collect();
+        let mut by: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        for (h, c) in &first_pass.mismatches {
+            let k = if unseeded.contains(h) {
+                "unseeded-book".to_owned()
+            } else {
+                format!("{c:?}")
+            };
+            *by.entry(k).or_default() += 1;
+        }
+        let _ = writeln!(
+            report,
+            "blocks touching an unseeded book: {} of {}; not-reproduced blocks by class:",
+            unseeded.len(),
+            blocks.len()
+        );
+        for (k, n) in &by {
+            let _ = writeln!(report, "  {n:>6}  {k}");
+        }
+    }
     report.push_str(&timed.summary().to_text());
     // Like-for-like also needs the end-state check, which this CLI does not
     // run yet: until it does, every speed row stays "not like-for-like".
@@ -267,6 +350,736 @@ fn replay(a: &Args) -> ExitCode {
         eprintln!("note: {lock}");
     }
     ExitCode::SUCCESS
+}
+
+/// Opens the blocks file as a stream of non-empty lines.
+/// `bpath` may list several files, comma-separated, read in order; each may
+/// be gzip (`.gz`).
+fn block_lines(bpath: &str) -> Result<impl Iterator<Item = Result<String, String>>, String> {
+    let mut parts = Vec::new();
+    for p in bpath.split(',') {
+        let r = open_input(p)?;
+        let bp = p.to_owned();
+        parts.push(r.lines().map(move |l| l.map_err(|e| format!("{bp}: {e}"))));
+    }
+    Ok(parts
+        .into_iter()
+        .flatten()
+        .filter(|l| l.as_ref().map_or(true, |l| !l.trim().is_empty())))
+}
+
+/// A `gzip -dc` child's output; at its end, the child's exit status is
+/// checked, so a truncated or corrupt file is an error, not a short input.
+struct Gunzip {
+    child: std::process::Child,
+    out: std::process::ChildStdout,
+    path: String,
+}
+
+impl std::io::Read for Gunzip {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.out.read(buf)?;
+        if n == 0 && !buf.is_empty() {
+            let st = self.child.wait()?;
+            if !st.success() {
+                return Err(std::io::Error::other(format!(
+                    "{}: gzip -dc exited {st}",
+                    self.path
+                )));
+            }
+        }
+        Ok(n)
+    }
+}
+
+/// Opens an input file; a `.gz` path is decompressed by `gzip -dc`.
+fn open_input(path: &str) -> Result<Box<dyn BufRead>, String> {
+    if std::path::Path::new(path)
+        .extension()
+        .is_some_and(|x| x.eq_ignore_ascii_case("gz"))
+    {
+        let mut child = std::process::Command::new("gzip")
+            .arg("-dc")
+            .arg(path)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("{path}: gzip -dc: {e}"))?;
+        let out = child
+            .stdout
+            .take()
+            .ok_or_else(|| format!("{path}: gzip -dc: no stdout"))?;
+        Ok(Box::new(BufReader::with_capacity(
+            1 << 20,
+            Gunzip {
+                child,
+                out,
+                path: path.to_owned(),
+            },
+        )))
+    } else {
+        let f = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+        Ok(Box::new(BufReader::new(f)))
+    }
+}
+
+/// `--end-seed FILE`: native's l4 book seed at the last replayed height.
+/// Every book we hold, printed by the same canonical printer for ours and
+/// native's (queue order, oid, user, size, cloid), compared book by book and
+/// reported per book kind; books whose coin is listed in `unconfirmed`
+/// (`--end-unconfirmed`, coins whose seed map is not confirmed) are reported
+/// apart and do not decide the verdict. The seed's next oid is taken as a
+/// lower bound only (it may be inferred): we report whether ours reaches it.
+/// Returns whether every confirmed book is equal, and a report.
+#[allow(clippy::too_many_lines)]
+fn end_state_check(
+    path: &str,
+    ours: &p2_node::hlexec::HlExecEngine,
+    held: &p2_node::hlexec::AssetTable,
+    all: &p2_node::hlexec::AssetTable,
+    last_height: u64,
+    unconfirmed: &std::collections::HashSet<String>,
+) -> Result<(bool, String), String> {
+    use p2_node::engine::Engine as _;
+    let end = p2_node::hlexec::L4Seed::read(open_input(path)?, all)
+        .map_err(|e| format!("{path}: {e}"))?;
+    if end.height != last_height {
+        return Err(format!(
+            "{path}: end seed height {} but the last replayed height is {last_height}",
+            end.height
+        ));
+    }
+    let native = hl_exec::Engine::from_l4_snapshot(
+        &end.table.ids(),
+        end.orders.iter().copied(),
+        end.next_oid,
+        hl_exec::Capacity::default(),
+        hl_exec::EngineConfig::default(),
+    )
+    .map_err(|e| format!("{path}: does not load into hl-exec: {e:?}"))?;
+    let native = p2_node::hlexec::HlExecEngine::new(native, end.table.clone());
+    // Book lines start with the asset id; the last line is `next_oid N`.
+    let split = |text: String| {
+        let mut books: std::collections::BTreeMap<u32, Vec<String>> =
+            std::collections::BTreeMap::default();
+        let mut next = None;
+        for l in text.lines() {
+            match l.split(' ').next().and_then(|a| a.parse::<u32>().ok()) {
+                Some(a) => books.entry(a).or_default().push(l.to_owned()),
+                None => {
+                    next = l
+                        .strip_prefix("next_oid ")
+                        .and_then(|n| n.parse::<u64>().ok());
+                }
+            }
+        }
+        (books, next)
+    };
+    let (ob, onext) = split(ours.final_book().unwrap_or_default());
+    let (nb, _) = split(native.final_book().unwrap_or_default());
+    let empty = Vec::new();
+    // kind -> (equal, differ, orders ours, orders native, differ only in cloids)
+    let mut kinds: std::collections::BTreeMap<String, (u64, u64, usize, usize, u64)> =
+        std::collections::BTreeMap::default();
+    // A queue entry without its last field (the cloid).
+    let no_cloid = |v: &[String]| -> Vec<String> {
+        v.iter()
+            .map(|l| l.rsplit_once(' ').map_or(l.as_str(), |(h, _)| h).to_owned())
+            .collect()
+    };
+    let mut lines = String::new();
+    let mut confirmed_ok = true;
+    let mut missing = 0usize;
+    for a in held.ids() {
+        let coin = held.get(a).map_or("?", |m| m.coin.as_str());
+        let map_unconfirmed = unconfirmed.contains(coin);
+        let kind = if map_unconfirmed {
+            "outcome (map unconfirmed)".to_owned()
+        } else {
+            p2_node::hlexec::asset_kind(a).to_owned()
+        };
+        if end.table.get(a).is_none() {
+            missing += 1;
+        }
+        let (mine, theirs) = (ob.get(&a).unwrap_or(&empty), nb.get(&a).unwrap_or(&empty));
+        let e = kinds.entry(kind.clone()).or_default();
+        e.2 += mine.len();
+        e.3 += theirs.len();
+        if mine == theirs && end.table.get(a).is_some() {
+            e.0 += 1;
+            continue;
+        }
+        e.1 += 1;
+        if no_cloid(mine) == no_cloid(theirs) {
+            e.4 += 1;
+        }
+        if !map_unconfirmed {
+            confirmed_ok = false;
+        }
+        // First differing queue entry: `asset side px_ticks oid user sz cloid`.
+        let i = mine
+            .iter()
+            .zip(theirs)
+            .position(|(p, q)| p != q)
+            .unwrap_or(mine.len().min(theirs.len()));
+        let show = |l: Option<&String>| {
+            l.map_or_else(
+                || "none".to_owned(),
+                |l| {
+                    let f: Vec<&str> = l.split(' ').collect();
+                    let px = held.get(a).map_or_else(
+                        || f[2].to_owned(),
+                        |m| {
+                            p2_node::hlexec::fmt_units(
+                                f[2].parse().unwrap_or(0),
+                                m.px_decimals,
+                                false,
+                            )
+                        },
+                    );
+                    format!(
+                        "{} {px} oid {} user {} sz {} cloid {}",
+                        f[1], f[3], f[4], f[5], f[6]
+                    )
+                },
+            )
+        };
+        let _ = writeln!(
+            lines,
+            "  differs [{kind}] {coin} (asset {a}): {} orders ours, {} native; first difference at queue entry {i}: ours {}, native {}",
+            mine.len(),
+            theirs.len(),
+            show(mine.get(i)),
+            show(theirs.get(i))
+        );
+    }
+    let not_held = end
+        .table
+        .ids()
+        .iter()
+        .filter(|a| held.get(**a).is_none())
+        .count();
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "end-state check at {last_height} against {path}: covers the {} books both seeds hold ({not_held} native books not held, {missing} held books absent from native's seed); books not in the seeds are in neither side",
+        held.ids().len()
+    );
+    for (k, (eq, ne, o, n, cl)) in &kinds {
+        let _ = writeln!(
+            s,
+            "  {k}: books equal {eq}, differing {ne} (of which only in cloids {cl}); orders ours {o}, native {n}"
+        );
+    }
+    let bound = end.next_oid.map(|o| o.0);
+    let _ = writeln!(
+        s,
+        "  oid counter: ours next_oid {}, native seed's next_oid {} is a lower bound (inferred); ours >= bound: {}",
+        onext.map_or("?".into(), |n| n.to_string()),
+        bound.map_or("?".into(), |n| n.to_string()),
+        match (onext, bound) {
+            (Some(o), Some(b)) => if o >= b { "yes" } else { "NO" },
+            _ => "unknown",
+        }
+    );
+    s.push_str(&lines);
+    Ok((confirmed_ok && missing == 0, s))
+}
+
+/// `replay --compare-only`: the per-block k/N count, streamed. Each block is
+/// decoded, run, compared and dropped, so memory stays flat in N (the timed
+/// path keeps every decoded block for its passes). F2 is checked for the
+/// whole input before the engine runs; F1's decoded-height check runs as
+/// blocks arrive and refuses the run (no report) if it fails.
+#[allow(clippy::too_many_lines)]
+fn compare_only(
+    args: &Args,
+    bpath: &str,
+    dpath: &str,
+    snapshot: u64,
+    engine: &str,
+    hl: Option<&HlSetup>,
+) -> ExitCode {
+    let fail = |e: String| {
+        eprintln!("{e}");
+        ExitCode::from(1)
+    };
+    let mut diffs =
+        match open_input(dpath).and_then(|r| load_native_diffs(r).map_err(|e| e.to_string())) {
+            Ok(d) => d,
+            Err(e) => return fail(format!("{dpath}: {e}")),
+        };
+    // Pre-pass: count blocks (F2 up front) and, for echo only, collect
+    // native's answers (echo replays them; it is the harness oracle).
+    let mut count = 0u64;
+    let mut native = Vec::new();
+    let lines = match block_lines(bpath) {
+        Ok(l) => l,
+        Err(e) => return fail(e),
+    };
+    for l in lines {
+        let line = match l {
+            Ok(line) => line,
+            Err(e) => return fail(e),
+        };
+        count += 1;
+        let height = match nth_height(snapshot, count) {
+            Ok(h) => h,
+            Err(e) => return fail(e),
+        };
+        if !diffs.contains_key(&height) {
+            return fail(ReplayError::NoNativeDiffs { height }.to_string());
+        }
+        if engine == "echo" {
+            match hl_block::decode_block(&line) {
+                Ok(block) => native.push((
+                    block
+                        .actions()
+                        .map(|x| x.outcome.to_json())
+                        .collect::<Vec<_>>(),
+                    diffs.get(&height).map(|d| d.1.clone()).unwrap_or_default(),
+                )),
+                Err(e) => return fail(format!("{bpath}:{count}: {e}")),
+            }
+        }
+    }
+    let lines = match block_lines(bpath) {
+        Ok(l) => l,
+        Err(e) => return fail(e),
+    };
+    let mut line_no = 0u64;
+    let decisions: wallet_rule::Decisions = std::rc::Rc::default();
+    let mut rule = match args.get("--signers") {
+        Some(_) if engine != "hlexec" => return fail("--signers needs --engine hlexec".into()),
+        Some(p) => match open_input(p) {
+            Ok(r) => {
+                let w = wallet_rule::WalletRule::new(r, decisions.clone());
+                eprintln!("signers: {} addresses from {p}", w.len());
+                Some(w)
+            }
+            Err(e) => return fail(e),
+        },
+        None => None,
+    };
+    let stream = lines.map(|l| {
+        line_no += 1;
+        let height = nth_height(snapshot, line_no)?;
+        let line = l?;
+        let block = hl_block::decode_block(&line).map_err(|e| format!("{bpath}:{line_no}: {e}"))?;
+        let rb =
+            ReplayBlock::new(height, block, diffs.remove(&height)).map_err(|e| e.to_string())?;
+        if let Some(r) = rule.as_mut() {
+            r.decide(
+                &line,
+                &rb.user_actions(),
+                rb.native_responses(),
+                rb.block().time_ns,
+            )
+            .map_err(|e| format!("{bpath}:{line_no}: {e}"))?;
+        }
+        Ok::<_, String>(rb)
+    });
+    let ruled = args.get("--signers").is_some();
+    // Unknown-wallet tally over every action (both absent, native only, ours only).
+    let mut uw = (0u64, 0u64, 0u64);
+    let mut unseeded = std::collections::HashSet::new();
+    let no_placed = std::collections::HashSet::new();
+    let mut classes: HashMap<u64, Vec<String>> = HashMap::new();
+    let ro_plain = args.0.iter().any(|x| x == "--reduce-only-as-plain");
+    let mut ro_legs = match args.get("--ro-legs-out") {
+        Some(p) => match std::fs::File::create(p) {
+            Ok(f) => Some(std::io::BufWriter::new(f)),
+            Err(e) => return fail(format!("{p}: {e}")),
+        },
+        None => None,
+    };
+    let mut ro_err: Option<String> = None;
+    let each = |blk: &ReplayBlock, out: &p2_node::engine::BlockOutcome, reproduced: bool| {
+        if ruled {
+            for (i, n) in blk.native_responses().iter().enumerate() {
+                let ours = match out.results.get(i) {
+                    Some(p2_node::engine::ActionResult::Response(v)) => {
+                        wallet_rule::is_unknown_wallet(v)
+                    }
+                    _ => false,
+                };
+                match (wallet_rule::is_unknown_wallet(n), ours) {
+                    (true, true) => uw.0 += 1,
+                    (true, false) => uw.1 += 1,
+                    (false, true) => uw.2 += 1,
+                    (false, false) => {}
+                }
+            }
+        }
+        if let Some(w) = ro_legs.as_mut() {
+            if let Err(e) = write_ro_legs(w, blk, out) {
+                ro_err.get_or_insert(e.to_string());
+            }
+        }
+        if let Some((table, all, _, st)) = hl {
+            if p2_node::hlexec::touches_unseeded(table, blk) {
+                unseeded.insert(blk.height());
+            }
+            if !reproduced {
+                // Without --statuses there is nothing to tell native's
+                // action-less book activity apart: never diffs:no-action.
+                let placed = (!st.max_oids.is_empty())
+                    .then(|| st.placed.get(&blk.height()).unwrap_or(&no_placed));
+                let mut c = p2_node::hlexec::block_classes(table, all, blk, out, placed);
+                if c.is_empty() {
+                    // compare() saw a difference block_classes does not name.
+                    c.push("unclassified".into());
+                }
+                classes.insert(blk.height(), c);
+            }
+        }
+    };
+    let mut hl_engine = hl.map(|(table, _, seeded, st)| {
+        p2_node::hlexec::HlExecEngine::new(seeded.clone(), table.clone())
+            .with_status_max_oids(st.max_oids.clone())
+            .with_status_cloids(st.cloids.clone())
+            .with_reduce_only_as_plain(ro_plain)
+    });
+    let run = match (engine, hl_engine.as_mut()) {
+        ("hlexec", Some(eng)) if ruled => Replay::run_stream(
+            &mut wallet_rule::RuledEngine {
+                inner: eng,
+                decisions: decisions.clone(),
+            },
+            stream,
+            snapshot,
+            each,
+        ),
+        ("hlexec", Some(eng)) => Replay::run_stream(eng, stream, snapshot, each),
+        ("echo", _) => Replay::run_stream(&mut EchoEngine::new(native), stream, snapshot, each),
+        _ => Replay::run_stream(&mut NullEngine, stream, snapshot, each),
+    };
+    let mut run = match run {
+        Ok(run) => run,
+        Err(e) => return fail(e.to_string()),
+    };
+    if let Some(e) = ro_err {
+        return fail(format!("--ro-legs-out: {e}"));
+    }
+    if let Some(Err(e)) = ro_legs.as_mut().map(std::io::Write::flush) {
+        return fail(format!("--ro-legs-out: {e}"));
+    }
+    let mut end_report = String::new();
+    if let Some(p) = args.get("--end-seed") {
+        let (Some(eng), Some((table, all, _, _))) = (hl_engine.as_ref(), hl) else {
+            return fail("--end-seed needs --engine hlexec".into());
+        };
+        let unconfirmed: std::collections::HashSet<String> = args
+            .get("--end-unconfirmed")
+            .map(|l| l.split(',').map(str::to_owned).collect())
+            .unwrap_or_default();
+        match end_state_check(
+            p,
+            eng,
+            table,
+            all,
+            run.last_height.unwrap_or(snapshot),
+            &unconfirmed,
+        ) {
+            Ok((ok, text)) => {
+                run.end_state = Some(ok);
+                end_report = text;
+            }
+            Err(e) => return fail(e),
+        }
+    }
+    let mut report = String::new();
+    let mut flag = String::new();
+    if ro_plain {
+        let _ = writeln!(report, "{RO_PLAIN_NOTE}");
+        flag.push_str("[--reduce-only-as-plain, approximation] ");
+    }
+    if let Some(r) = &rule {
+        let _ = writeln!(
+            report,
+            "flag --signers: lane 1's unknown-wallet rule (PR #11 4154560). Actions ruled absent {}; \
+             unknown-wallet (all actions): both {}, native only {}, ours only {}; L1 signatures not \
+             recovered {}; agents added {}; set now {}",
+            r.absent, uw.0, uw.1, uw.2, r.not_recovered, r.agents_added, r.len()
+        );
+        flag.push_str("[--signers] ");
+    }
+    let _ = writeln!(
+        report,
+        "engine {engine}  blocks {}  compare-only: nothing timed",
+        run.blocks
+    );
+    report.push_str(&run.to_text());
+    if hl.is_some() {
+        report.push_str(&class_report(&run, &unseeded));
+        report.push_str(&all_causes_report(&run, &classes));
+    }
+    report.push_str(&end_report);
+    let _ = writeln!(
+        report,
+        "{flag}{}",
+        p2_node::replay::verdict_label(
+            run.reproduced,
+            run.blocks,
+            run.end_state
+                .map(|ok| (ok, run.last_height.unwrap_or(snapshot)))
+        )
+    );
+    print!("{report}");
+    if let Err(e) = write_out(args, &report, &heights_tsv(&run, &unseeded, &classes)) {
+        return fail(e);
+    }
+    ExitCode::SUCCESS
+}
+
+/// First report line of a `--reduce-only-as-plain` run: every k it prints
+/// carries the flag and is an approximation.
+const RO_PLAIN_NOTE: &str =
+    "flag --reduce-only-as-plain: APPROXIMATION. Reduce-only Gtc/Alo/Ioc legs \
+are placed as plain orders with no position check (we hold no positions); native's \"Reduce only \
+order would increase position\" depends on position state we do not have. Every k below is with \
+this flag; report it beside the run without it, never in its place.";
+
+/// `--ro-legs-out`: one line per leg [`p2_node::hlexec::plain_reduce_only_legs`]
+/// names, `height TAB action TAB type TAB leg TAB native TAB ours` (the
+/// leg's status JSON, see [`p2_node::hlexec::leg_status`]; ours `-` when the
+/// action is unsupported).
+fn write_ro_legs(
+    w: &mut impl std::io::Write,
+    blk: &ReplayBlock,
+    out: &p2_node::engine::BlockOutcome,
+) -> std::io::Result<()> {
+    let native = blk.native_responses();
+    for (i, a) in blk.user_actions().iter().enumerate() {
+        let legs = p2_node::hlexec::plain_reduce_only_legs(a);
+        if legs.is_empty() {
+            continue;
+        }
+        let Some(nat) = native.get(i) else { continue };
+        for j in legs {
+            let ours = match out.results.get(i) {
+                Some(p2_node::engine::ActionResult::Response(v)) => {
+                    p2_node::hlexec::leg_status(v, j).to_string()
+                }
+                _ => "-".to_owned(),
+            };
+            writeln!(
+                w,
+                "{}\t{i}\t{}\t{j}\t{}\t{ours}",
+                blk.height(),
+                a.action_type,
+                p2_node::hlexec::leg_status(nat, j)
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// `snapshot + n` for the n-th (1-based) block line, checked.
+fn nth_height(snapshot: u64, n: u64) -> Result<u64, String> {
+    snapshot.checked_add(n).ok_or_else(|| {
+        ReplayError::HeightOverflow {
+            snapshot,
+            index: usize::try_from(n.saturating_sub(1)).unwrap_or(usize::MAX),
+        }
+        .to_string()
+    })
+}
+
+/// With `--out DIR`: the report and the per-height verdicts.
+fn write_out(args: &Args, report: &str, heights: &str) -> Result<(), String> {
+    let Some(out) = args.get("--out").map(PathBuf::from) else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(&out)
+        .and_then(|()| std::fs::write(out.join("report.txt"), report))
+        .and_then(|()| std::fs::write(out.join("heights.tsv"), heights))
+        .map_err(|e| format!("{}: {e}", out.display()))
+}
+
+/// One line per block, `height TAB reproduced` or `height TAB classes`
+/// (comma-separated, every cause from [`p2_node::hlexec::block_classes`]
+/// with hlexec; otherwise the first mismatch, or unseeded-book), the shape
+/// of lane 1's `--heights-out`, for reconciling runs by height.
+fn heights_tsv(
+    run: &Replay,
+    unseeded: &std::collections::HashSet<u64>,
+    classes: &HashMap<u64, Vec<String>>,
+) -> String {
+    let mut rows: Vec<(u64, String)> = run
+        .reproduced_heights
+        .iter()
+        .map(|h| (*h, "reproduced".to_owned()))
+        .collect();
+    for (h, cause) in &run.mismatches {
+        let class = if let Some(c) = classes.get(h) {
+            c.join(",")
+        } else if unseeded.contains(h) {
+            "unseeded-book".to_owned()
+        } else {
+            format!("{cause:?}").replace(',', ";")
+        };
+        rows.push((*h, class));
+    }
+    rows.sort_by_key(|r| r.0);
+    let mut s = String::new();
+    for (h, v) in rows {
+        let _ = writeln!(s, "{h}\t{v}");
+    }
+    s
+}
+
+/// Every cause, counted twice: blocks where it appears at all, and blocks
+/// where it is the only cause (fixing it alone adds that many to k).
+fn all_causes_report(run: &Replay, classes: &HashMap<u64, Vec<String>>) -> String {
+    let mut any: std::collections::BTreeMap<&str, (u64, u64)> = std::collections::BTreeMap::new();
+    for (h, _) in &run.mismatches {
+        let Some(c) = classes.get(h) else { continue };
+        for x in c {
+            let e = any.entry(x.as_str()).or_default();
+            e.0 += 1;
+            if c.len() == 1 {
+                e.1 += 1;
+            }
+        }
+    }
+    let mut rows: Vec<_> = any.into_iter().collect();
+    rows.sort_by_key(|(k, (n, _))| (std::cmp::Reverse(*n), *k));
+    let mut s = String::from("every cause per not-reproduced block (appears / only cause):\n");
+    for (k, (n, only)) in rows {
+        let _ = writeln!(s, "  {n:>6}  {only:>6}  {k}");
+    }
+    s
+}
+
+/// Not-reproduced blocks by class; a block touching a book the seed does not
+/// hold is "unseeded-book" whatever else differs.
+fn class_report(run: &Replay, unseeded: &std::collections::HashSet<u64>) -> String {
+    let mut report = String::new();
+    let mut by: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for (height, cause) in &run.mismatches {
+        let key = if unseeded.contains(height) {
+            "unseeded-book".to_owned()
+        } else {
+            format!("{cause:?}")
+        };
+        *by.entry(key).or_default() += 1;
+    }
+    let _ = writeln!(
+        report,
+        "blocks touching an unseeded book: {} of {}; not-reproduced blocks by class:",
+        unseeded.len(),
+        run.blocks
+    );
+    for (key, count) in &by {
+        let _ = writeln!(report, "  {count:>6}  {key}");
+    }
+    report
+}
+
+/// Seeded books' asset table, every listed asset's table, seeded engine and
+/// what resync takes from native's order statuses (`--statuses`; empty
+/// without it).
+type HlSetup = (
+    p2_node::hlexec::AssetTable,
+    p2_node::hlexec::AssetTable,
+    hl_exec::Engine,
+    p2_node::hlexec::StatusIndex,
+);
+
+/// Static meta for every listed asset: `--asset-meta FILE` or `--meta-dir DIR`.
+fn load_meta(a: &Args) -> Result<p2_node::hlexec::AssetTable, String> {
+    match (a.get("--asset-meta"), a.get("--meta-dir")) {
+        (Some(mp), None) => std::fs::read_to_string(mp)
+            .map_err(|e| e.to_string())
+            .and_then(|s| p2_node::hlexec::AssetTable::from_json(&s))
+            .map_err(|e| format!("{mp}: {e}")),
+        (None, Some(dir)) => p2_node::hlexec::AssetTable::from_meta_dir(std::path::Path::new(dir)),
+        _ => Err("--engine hlexec needs --seed and one of --asset-meta, --meta-dir".into()),
+    }
+}
+
+/// The asset tables and lane 1's seed (resting-order lines or an l4 book
+/// file, told apart by the first byte), checked against
+/// `--snapshot-height`; with `--statuses`, native's order-status file for
+/// resync's oid counter.
+fn load_hlexec(a: &Args, snapshot: u64) -> Result<HlSetup, String> {
+    let Some(sp) = a.get("--seed") else {
+        return Err("--engine hlexec needs --seed and one of --asset-meta, --meta-dir".into());
+    };
+    let all = load_meta(a)?;
+    let mut f = BufReader::new(std::fs::File::open(sp).map_err(|e| format!("{sp}: {e}"))?);
+    let l4 = f
+        .fill_buf()
+        .map_err(|e| format!("{sp}: {e}"))?
+        .iter()
+        .find(|c| !c.is_ascii_whitespace())
+        == Some(&b'[');
+    let (table, height, next_oid, orders) = if l4 {
+        let seed = p2_node::hlexec::L4Seed::read(f, &all).map_err(|e| format!("{sp}: {e}"))?;
+        if !seed.skipped_coins.is_empty() {
+            eprintln!(
+                "hlexec l4 seed: {} coins with no meta not seeded (first {})",
+                seed.skipped_coins.len(),
+                seed.skipped_coins[0]
+            );
+        }
+        (seed.table, seed.height, seed.next_oid, seed.orders)
+    } else {
+        // Spot is 10000..100000; perps are below it, builder perps above it.
+        let table = all.filtered(|m| !(10_000..100_000).contains(&m.asset));
+        let seed = p2_node::hlexec::RestingSeed::read(f).map_err(|e| format!("{sp}: {e}"))?;
+        if let Some(o) = seed.orders.iter().find(|o| table.get(o.asset).is_none()) {
+            return Err(format!(
+                "{sp}: oid {} on asset {} not in the perp asset table",
+                o.oid.0, o.asset
+            ));
+        }
+        (table, seed.height, seed.next_oid, seed.orders)
+    };
+    if height != snapshot {
+        return Err(format!(
+            "{sp}: seed height {height} but --snapshot-height {snapshot}"
+        ));
+    }
+    let ids = table.ids();
+    let count = |k: &str| {
+        ids.iter()
+            .filter(|x| p2_node::hlexec::asset_kind(**x) == k)
+            .count()
+    };
+    eprintln!(
+        "hlexec seed height {height}: {} resting orders, {} books seeded ({} perp, {} spot, {} builder perp, {} outcome), next_oid {:?}",
+        orders.len(),
+        ids.len(),
+        count("perp"),
+        count("spot"),
+        count("builder-perp"),
+        count("outcome"),
+        next_oid.map(|o| o.0)
+    );
+    let max = orders.iter().map(|o| o.oid.0).max().unwrap_or(0);
+    let e = hl_exec::Engine::from_l4_snapshot(
+        &ids,
+        orders.iter().copied(),
+        Some(next_oid.unwrap_or(hl_exec::Oid(max + 1))),
+        hl_exec::Capacity::default(),
+        hl_exec::EngineConfig::default(),
+    )
+    .map_err(|e| format!("{sp}: seed does not load into hl-exec: {e:?}"))?;
+    let st = match a.get("--statuses") {
+        Some(path) => {
+            let idx = p2_node::hlexec::load_statuses(open_input(path)?)
+                .map_err(|e| format!("{path}: {e}"))?;
+            eprintln!(
+                "hlexec statuses: highest oid for {} heights, cloids for {} oids",
+                idx.max_oids.len(),
+                idx.cloids.len()
+            );
+            idx
+        }
+        None => p2_node::hlexec::StatusIndex::default(),
+    };
+    Ok((table, all, e, st))
 }
 
 fn load_pair(
@@ -441,5 +1254,83 @@ fn native_times(a: &Args) -> ExitCode {
         ns.last().copied().unwrap_or(0),
         mean
     );
+    ExitCode::SUCCESS
+}
+
+/// Renderer check: for every order-book action in a `replica_cmds` file
+/// (plain or gzip-free JSON lines), parse native's response with the action
+/// and asset metadata, render it with the hl-exec adapter's renderer and
+/// count value-equal / different / not rendered (a response class the
+/// engine never produces, e.g. a margin error).
+fn render_check(a: &Args) -> ExitCode {
+    use std::collections::BTreeMap;
+    use std::io::BufRead as _;
+    let (Some(bp), Some(mp)) = (a.get("--blocks"), a.get("--asset-meta")) else {
+        return usage("render-check --blocks FILE --asset-meta asset_meta.json");
+    };
+    let meta = match std::fs::read_to_string(mp)
+        .map_err(|e| e.to_string())
+        .and_then(|s| p2_node::hlexec::AssetTable::from_json(&s))
+    {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{mp}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let f = match std::fs::File::open(bp) {
+        Ok(f) => BufReader::new(f),
+        Err(e) => {
+            eprintln!("{bp}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let (mut same, mut diff, mut skipped) = (0u64, 0u64, 0u64);
+    let mut diff_by: BTreeMap<String, (u64, String)> = BTreeMap::new();
+    for (i, line) in f.lines().enumerate() {
+        let Ok(line) = line else { break };
+        let b = match hl_block::decode_block(&line) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("{bp}:{}: {e}", i + 1);
+                return ExitCode::from(1);
+            }
+        };
+        for act in b.actions() {
+            if !matches!(
+                act.action_type.as_str(),
+                "order" | "cancel" | "cancelByCloid" | "modify" | "batchModify" | "noop"
+            ) {
+                continue;
+            }
+            let native = act.outcome.to_json();
+            let ua = p2_node::engine::UserAction::from_signed(act);
+            match p2_node::hlexec::roundtrip(&meta, &ua, &native) {
+                Some(true) => same += 1,
+                Some(false) => {
+                    diff += 1;
+                    let e = diff_by
+                        .entry(format!(
+                            "{} {}",
+                            act.action_type,
+                            hl_block::census::response_classes(&act.outcome)
+                                .first()
+                                .cloned()
+                                .unwrap_or_default()
+                        ))
+                        .or_insert((0, native.to_string()));
+                    e.0 += 1;
+                }
+                None => skipped += 1,
+            }
+        }
+    }
+    println!("rendered value-equal {same}, different {diff}, not rendered (engine never answers this class) {skipped}");
+    for (k, (n, ex)) in &diff_by {
+        println!(
+            "{n:>10}  {k}\n            e.g. {}",
+            ex.chars().take(300).collect::<String>()
+        );
+    }
     ExitCode::SUCCESS
 }

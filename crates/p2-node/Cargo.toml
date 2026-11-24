@@ -13,10 +13,14 @@ publish = false
 hl-block = { path = "../hl-block" }
 hl-warm = { path = "../hl-warm" }
 hl-node-convert = { path = "../hl-node-convert" }
+hl-exec = { path = "../hl-exec" }
 hl-book-ref = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 serde.workspace = true
 thiserror.workspace = true
+# --signers: lane 1's unknown-wallet rule (L1 signer recovery), same versions as hl-exec's replay example.
+secp256k1 = { version = "0.29", features = ["recovery"] }
+sha3 = "0.10"
 
 [dev-dependencies]
 hl-block = { path = "../hl-block" }

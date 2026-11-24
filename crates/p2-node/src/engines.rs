@@ -18,7 +18,9 @@ impl Engine for NullEngine {
             book_diffs: Vec::new(),
         }
     }
-    fn resync(&mut self, _h: u64, _d: &[BookDiff]) {}
+    fn resync(&mut self, _h: u64, _d: &[BookDiff], _r: &[Value]) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Test oracle: answers with native's own responses and diffs, handed to it
@@ -47,5 +49,7 @@ impl Engine for EchoEngine {
             book_diffs: d,
         }
     }
-    fn resync(&mut self, _h: u64, _d: &[BookDiff]) {}
+    fn resync(&mut self, _h: u64, _d: &[BookDiff], _r: &[Value]) -> Result<(), String> {
+        Ok(())
+    }
 }

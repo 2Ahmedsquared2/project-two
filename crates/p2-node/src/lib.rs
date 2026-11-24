@@ -9,6 +9,7 @@
 pub mod engine;
 pub mod engines;
 pub mod gen;
+pub mod hlexec;
 pub mod native_times;
 pub mod replay;
 pub mod timing;

@@ -185,6 +185,53 @@ fn native_times_summary() {
     assert!(so.contains("max 26845330"), "{so}");
 }
 
+#[test]
+fn replay_compare_only_streams_counts_and_times_nothing() {
+    // Streaming per-block count (no timed passes, no warm gate): same k/N as
+    // the timed path's first pass, and it says nothing was timed.
+    let out = tmp("compare-only");
+    let run = |engine: &str| {
+        bin()
+            .args(["replay", "--compare-only", "--engine", engine])
+            .args(["--blocks", &data("three_blocks.jsonl")])
+            .args(["--diffs", &data("diffs_1000.jsonl")])
+            .args(["--snapshot-height", "999", "--out", out.to_str().unwrap()])
+            .output()
+            .unwrap()
+    };
+    let o = run("null");
+    let so = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        o.status.success(),
+        "{so}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(so.contains("compare-only: nothing timed"), "{so}");
+    assert!(so.contains("per-block outputs matched 1/3"), "{so}");
+    assert!(so.contains("actions executed 0/3"), "{so}");
+    assert!(std::fs::read_to_string(out.join("report.txt"))
+        .unwrap()
+        .contains("per-block outputs matched 1/3"));
+    let o = run("echo");
+    let so = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        o.status.success(),
+        "{so}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(so.contains("per-block outputs matched 3/3"), "{so}");
+    // F2 up front: a snapshot past the diffs' range is refused before running.
+    let o = bin()
+        .args(["replay", "--compare-only"])
+        .args(["--blocks", &data("three_blocks.jsonl")])
+        .args(["--diffs", &data("diffs_1000.jsonl")])
+        .args(["--snapshot-height", "1000"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("no native book diffs for height 1003"));
+}
+
 /// CI/CD re-review blocker 2: a snapshot height at `u64::MAX` is refused with an
 /// error (exit 1), not a debug panic (101) or a release wrap.
 #[test]
@@ -206,4 +253,84 @@ fn replay_snapshot_at_u64_max_is_refused() {
     let err = String::from_utf8_lossy(&o.stderr);
     assert_eq!(o.status.code(), Some(1), "{err}");
     assert!(err.contains("overflows u64"), "{err}");
+}
+
+/// Same refusal on the streaming compare-only path.
+#[test]
+fn replay_compare_only_snapshot_at_u64_max_is_refused() {
+    let o = bin()
+        .args([
+            "replay",
+            "--compare-only",
+            "--blocks",
+            &data("three_blocks.jsonl"),
+            "--diffs",
+            &data("diffs_1000.jsonl"),
+            "--snapshot-height",
+            "18446744073709551615",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(err.contains("overflows u64"), "{err}");
+}
+
+/// Gzip inputs (`.gz`, read via `gzip -dc`) and a `--blocks` list split
+/// across two files give the same report as the plain single files; a
+/// corrupt gzip is an error, not a short input.
+#[test]
+fn replay_compare_only_reads_gzip_and_split_block_files() {
+    let dir = tmp("gz-input");
+    std::fs::create_dir_all(&dir).unwrap();
+    let blocks = std::fs::read_to_string(data("three_blocks.jsonl")).unwrap();
+    let lines: Vec<&str> = blocks.lines().collect();
+    let gz = |name: &str, text: String| {
+        let plain = dir.join(name);
+        std::fs::write(&plain, text).unwrap();
+        let st = std::process::Command::new("gzip")
+            .arg("-f")
+            .arg(&plain)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        format!("{}.gz", plain.display())
+    };
+    let a = gz("a.jsonl", format!("{}\n", lines[0]));
+    let b = gz("b.jsonl", format!("{}\n{}\n", lines[1], lines[2]));
+    let d = gz(
+        "d.jsonl",
+        std::fs::read_to_string(data("diffs_1000.jsonl")).unwrap(),
+    );
+    let run = |blocks: &str, diffs: &str| {
+        bin()
+            .args(["replay", "--compare-only", "--engine", "echo"])
+            .args(["--blocks", blocks, "--diffs", diffs])
+            .args(["--snapshot-height", "999"])
+            .output()
+            .unwrap()
+    };
+    let plain = run(&data("three_blocks.jsonl"), &data("diffs_1000.jsonl"));
+    let split = run(&format!("{a},{b}"), &d);
+    assert!(
+        split.status.success(),
+        "{}",
+        String::from_utf8_lossy(&split.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&split.stdout),
+        String::from_utf8_lossy(&plain.stdout)
+    );
+    assert!(String::from_utf8_lossy(&split.stdout).contains("per-block outputs matched 3/3"));
+    let bad = dir.join("bad.jsonl.gz");
+    let mut bytes = std::fs::read(&d).unwrap();
+    bytes.truncate(bytes.len() / 2);
+    std::fs::write(&bad, bytes).unwrap();
+    let o = run(&data("three_blocks.jsonl"), bad.to_str().unwrap());
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
 }

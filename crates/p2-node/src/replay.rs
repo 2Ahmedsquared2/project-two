@@ -104,7 +104,7 @@ impl ReplayBlock {
     /// The engine's input: what the block carries.
     #[must_use]
     pub fn user_actions(&self) -> Vec<UserAction<'_>> {
-        self.block.actions().map(UserAction::from_signed).collect()
+        UserAction::of_block(&self.block)
     }
 }
 
@@ -142,6 +142,15 @@ pub enum ReplayError {
         /// Height the line carries.
         decoded: u64,
     },
+    /// Resync from native's diffs failed: our book is no longer known to
+    /// equal native's, so nothing after this block may be counted.
+    #[error("resync at height {height} failed: {why}")]
+    Resync {
+        /// Height.
+        height: u64,
+        /// Engine's reason.
+        why: String,
+    },
     /// F2: no native diffs for this height. Absent is not empty: the block can
     /// be neither compared nor resynced, so the run stops before it. Replay a
     /// range that ends at the last height with native diffs.
@@ -165,29 +174,46 @@ pub fn height_at(snapshot: u64, index: usize) -> Result<u64, ReplayError> {
 
 /// Checks F1 and F2 for the whole input before anything runs.
 pub fn validate(blocks: &[ReplayBlock], snapshot: u64) -> Result<(), ReplayError> {
-    for (index, b) in blocks.iter().enumerate() {
-        let expected = height_at(snapshot, index)?;
-        if b.height != expected {
-            return Err(ReplayError::Height {
-                index,
-                got: b.height,
-                expected,
-                snapshot,
+    blocks
+        .iter()
+        .enumerate()
+        .try_for_each(|(index, b)| check_block(b, index, snapshot))
+}
+
+/// F1 and F2 for the block at input position `index`.
+pub fn check_block(b: &ReplayBlock, index: usize, snapshot: u64) -> Result<(), ReplayError> {
+    let expected = height_at(snapshot, index)?;
+    if b.height != expected {
+        return Err(ReplayError::Height {
+            index,
+            got: b.height,
+            expected,
+            snapshot,
+        });
+    }
+    if let Some(decoded) = b.block.height {
+        if decoded != b.height {
+            return Err(ReplayError::DecodedHeight {
+                height: b.height,
+                decoded,
             });
         }
-        if let Some(decoded) = b.block.height {
-            if decoded != b.height {
-                return Err(ReplayError::DecodedHeight {
-                    height: b.height,
-                    decoded,
-                });
-            }
-        }
-        if b.native_diffs.is_none() {
-            return Err(ReplayError::NoNativeDiffs { height: b.height });
-        }
+    }
+    if b.native_diffs.is_none() {
+        return Err(ReplayError::NoNativeDiffs { height: b.height });
     }
     Ok(())
+}
+
+/// Why a streaming run stopped without a report.
+#[derive(Debug, thiserror::Error)]
+pub enum StreamError<X: std::fmt::Display> {
+    /// The input source failed (read or decode).
+    #[error("{0}")]
+    Input(X),
+    /// F1/F2 refused a block, or a resync failed.
+    #[error(transparent)]
+    Replay(#[from] ReplayError),
 }
 
 /// The one verdict label every report prints (lead planner's rule A, Proof
@@ -268,6 +294,9 @@ pub struct Replay {
     pub reproduced: u64,
     /// Heights reproduced exactly (timing is reported over these only).
     pub reproduced_heights: Vec<u64>,
+    /// Reproduced heights whose native diff list was empty: they count only
+    /// because our engine wrote no diffs either (absent diffs refuse, F2).
+    pub reproduced_zero_native_diffs: Vec<u64>,
     /// Actions seen.
     pub actions: u64,
     /// Actions the engine executed (did not return `Unsupported`).
@@ -276,6 +305,8 @@ pub struct Replay {
     pub causes: BTreeMap<Cause, u64>,
     /// The first mismatch.
     pub first_mismatch: Option<FirstMismatch>,
+    /// Every non-reproduced block with its first cause, in height order.
+    pub mismatches: Vec<(u64, Cause)>,
 }
 
 fn native_class(o: &Outcome) -> String {
@@ -321,17 +352,29 @@ pub fn compare(b: &ReplayBlock, out: &BlockOutcome) -> Option<FirstMismatch> {
             ActionResult::Response(_) => {}
         }
     }
-    let nd = b.native_diffs();
-    if nd != out.book_diffs.as_slice() {
+    // Decimal strings compare by value: native writes "2923.0", we write
+    // "2923"; users compare case-insensitively.
+    let nd: Vec<BookDiff> = b
+        .native_diffs()
+        .iter()
+        .map(crate::hlexec::canonical_node_diff)
+        .collect();
+    let od: Vec<BookDiff> = out
+        .book_diffs
+        .iter()
+        .map(crate::hlexec::canonical_node_diff)
+        .collect();
+    let (nd, od) = (&nd, &od);
+    if nd != od {
         let i = nd
             .iter()
-            .zip(&out.book_diffs)
+            .zip(od)
             .position(|(x, y)| x != y)
-            .unwrap_or(nd.len().min(out.book_diffs.len()));
+            .unwrap_or(nd.len().min(od.len()));
         return mk(
             Cause::BookDiffs,
             format!("{:?}", nd.get(i)),
-            format!("{:?}", out.book_diffs.get(i)),
+            format!("{:?}", od.get(i)),
         );
     }
     None
@@ -350,7 +393,38 @@ impl Replay {
         for b in blocks {
             let acts = b.user_actions();
             let out = engine.execute_block(b.block.time_ns, &acts);
-            r.record(b, &out, engine);
+            r.record(b, &out, engine)?;
+        }
+        Ok(r)
+    }
+
+    /// [`Replay::run`] over a stream: each block is checked (F1/F2), run,
+    /// recorded, shown to `each` with the engine's outcome and whether it
+    /// reproduced, then dropped, so
+    /// memory does not grow with N. Unlike `run`, F1/F2 are checked as blocks
+    /// arrive, so blocks before a refused one have run; the run still returns
+    /// an error and no report, so nothing is counted.
+    pub fn run_stream<E, I, X>(
+        engine: &mut E,
+        blocks: I,
+        snapshot: u64,
+        mut each: impl FnMut(&ReplayBlock, &BlockOutcome, bool),
+    ) -> Result<Self, StreamError<X>>
+    where
+        E: Engine,
+        I: IntoIterator<Item = Result<ReplayBlock, X>>,
+        X: std::fmt::Display,
+    {
+        let mut r = Replay::starting_at(snapshot);
+        for (index, b) in blocks.into_iter().enumerate() {
+            let b = b.map_err(StreamError::Input)?;
+            check_block(&b, index, snapshot)?;
+            let acts = b.user_actions();
+            let out = engine.execute_block(b.block.time_ns, &acts);
+            drop(acts);
+            let before = r.reproduced;
+            r.record(&b, &out, engine)?;
+            each(&b, &out, r.reproduced > before);
         }
         Ok(r)
     }
@@ -365,7 +439,12 @@ impl Replay {
     }
 
     /// Records one block's outcome (used by the timed runner too).
-    pub fn record<E: Engine>(&mut self, b: &ReplayBlock, out: &BlockOutcome, engine: &mut E) {
+    pub fn record<E: Engine>(
+        &mut self,
+        b: &ReplayBlock,
+        out: &BlockOutcome,
+        engine: &mut E,
+    ) -> Result<(), ReplayError> {
         self.blocks += 1;
         self.first_height.get_or_insert(b.height);
         self.last_height = Some(b.height);
@@ -391,16 +470,26 @@ impl Replay {
             None => {
                 self.reproduced += 1;
                 self.reproduced_heights.push(b.height);
+                if b.native_diffs().is_empty() {
+                    self.reproduced_zero_native_diffs.push(b.height);
+                }
             }
             Some(m) => {
                 *self.causes.entry(m.cause.clone()).or_insert(0) += 1;
+                self.mismatches.push((b.height, m.cause.clone()));
                 if self.first_mismatch.is_none() {
                     self.first_mismatch = Some(m);
                 }
                 self.resynced += 1;
-                engine.resync(b.height, b.native_diffs());
+                engine
+                    .resync(b.height, b.native_diffs(), &b.native_responses)
+                    .map_err(|why| ReplayError::Resync {
+                        height: b.height,
+                        why,
+                    })?;
             }
         }
+        Ok(())
     }
 
     /// Human-readable report.
@@ -420,6 +509,11 @@ impl Replay {
             s,
             "blocks with an unsupported action {}, mismatched and resynced {}",
             self.blocks_with_unsupported, self.resynced
+        );
+        let _ = writeln!(
+            s,
+            "reproduced with zero native diffs {} (empty native list matched only by an empty one; absent diffs refuse the run)",
+            self.reproduced_zero_native_diffs.len()
         );
         let _ = writeln!(
             s,
