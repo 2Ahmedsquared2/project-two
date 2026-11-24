@@ -589,6 +589,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hl-race"
+version = "0.1.0"
+dependencies = [
+ "hl-alloc-gate",
+ "hl-latency",
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
