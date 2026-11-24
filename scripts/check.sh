@@ -5,6 +5,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 echo "== cargo fmt --all --check";   cargo fmt --all --check
 echo "== cargo clippy -D warnings";  cargo clippy --workspace --all-targets -- -D warnings
+# hl-replay is the only crate with cargo features: lint the configurations the
+# workspace run above (default features) does not build.
+echo "== cargo clippy -D warnings (hl-replay --no-default-features)"
+cargo clippy -p hl-replay --no-default-features --all-targets -- -D warnings
+echo "== cargo clippy -D warnings (hl-replay --features prototype-signer)"
+cargo clippy -p hl-replay --features prototype-signer --all-targets -- -D warnings
 echo "== cargo test";                cargo test --workspace
 echo "== cargo doc";                 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 echo "== golden vectors"

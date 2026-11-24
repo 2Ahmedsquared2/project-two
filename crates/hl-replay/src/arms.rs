@@ -191,8 +191,12 @@ struct HotOut {
 type HotResult = Result<HotOut, ReplayError>;
 
 /// A kernel submission-queue polling thread, and the core it is given.
+///
+/// Without the `compio` feature no ring is made, so nothing reads the core
+/// and the field is not built.
 #[derive(Clone, Copy)]
 struct SqPoll {
+    #[cfg(feature = "compio")]
     core: Option<usize>,
 }
 
@@ -227,6 +231,7 @@ fn sqpoll_core_refusal(hot_core: Option<usize>, sqpoll_core: Option<usize>) -> O
 /// core, until the kernel reports that core. It returns the last reading
 /// either way: what the kernel says, not what was asked. `None` if the
 /// thread never shows.
+#[cfg(feature = "compio")]
 fn new_sqpoll_thread_cpus(before: &[(String, String)], asked: Option<usize>) -> Option<String> {
     let asked = asked.map(|c| c.to_string());
     let mut last = None;
@@ -249,6 +254,7 @@ fn new_sqpoll_thread_cpus(before: &[(String, String)], asked: Option<usize>) -> 
 
 /// The `iou-sqp` kernel threads of this process: `(tid, Cpus_allowed_list)`.
 /// Empty where `/proc` has no such thing.
+#[cfg(feature = "compio")]
 fn sqpoll_threads() -> Vec<(String, String)> {
     let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
         return Vec::new();
@@ -627,7 +633,10 @@ fn hot_main(
         pin(hot_core)
     };
     let mut sqpoll_cpus = None;
-    let sqpoll = SqPoll { core: sqpoll_core };
+    let sqpoll = SqPoll {
+        #[cfg(feature = "compio")]
+        core: sqpoll_core,
+    };
     let hists = match (arm, source) {
         (Arm::BusyPoll, Source::Tcp(s)) => Some(busy_arm(s, sink, core, total, &ready)?),
         (Arm::TokioCurrentThread, Source::Tcp(s)) => {
