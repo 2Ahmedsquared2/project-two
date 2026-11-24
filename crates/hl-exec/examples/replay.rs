@@ -253,6 +253,8 @@ fn decode_leg(meta: &Meta, o: &Value, priority: u64) -> (OrderReq, bool) {
     let Some(info) = meta.by_idx.get(&a) else {
         return (req, true);
     };
+    req.px = Px(parse_fixed(p.as_bytes(), info.px_dec).unwrap_or(0));
+    req.sz = Sz(parse_fixed(s.as_bytes(), info.sz_dec).unwrap_or(0));
     // Static checks, in the order the public sample supports (see PR notes).
     if decs(s) > info.sz_dec as usize {
         req.pre_reject = Some(RejectReason::LotSize);
@@ -260,9 +262,12 @@ fn decode_leg(meta: &Meta, o: &Value, priority: u64) -> (OrderReq, bool) {
         req.pre_reject = Some(RejectReason::InvalidPrice);
     } else if sig_figs(p) > 5 {
         req.pre_reject = Some(RejectReason::TickSize);
+    } else if req.px.0 == 0 {
+        // Price 0 is "Order has invalid price." ahead of the minimum-value
+        // check: native answers exactly that on all 23 price-0 legs in the
+        // 10,000-block window (lane 3's HYPE Gtc legs).
+        req.pre_reject = Some(RejectReason::InvalidPrice);
     }
-    req.px = Px(parse_fixed(p.as_bytes(), info.px_dec).unwrap_or(0));
-    req.sz = Sz(parse_fixed(s.as_bytes(), info.sz_dec).unwrap_or(0));
     // Minimum notional ($10) is not modelled: the sample shows other checks
     // (margin, reduce-only) win in some cases, so such legs are unsupported.
     let notional = u128::from(req.px.0) * u128::from(req.sz.0);
@@ -1608,6 +1613,46 @@ mod tests {
     /// Native raw book diffs carry no cloid. An order adopted by resync must
     /// get its cloid from native's order statuses, or a later cancelByCloid
     /// of it is answered "never placed" (1,507 of 2,000 blocks before).
+    fn meta_one(a: Asset, sz_dec: u32, px_dec: u32) -> Meta {
+        Meta {
+            by_idx: HashMap::from([(a, AssetInfo { sz_dec, px_dec })]),
+            by_name: HashMap::new(),
+        }
+    }
+
+    fn leg(a: Asset, p: &str, s: &str) -> Value {
+        serde_json::json!({"a": a, "b": true, "p": p, "s": s, "r": false,
+            "t": {"limit": {"tif": "Gtc"}}})
+    }
+
+    /// Price "0" is native's "Order has invalid price.", ahead of the
+    /// minimum-value check; a non-zero price under $10 notional stays
+    /// unsupported (min notional is not modelled).
+    #[test]
+    fn price_zero_is_invalid_price_before_min_value() {
+        let meta = meta_one(159, 2, 4); // HYPE: szDecimals 2, 6 - 2 price decimals
+        for p in ["0", "0.0"] {
+            let (r, unsupported) = decode_leg(&meta, &leg(159, p, "1.5"), 0);
+            assert_eq!(r.pre_reject, Some(RejectReason::InvalidPrice), "price {p}");
+            assert!(!unsupported, "price {p} is answered, not unsupported");
+            assert_eq!(
+                leg_json(
+                    &meta,
+                    159,
+                    None,
+                    OrderStatus::Rejected(RejectReason::InvalidPrice)
+                ),
+                serde_json::json!({"error": "Order has invalid price."})
+            );
+        }
+        let (r, unsupported) = decode_leg(&meta, &leg(159, "1.5", "1"), 0);
+        assert_eq!(r.pre_reject, None);
+        assert!(unsupported, "$1.50 notional: min value not modelled");
+        let (r, unsupported) = decode_leg(&meta, &leg(159, "30", "1"), 0);
+        assert_eq!(r.pre_reject, None);
+        assert!(!unsupported, "$30 notional is modelled");
+    }
+
     #[test]
     fn resync_diffs_get_cloids_from_native_statuses() {
         let new = DiffKind::New {
