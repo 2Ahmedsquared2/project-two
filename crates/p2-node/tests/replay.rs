@@ -310,3 +310,34 @@ fn extra_results_never_exceed_actions() {
     let r = Replay::run(&mut e, &blocks, 999).unwrap();
     assert!(r.actions_executed <= r.actions, "{}", r.to_text());
 }
+
+/// CI/CD re-review blocker 2: `snapshot + 1 + index` must not overflow (a
+/// panic in debug, a wrap to a small height in release). A snapshot at or
+/// next to `u64::MAX` is refused as an error.
+#[test]
+fn height_arithmetic_at_u64_max_is_an_error_not_a_panic() {
+    assert_eq!(p2_node::replay::height_at(5, 0), Ok(6));
+    assert_eq!(p2_node::replay::height_at(u64::MAX - 1, 0), Ok(u64::MAX));
+    assert_eq!(
+        p2_node::replay::height_at(u64::MAX - 1, 1),
+        Err(ReplayError::HeightOverflow {
+            snapshot: u64::MAX - 1,
+            index: 1
+        })
+    );
+    assert_eq!(
+        p2_node::replay::height_at(u64::MAX, 0),
+        Err(ReplayError::HeightOverflow {
+            snapshot: u64::MAX,
+            index: 0
+        })
+    );
+    let blocks = input();
+    assert_eq!(
+        p2_node::replay::validate(&blocks, u64::MAX),
+        Err(ReplayError::HeightOverflow {
+            snapshot: u64::MAX,
+            index: 0
+        })
+    );
+}

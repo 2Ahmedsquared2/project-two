@@ -165,7 +165,13 @@ fn replay(a: &Args) -> ExitCode {
     };
     let mut blocks = Vec::with_capacity(lines.len());
     for (i, l) in lines.iter().enumerate() {
-        let h = snapshot + 1 + u64::try_from(i).unwrap_or(u64::MAX);
+        let h = match p2_node::replay::height_at(snapshot, i) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(1);
+            }
+        };
         let b = match hl_block::decode_block(l) {
             Ok(b) => b,
             Err(e) => {
@@ -412,7 +418,9 @@ fn native_times(a: &Args) -> ExitCode {
             }
         }
     }
-    let contiguous = v.windows(2).all(|w| w[1].height == w[0].height + 1);
+    let contiguous = v
+        .windows(2)
+        .all(|w| w[0].height.checked_add(1) == Some(w[1].height));
     let mut ns: Vec<u64> = v.iter().map(|t| t.apply_ns).collect();
     ns.sort_unstable();
     let p = |m| p2_node::timing::percentile(&ns, m).unwrap_or(0);

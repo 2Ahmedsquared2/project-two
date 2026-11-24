@@ -124,6 +124,15 @@ pub enum ReplayError {
         /// Snapshot height.
         snapshot: u64,
     },
+    /// F1: `snapshot + 1 + index` does not fit in u64 (CI/CD re-review:
+    /// unchecked, it panics in debug and wraps to a small height in release).
+    #[error("height: snapshot {snapshot} + 1 + block index {index} overflows u64")]
+    HeightOverflow {
+        /// Snapshot height.
+        snapshot: u64,
+        /// Index in the input.
+        index: usize,
+    },
     /// F1 / CI/CD #2: the line carries its own height and it is not the
     /// height it would be replayed as (the CLI numbers lines by position).
     #[error("block replayed as height {height} carries height {decoded}")]
@@ -145,10 +154,19 @@ pub enum ReplayError {
     },
 }
 
+/// The height block `index` (0-based) replays as: `snapshot + 1 + index`,
+/// checked.
+pub fn height_at(snapshot: u64, index: usize) -> Result<u64, ReplayError> {
+    u64::try_from(index)
+        .ok()
+        .and_then(|i| snapshot.checked_add(1)?.checked_add(i))
+        .ok_or(ReplayError::HeightOverflow { snapshot, index })
+}
+
 /// Checks F1 and F2 for the whole input before anything runs.
 pub fn validate(blocks: &[ReplayBlock], snapshot: u64) -> Result<(), ReplayError> {
     for (index, b) in blocks.iter().enumerate() {
-        let expected = snapshot + 1 + u64::try_from(index).unwrap_or(u64::MAX);
+        let expected = height_at(snapshot, index)?;
         if b.height != expected {
             return Err(ReplayError::Height {
                 index,

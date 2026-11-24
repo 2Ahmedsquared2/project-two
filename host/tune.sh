@@ -75,7 +75,17 @@ fi
 if [ -e "$state" ]; then
   echo "already tuned: $state holds the original values; run --undo first" >&2; exit 1
 fi
-tmp="$(mktemp "$sdir/.state.XXXXXX")"
+# Journal: the state file is created first (exclusively, mode 600) and each
+# original value is appended and synced BEFORE its path is written, so a tune
+# that stops part-way (signal, set -e, a failed write) always leaves a state
+# file that --undo can restore from. A re-tune refuses while it exists.
+( umask 077; set -o noclobber; : > "$state" ) || { echo "refusing: could not create $state" >&2; exit 1; }
+persist() { sync -- "$state" 2>/dev/null || sync; }
+failed=0
+stopped() { echo "tune stopped part-way: run sudo host/tune.sh --undo to restore from $state" >&2; }
+trap stopped ERR
+trap 'stopped; exit 130' INT
+trap 'stopped; exit 143' TERM
 set_file() { # set_file PATH VALUE
   local p="$1" v="$2" before
   allowed "$p" || { echo "internal: $p not in the allowed set" >&2; exit 1; }
@@ -83,8 +93,9 @@ set_file() { # set_file PATH VALUE
   before="$(cat "$p")"
   # THP files show "[x]" around the active choice; store the bare word.
   case "$before" in *\[*\]*) before="$(sed 's/.*\[\(.*\)\].*/\1/' <<<"$before")";; esac
-  echo "$p|$before" >> "$tmp"
-  if printf '%s' "$v" > "$p" 2>/dev/null; then echo "set $p: '$before' -> '$v'"; else echo "FAILED $p -> $v"; fi
+  echo "$p|$before" >> "$state"
+  persist
+  if printf '%s' "$v" > "$p" 2>/dev/null; then echo "set $p: '$before' -> '$v'"; else echo "FAILED $p -> $v" >&2; failed=1; fi
 }
 for g in "$root"/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -e "$g" ] && set_file "$g" performance; done
 for s in "$root"/sys/devices/system/cpu/cpu*/cpuidle/state[2-9]/disable; do [ -e "$s" ] && set_file "$s" 1; done
@@ -97,6 +108,9 @@ set_file "$root"/proc/sys/kernel/numa_balancing 0
 set_file "$root"/proc/sys/kernel/sched_rt_runtime_us -1
 set_file "$root"/proc/sys/vm/stat_interval 120
 set_file "$root"/proc/sys/kernel/watchdog 0
-mv "$tmp" "$state"
+trap - ERR INT TERM
+if [ "$failed" = 1 ]; then
+  echo "tune incomplete: some writes failed; originals of everything attempted are in $state (undo: sudo host/tune.sh --undo)" >&2; exit 1
+fi
 echo "reserved hugepages now: $(cat "$root"/proc/sys/vm/nr_hugepages 2>/dev/null || echo '?')"
 echo "state saved to $state (undo: sudo host/tune.sh --undo)"

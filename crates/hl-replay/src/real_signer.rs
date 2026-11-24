@@ -14,7 +14,7 @@ const UNITS_PER_LOT: u64 = 1_000;
 
 /// [`hl_order::Signer`] as a harness stage: msgpack streamed into
 /// keccak-256 (`connectionId`), the EIP-712 phantom-agent digest, one
-/// RFC 6979 secp256k1 signature (k256) and the SDK's signed-request JSON
+/// RFC 6979 secp256k1 signature (libsecp256k1) and the SDK's signed-request JSON
 /// body, built in a reused buffer.
 ///
 /// It signs for testnet only (`hl-order` has no mainnet variant) and sends
@@ -132,7 +132,7 @@ impl HlOrderSigner {
 
 impl Stage for HlOrderSigner {
     const NAME: &'static str =
-        "HlOrderSigner: hl_order::Signer::sign_l1 (msgpack -> keccak256 connectionId, EIP-712 agent digest, k256 RFC 6979) + request_body; testnet source, matches the Python SDK golden vectors";
+        "HlOrderSigner: hl_order::Signer::sign_l1 (msgpack -> keccak256 connectionId, EIP-712 agent digest, libsecp256k1 RFC 6979) + request_body; testnet source, matches the Python SDK golden vectors";
     /// Real because `tests/real_signer.rs` signs every `hl-order` golden
     /// vector through this type and compares the bytes with the SDK's.
     const LABEL: StageLabel = StageLabel::Real;

@@ -184,3 +184,26 @@ fn native_times_summary() {
     assert!(so.contains("median 12478919"), "{so}");
     assert!(so.contains("max 26845330"), "{so}");
 }
+
+/// CI/CD re-review blocker 2: a snapshot height at `u64::MAX` is refused with an
+/// error (exit 1), not a debug panic (101) or a release wrap.
+#[test]
+fn replay_snapshot_at_u64_max_is_refused() {
+    let o = bin()
+        .args([
+            "replay",
+            "--blocks",
+            &data("three_blocks.jsonl"),
+            "--diffs",
+            &data("diffs_1000.jsonl"),
+            "--snapshot-height",
+            "18446744073709551615",
+            "--passes",
+            "5",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(err.contains("overflows u64"), "{err}");
+}
