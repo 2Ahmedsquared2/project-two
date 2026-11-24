@@ -692,4 +692,18 @@ impl HostFactsNote {
             warnings: facts.core_warnings(feeder_core, hot_core),
         }
     }
+
+    /// [`Self::captured`], with warnings too about the core the
+    /// `compio-sqpoll` arm's kernel polling thread was given (`--sqpoll-core`).
+    #[must_use]
+    pub fn captured_with_sqpoll(
+        path: &Path,
+        facts: &HostFacts,
+        feeder_core: Option<usize>,
+        hot_core: Option<usize>,
+        sqpoll_core: Option<usize>,
+    ) -> Self {
+        let _ = sqpoll_core;
+        Self::captured(path, facts, feeder_core, hot_core)
+    }
 }

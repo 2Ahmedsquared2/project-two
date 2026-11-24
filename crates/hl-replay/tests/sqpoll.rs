@@ -228,3 +228,50 @@ fn the_polling_threads_core_equal_to_the_hot_core_is_a_usage_error() {
     let o = run(&["--arms", "busy-poll", "--no-pin", "--sqpoll-core", "1"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 }
+
+// ---- a core the kernel refuses (#64) ----
+
+/// No host has this CPU: the kernel refuses the ring with EINVAL.
+const NO_SUCH_CPU: usize = 100_000;
+
+#[test]
+fn a_core_the_kernel_refuses_is_named_as_the_reason() {
+    let _ring = one_ring();
+    // Where a polling thread cannot be had at all, the host is the reason.
+    if sqpoll_cpus(&cfg("refused-probe", None, None)).is_none() {
+        return;
+    }
+    let c = cfg("refused", None, Some(NO_SUCH_CPU));
+    let RoundOutcome::Unavailable(why) = run_round(Arm::CompioSqpoll, &c).unwrap() else {
+        panic!("ran with the polling thread on a CPU that does not exist");
+    };
+    for want in ["--sqpoll-core 100000", "offline", "cpuset"] {
+        assert!(why.contains(want), "no {want:?} in: {why}");
+    }
+    assert!(!why.contains("could not be set up on this host"), "{why}");
+}
+
+#[test]
+fn the_report_names_a_core_the_kernel_refused() {
+    let _ring = one_ring();
+    let free = run(&["--arms", "compio-sqpoll", "--no-pin"]);
+    if row(&stdout(&free), "compio-sqpoll").contains("unavailable") {
+        eprintln!("skipped: no polling thread on this host");
+        return;
+    }
+    let o = run(&[
+        "--arms",
+        "compio-sqpoll,busy-poll",
+        "--no-pin",
+        "--sqpoll-core",
+        "100000",
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let text = stdout(&o);
+    let sq = row(&text, "compio-sqpoll");
+    assert!(
+        sq.contains("unavailable") && sq.contains("--sqpoll-core 100000") && sq.contains("cpuset"),
+        "{sq}"
+    );
+    assert!(row(&text, "busy-poll").contains("n=90"));
+}
