@@ -77,9 +77,19 @@ The script sets nothing and contacts no remote host. A fact the host cannot
 give is written as `unavailable (why)`, never left out; the report lists the
 sections that hold one, so read that list before trusting a run.
 
-The report also prints `warning:` lines, which never stop a run: a pinned
-feeder or hot core outside `isolcpus` (or `isolcpus` not set at all), and a
-hot core whose physical core has a second thread.
+The report also prints `warning:` lines, which never stop a run:
+
+- a pinned feeder or hot core outside `isolcpus`, `nohz_full` or `rcu_nocbs`,
+  or one of those three not set at all. A core in `nohz_full` is not reported
+  as missing from `rcu_nocbs`, because the kernel offloads RCU callbacks on
+  every `nohz_full` CPU. `all` and stepped ranges (`0-7:2/4`) are read as CPU
+  lists; a list the harness cannot read (the kernel's `N` for the last CPU)
+  gets a line saying the pinned cores were not checked against it;
+- a hot core whose physical core has a second thread.
+
+The warnings read the kernel command line only. A kernel built to offload
+every CPU by default (`CONFIG_RCU_NOCB_CPU_DEFAULT_ALL`) with no `rcu_nocbs=`
+still gets the `rcu_nocbs is not set` line.
 
 For a local run that is not a result, `--allow-missing-host-facts` lets
 `--out` go ahead; the report then says

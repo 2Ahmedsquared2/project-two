@@ -195,15 +195,39 @@ impl HostFacts {
     /// The CPUs the kernel command line isolates (`isolcpus=`), if any.
     #[must_use]
     pub fn isolated_cpus(&self) -> Option<Vec<usize>> {
+        match self.cpu_list("isolcpus")? {
+            CpuList::Listed(cpus) => Some(cpus),
+            CpuList::All => None,
+        }
+    }
+
+    /// The CPUs a kernel command-line list names, if it is set and names any.
+    fn cpu_list(&self, key: &str) -> Option<CpuList> {
         let mut cpus = Vec::new();
-        // Flags such as `domain` and `managed_irq` are not CPU numbers.
-        for part in self.cmdline_value("isolcpus")?.split(',') {
-            let (first, last) = part.split_once('-').unwrap_or((part, part));
-            if let (Ok(first), Ok(last)) = (first.parse::<usize>(), last.parse::<usize>()) {
-                cpus.extend(first..=last);
+        for part in self.cmdline_value(key)?.split(',') {
+            if part.eq_ignore_ascii_case("all") {
+                return Some(CpuList::All);
+            }
+            // Flags such as `domain` and `managed_irq` are not CPU numbers.
+            // A range may carry a stride: `first-last:used/group`.
+            let (range, stride) = part.split_once(':').map_or((part, None), |(r, s)| {
+                let used_of_group = s.split_once('/').and_then(|(used, group)| {
+                    Some((used.parse::<usize>().ok()?, group.parse::<usize>().ok()?))
+                });
+                (r, used_of_group)
+            });
+            let (first, last) = range.split_once('-').unwrap_or((range, range));
+            let (Ok(first), Ok(last)) = (first.parse::<usize>(), last.parse::<usize>()) else {
+                continue;
+            };
+            match stride {
+                Some((used, group)) if group > 0 => {
+                    cpus.extend((first..=last).filter(|cpu| (cpu - first) % group < used));
+                }
+                _ => cpus.extend(first..=last),
             }
         }
-        (!cpus.is_empty()).then_some(cpus)
+        (!cpus.is_empty()).then_some(CpuList::Listed(cpus))
     }
 
     /// A parsed kernel command-line value the script wrote as `key: value`.
@@ -214,37 +238,68 @@ impl HostFacts {
             .filter(|v| *v != "not set")
     }
 
-    /// What a reader must weigh about the cores a run pinned to: a core
-    /// outside the isolated set, or a hot core that shares its physical core.
-    /// Warnings only; none of this stops a run.
-    fn core_warnings(&self, feeder: Option<usize>, hot: Option<usize>) -> Vec<String> {
-        let pinned: Vec<(&str, usize)> = [("feeder", feeder), ("hot", hot)]
-            .into_iter()
-            .filter_map(|(role, core)| Some((role, core?)))
-            .collect();
-        let mut warnings = Vec::new();
-        match self.isolated_cpus() {
-            Some(isolated) => {
-                let raw = self.cmdline_value("isolcpus").unwrap_or_default();
-                for (role, core) in &pinned {
-                    if !isolated.contains(core) {
-                        warnings.push(format!("{role} core {core} is not in isolcpus ({raw})"));
-                    }
-                }
+    /// Warnings for the pinned cores a kernel CPU list leaves out. `lacking`
+    /// is what such a core is not, for the line written when the list is not
+    /// set at all.
+    fn list_warnings(&self, key: &str, lacking: &str, pinned: &[(&str, usize)]) -> Vec<String> {
+        match self.cpu_list(key) {
+            Some(CpuList::All) => Vec::new(),
+            Some(CpuList::Listed(listed)) => {
+                let raw = self.cmdline_value(key).unwrap_or_default();
+                pinned
+                    .iter()
+                    .filter(|(_, core)| !listed.contains(core))
+                    .map(|(role, core)| format!("{role} core {core} is not in {key} ({raw})"))
+                    .collect()
             }
-            None if !pinned.is_empty() => {
+            None if pinned.is_empty() => Vec::new(),
+            None if self.cmdline_value(key).is_some() => {
+                let raw = self.cmdline_value(key).unwrap_or_default();
+                vec![format!(
+                    "{key} ({raw}) names no CPU this harness can read: pinned cores not checked against it"
+                )]
+            }
+            None => {
                 let cores: Vec<String> = pinned
                     .iter()
                     .map(|(role, core)| format!("{role} core {core}"))
                     .collect();
                 let verb = if cores.len() == 1 { "is" } else { "are" };
-                warnings.push(format!(
-                    "isolcpus is not set: {} {verb} not isolated",
+                vec![format!(
+                    "{key} is not set: {} {verb} not {lacking}",
                     cores.join(" and ")
-                ));
+                )]
             }
-            None => {}
         }
+    }
+
+    /// What a reader must weigh about the cores a run pinned to: a core
+    /// outside `isolcpus`, `nohz_full` or `rcu_nocbs`, or a hot core that
+    /// shares its physical core. Warnings only; none of this stops a run.
+    fn core_warnings(&self, feeder: Option<usize>, hot: Option<usize>) -> Vec<String> {
+        let pinned: Vec<(&str, usize)> = [("feeder", feeder), ("hot", hot)]
+            .into_iter()
+            .filter_map(|(role, core)| Some((role, core?)))
+            .collect();
+        let mut warnings = self.list_warnings("isolcpus", "isolated", &pinned);
+        warnings.extend(self.list_warnings("nohz_full", "tickless", &pinned));
+        // The kernel offloads RCU callbacks on every nohz_full CPU, as if it
+        // were in rcu_nocbs too, so only the other cores are checked.
+        let tickless = self.cpu_list("nohz_full");
+        let not_offloaded: Vec<(&str, usize)> = pinned
+            .iter()
+            .copied()
+            .filter(|(_, core)| match &tickless {
+                Some(CpuList::All) => false,
+                Some(CpuList::Listed(listed)) => !listed.contains(core),
+                None => true,
+            })
+            .collect();
+        warnings.extend(self.list_warnings(
+            "rcu_nocbs",
+            "offloaded from RCU callbacks",
+            &not_offloaded,
+        ));
         if let Some(hot) = hot {
             let prefix = format!("cpu{hot} thread siblings: ");
             let siblings = self
@@ -280,6 +335,14 @@ impl HostFacts {
             )))
         }
     }
+}
+
+/// The CPUs a kernel command-line CPU list names.
+enum CpuList {
+    /// The word `all`.
+    All,
+    /// These CPUs.
+    Listed(Vec<usize>),
 }
 
 /// What a report says about host facts.
