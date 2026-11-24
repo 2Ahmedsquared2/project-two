@@ -475,6 +475,53 @@ fn response_mismatch(native: &Value, ours: &Value) -> &'static str {
     }
 }
 
+/// The legs [`HlExecEngine::with_reduce_only_as_plain`] passes as plain
+/// orders: indexes of the action's reduce-only legs (`r: true`) with a Gtc,
+/// Alo or Ioc limit, in `orders` (order), `modifies[].order` (batchModify) or
+/// `order` (modify, index 0). Empty for any other action.
+#[must_use]
+pub fn plain_reduce_only_legs(a: &UserAction<'_>) -> Vec<usize> {
+    let act = a.action;
+    let legs: Vec<&Value> = match a.action_type {
+        "order" => act
+            .get("orders")
+            .and_then(Value::as_array)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default(),
+        "batchModify" => act
+            .get("modifies")
+            .and_then(Value::as_array)
+            .map(|v| v.iter().filter_map(|m| m.get("order")).collect())
+            .unwrap_or_default(),
+        "modify" => act.get("order").into_iter().collect(),
+        _ => Vec::new(),
+    };
+    legs.iter()
+        .enumerate()
+        .filter(|(_, l)| {
+            l.get("r").and_then(Value::as_bool) == Some(true)
+                && matches!(
+                    l.pointer("/t/limit/tif").and_then(Value::as_str),
+                    Some("Gtc" | "Alo" | "Ioc")
+                )
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// One leg's part of a response: `statuses[leg]` when the response has a
+/// status list, else the whole response (modify, action-level errors).
+#[must_use]
+pub fn leg_status(resp: &Value, leg: usize) -> Value {
+    match resp
+        .pointer("/response/data/statuses")
+        .and_then(Value::as_array)
+    {
+        Some(sts) => sts.get(leg).cloned().unwrap_or(Value::Null),
+        None => resp.clone(),
+    }
+}
+
 /// The value with every `"oid"` number set to 0.
 fn zero_oids(v: &Value) -> Value {
     match v {
@@ -929,6 +976,19 @@ fn order_ref(v: &Value) -> Option<OrderRef> {
 }
 
 impl Converted {
+    /// See [`HlExecEngine::with_reduce_only_as_plain`].
+    fn reduce_only_as_plain(&mut self) {
+        let legs = self
+            .orders
+            .iter_mut()
+            .chain(self.modifies.iter_mut().map(|m| &mut m.order));
+        for o in legs {
+            if o.tif != Tif::Other {
+                o.reduce_only = false;
+            }
+        }
+    }
+
     fn push_unsupported(&mut self, t: &str) {
         self.kinds.push(Kind::Unsupported);
         self.users.push(User::default());
@@ -1438,6 +1498,7 @@ pub struct HlExecEngine {
     unadopted_diffs: u64,
     status_max_oids: HashMap<u64, u64>,
     status_cloids: HashMap<u64, Cloid>,
+    reduce_only_as_plain: bool,
 }
 
 impl std::fmt::Debug for HlExecEngine {
@@ -1460,7 +1521,20 @@ impl HlExecEngine {
             unadopted_diffs: 0,
             status_max_oids: HashMap::new(),
             status_cloids: HashMap::new(),
+            reduce_only_as_plain: false,
         }
+    }
+
+    /// `--reduce-only-as-plain` (off by default; an approximation): a
+    /// reduce-only leg with a Gtc, Alo or Ioc limit goes to the engine as a
+    /// plain order (same price, size and TIF) with no position check, since
+    /// we hold no positions. Native answers "Reduce only order would
+    /// increase position" from position state we do not have. Trigger and
+    /// `FrontendMarket` legs (`Tif::Other`) stay unsupported.
+    #[must_use]
+    pub fn with_reduce_only_as_plain(mut self, on: bool) -> Self {
+        self.reduce_only_as_plain = on;
+        self
     }
 
     /// Every order's cloid by oid from native's order-status file
@@ -1514,7 +1588,10 @@ fn bundle_lens(actions: &[UserAction<'_>]) -> Vec<u32> {
 
 impl Engine for HlExecEngine {
     fn execute_block(&mut self, block_time_ns: u64, actions: &[UserAction<'_>]) -> BlockOutcome {
-        let conv = Converted::convert(&self.meta, actions);
+        let mut conv = Converted::convert(&self.meta, actions);
+        if self.reduce_only_as_plain {
+            conv.reduce_only_as_plain();
+        }
         let xa = conv.actions();
         let exp: Vec<Option<u64>> = actions.iter().map(|a| a.expires_after).collect();
         let lens = bundle_lens(actions);

@@ -39,6 +39,9 @@ oids included, and every order's cloid. With --compare-only and hlexec, heights.
 (--end-unconfirmed COIN,.. reports coins whose seed map is unconfirmed apart; they do not
 decide the verdict), and whether our oid counter reaches the seed's next_oid (a lower bound).
 --blocks takes several files, comma-separated; any input may be gzip (.gz, read via gzip -dc).
+--reduce-only-as-plain (hlexec, off by default; an APPROXIMATION, labelled in the report):
+reduce-only Gtc/Alo/Ioc legs go to the engine as plain orders, no position check; trigger and
+FrontendMarket legs stay unsupported. --ro-legs-out F writes those legs' native and our status.
 exit: 0 ok, 1 run error, 2 usage";
 
 struct Args(Vec<String>);
@@ -648,7 +651,21 @@ fn compare_only(
     let mut unseeded = std::collections::HashSet::new();
     let no_placed = std::collections::HashSet::new();
     let mut classes: HashMap<u64, Vec<String>> = HashMap::new();
+    let ro_plain = args.0.iter().any(|x| x == "--reduce-only-as-plain");
+    let mut ro_legs = match args.get("--ro-legs-out") {
+        Some(p) => match std::fs::File::create(p) {
+            Ok(f) => Some(std::io::BufWriter::new(f)),
+            Err(e) => return fail(format!("{p}: {e}")),
+        },
+        None => None,
+    };
+    let mut ro_err: Option<String> = None;
     let each = |blk: &ReplayBlock, out: &p2_node::engine::BlockOutcome, reproduced: bool| {
+        if let Some(w) = ro_legs.as_mut() {
+            if let Err(e) = write_ro_legs(w, blk, out) {
+                ro_err.get_or_insert(e.to_string());
+            }
+        }
         if let Some((table, all, _, st)) = hl {
             if p2_node::hlexec::touches_unseeded(table, blk) {
                 unseeded.insert(blk.height());
@@ -671,6 +688,7 @@ fn compare_only(
         p2_node::hlexec::HlExecEngine::new(seeded.clone(), table.clone())
             .with_status_max_oids(st.max_oids.clone())
             .with_status_cloids(st.cloids.clone())
+            .with_reduce_only_as_plain(ro_plain)
     });
     let run = match (engine, hl_engine.as_mut()) {
         ("hlexec", Some(eng)) => Replay::run_stream(eng, stream, snapshot, each),
@@ -681,6 +699,12 @@ fn compare_only(
         Ok(run) => run,
         Err(e) => return fail(e.to_string()),
     };
+    if let Some(e) = ro_err {
+        return fail(format!("--ro-legs-out: {e}"));
+    }
+    if let Some(Err(e)) = ro_legs.as_mut().map(std::io::Write::flush) {
+        return fail(format!("--ro-legs-out: {e}"));
+    }
     let mut end_report = String::new();
     if let Some(p) = args.get("--end-seed") {
         let (Some(eng), Some((table, all, _, _))) = (hl_engine.as_ref(), hl) else {
@@ -706,6 +730,12 @@ fn compare_only(
         }
     }
     let mut report = String::new();
+    let flag = if ro_plain {
+        let _ = writeln!(report, "{RO_PLAIN_NOTE}");
+        "[--reduce-only-as-plain, approximation] "
+    } else {
+        ""
+    };
     let _ = writeln!(
         report,
         "engine {engine}  blocks {}  compare-only: nothing timed",
@@ -719,7 +749,7 @@ fn compare_only(
     report.push_str(&end_report);
     let _ = writeln!(
         report,
-        "{}",
+        "{flag}{}",
         p2_node::replay::verdict_label(
             run.reproduced,
             run.blocks,
@@ -732,6 +762,49 @@ fn compare_only(
         return fail(e);
     }
     ExitCode::SUCCESS
+}
+
+/// First report line of a `--reduce-only-as-plain` run: every k it prints
+/// carries the flag and is an approximation.
+const RO_PLAIN_NOTE: &str =
+    "flag --reduce-only-as-plain: APPROXIMATION. Reduce-only Gtc/Alo/Ioc legs \
+are placed as plain orders with no position check (we hold no positions); native's \"Reduce only \
+order would increase position\" depends on position state we do not have. Every k below is with \
+this flag; report it beside the run without it, never in its place.";
+
+/// `--ro-legs-out`: one line per leg [`p2_node::hlexec::plain_reduce_only_legs`]
+/// names, `height TAB action TAB type TAB leg TAB native TAB ours` (the
+/// leg's status JSON, see [`p2_node::hlexec::leg_status`]; ours `-` when the
+/// action is unsupported).
+fn write_ro_legs(
+    w: &mut impl std::io::Write,
+    blk: &ReplayBlock,
+    out: &p2_node::engine::BlockOutcome,
+) -> std::io::Result<()> {
+    let native = blk.native_responses();
+    for (i, a) in blk.user_actions().iter().enumerate() {
+        let legs = p2_node::hlexec::plain_reduce_only_legs(a);
+        if legs.is_empty() {
+            continue;
+        }
+        let Some(nat) = native.get(i) else { continue };
+        for j in legs {
+            let ours = match out.results.get(i) {
+                Some(p2_node::engine::ActionResult::Response(v)) => {
+                    p2_node::hlexec::leg_status(v, j).to_string()
+                }
+                _ => "-".to_owned(),
+            };
+            writeln!(
+                w,
+                "{}\t{i}\t{}\t{j}\t{}\t{ours}",
+                blk.height(),
+                a.action_type,
+                p2_node::hlexec::leg_status(nat, j)
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// `snapshot + n` for the n-th (1-based) block line, checked.

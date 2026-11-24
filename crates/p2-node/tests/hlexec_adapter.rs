@@ -672,3 +672,47 @@ fn status_index_records_hashed_oids_per_height() {
     assert_eq!(idx.placed.get(&5), Some(&[700].into()));
     assert_eq!(idx.max_oids.get(&5), Some(&700));
 }
+
+/// `--reduce-only-as-plain` (off by default, an approximation): a
+/// reduce-only limit leg goes to the engine as a plain order with no
+/// position check. Off, it stays unsupported; trigger and `FrontendMarket`
+/// reduce-only legs stay unsupported either way.
+#[test]
+fn reduce_only_as_plain_is_off_by_default_and_skips_trigger_and_frontend_market() {
+    let ro_ioc = json!({"type":"order","grouping":"na","orders":[{"a":7,"b":true,"p":"10","s":"0.5","r":true,"t":{"limit":{"tif":"Ioc"}}}]});
+    let ro_trig = json!({"type":"order","grouping":"na","orders":[{"a":7,"b":true,"p":"10","s":"0.5","r":true,"t":{"trigger":{"isMarket":true,"triggerPx":"9","tpsl":"sl"}}}]});
+    let ro_fm = json!({"type":"order","grouping":"na","orders":[{"a":7,"b":true,"p":"10","s":"0.5","r":true,"t":{"limit":{"tif":"FrontendMarket"}}}]});
+
+    let off = engine().execute_block(1, &[ua("order", &ro_ioc, ALICE)]);
+    assert!(matches!(off.results[0], ActionResult::Unsupported));
+
+    let mut e = engine().with_reduce_only_as_plain(true);
+    let on = e.execute_block(1, &[ua("order", &ro_ioc, ALICE)]);
+    assert_eq!(
+        status(&on.results[0]),
+        &json!({"filled": {"totalSz": "0.5", "avgPx": "10.0", "oid": 200}})
+    );
+    assert_eq!(diff_kinds(&on).len(), 1);
+    for a in [&ro_trig, &ro_fm] {
+        let out = e.execute_block(2, &[ua("order", a, ALICE)]);
+        assert!(matches!(out.results[0], ActionResult::Unsupported), "{a}");
+    }
+
+    assert_eq!(
+        p2_node::hlexec::plain_reduce_only_legs(&ua("order", &ro_ioc, ALICE)),
+        vec![0]
+    );
+    for a in [&ro_trig, &ro_fm] {
+        assert_eq!(
+            p2_node::hlexec::plain_reduce_only_legs(&ua("order", a, ALICE)),
+            Vec::<usize>::new()
+        );
+    }
+    let bm = json!({"type":"batchModify","modifies":[
+        {"oid":1,"order":{"a":7,"b":true,"p":"9","s":"1","r":false,"t":{"limit":{"tif":"Gtc"}}}},
+        {"oid":2,"order":{"a":7,"b":true,"p":"9","s":"1","r":true,"t":{"limit":{"tif":"Alo"}}}}]});
+    assert_eq!(
+        p2_node::hlexec::plain_reduce_only_legs(&ua("batchModify", &bm, ALICE)),
+        vec![1]
+    );
+}
