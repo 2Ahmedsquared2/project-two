@@ -51,7 +51,8 @@ same host. The harness checks, before anything runs, that the file has the
 header and all 18 sections, each terminated and not empty, and that it was
 captured on the running kernel. The report then carries
 `host facts: FILE, captured <UTC>, 18 sections checked, unavailable in: ...`
-and the file is copied to `DIR/host-facts.txt`.
+and the checked text is written to `DIR/host-facts.txt` from memory (temporary
+file, then rename), so `FILE` may already be that file.
 
 | Section | What the script reads |
 |---|---|

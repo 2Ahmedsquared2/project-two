@@ -40,7 +40,7 @@ loopback socket (t2), per arm, rounds interleaved.
                      --host-facts
   --host-facts FILE  host facts written by scripts/capture-host.sh on this
                      host; checked before anything runs, named in the report
-                     and copied to DIR/host-facts.txt
+                     and written to DIR/host-facts.txt
   --allow-missing-host-facts
                      local runs only: let --out go ahead without host facts;
                      the report says NOT CAPTURED
@@ -207,20 +207,21 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
 }
 
 /// Checks the host-facts file, if one was given, before anything runs.
-fn host_facts_note(args: &Args, host: &HostInfo) -> Result<HostFactsNote, ReplayError> {
+/// Returns the report's note and the checked facts, which are kept in memory
+/// for the copy beside the report.
+fn check_host_facts(
+    args: &Args,
+    host: &HostInfo,
+) -> Result<(HostFactsNote, Option<HostFacts>), ReplayError> {
     match &args.host_facts {
         Some(path) => {
             let facts = HostFacts::load(path)?;
             facts.check_kernel(&host.kernel)?;
-            Ok(HostFactsNote::captured(
-                path,
-                &facts,
-                args.feeder_core,
-                args.hot_core,
-            ))
+            let note = HostFactsNote::captured(path, &facts, args.feeder_core, args.hot_core);
+            Ok((note, Some(facts)))
         }
-        None if args.allow_missing_host_facts => Ok(HostFactsNote::Waived),
-        None => Ok(HostFactsNote::NotRequired),
+        None if args.allow_missing_host_facts => Ok((HostFactsNote::Waived, None)),
+        None => Ok((HostFactsNote::NotRequired, None)),
     }
 }
 
@@ -238,8 +239,8 @@ fn main() -> ExitCode {
         }
     };
     let host = HostInfo::detect();
-    let host_facts = match host_facts_note(&args, &host) {
-        Ok(note) => note,
+    let (host_facts, checked_facts) = match check_host_facts(&args, &host) {
+        Ok(pair) => pair,
         Err(e) => {
             eprintln!("hl-replay: --host-facts: {e}");
             return ExitCode::from(2);
@@ -302,8 +303,8 @@ fn main() -> ExitCode {
             eprintln!("hl-replay: --out: {e}");
             return ExitCode::FAILURE;
         }
-        if let Some(facts) = &args.host_facts {
-            if let Err(e) = std::fs::copy(facts, dir.join("host-facts.txt")) {
+        if let Some(facts) = &checked_facts {
+            if let Err(e) = facts.write_to(dir) {
                 eprintln!("hl-replay: --out: host-facts.txt: {e}");
                 return ExitCode::FAILURE;
             }

@@ -172,7 +172,7 @@ fn host_facts_already_in_the_out_directory_survive_the_run() {
     let facts = out.join("host-facts.txt");
     std::fs::copy(captured_facts("facts-same"), &facts).unwrap();
     let before = std::fs::read(&facts).unwrap();
-    assert!(!before.is_empty());
+    assert_ne!(before.len(), 0);
     let o = tiny_run()
         .arg("--host-facts")
         .arg(&facts)

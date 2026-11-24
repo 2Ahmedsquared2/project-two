@@ -1,7 +1,7 @@
 //! The host-facts file `scripts/capture-host.sh` writes, and the check that a
 //! run meant for a write-up carries one.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::ReplayError;
 
@@ -15,6 +15,7 @@ pub struct HostFacts {
     captured_utc: String,
     kernel: String,
     sections: Vec<(String, String)>,
+    raw: String,
 }
 
 impl HostFacts {
@@ -62,6 +63,7 @@ impl HostFacts {
             captured_utc: String::new(),
             kernel: String::new(),
             sections: Vec::new(),
+            raw: text.to_owned(),
         };
         facts.read_body(lines)?;
         if facts.captured_utc.is_empty() {
@@ -135,12 +137,25 @@ impl HostFacts {
     /// The file's text exactly as it was checked.
     #[must_use]
     pub fn raw(&self) -> &str {
-        ""
+        &self.raw
     }
 
     /// Writes the checked text to `dir/host-facts.txt`.
-    pub fn write_to(&self, _dir: &Path) -> Result<std::path::PathBuf, ReplayError> {
-        Err(bad("not implemented".to_owned()))
+    ///
+    /// The bytes come from memory, never from a second read of the source, so
+    /// what is kept is what was checked even if the source changed during the
+    /// run or is this very file. They go to a temporary file in `dir` that is
+    /// renamed into place, so a reader never sees half a file.
+    pub fn write_to(&self, dir: &Path) -> Result<PathBuf, ReplayError> {
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join("host-facts.txt");
+        let tmp = dir.join(format!(".host-facts.txt.{}.tmp", std::process::id()));
+        let written = std::fs::write(&tmp, &self.raw).and_then(|()| std::fs::rename(&tmp, &path));
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        Ok(path)
     }
 
     /// When the facts were captured (UTC), as the script wrote it.
