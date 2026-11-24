@@ -527,6 +527,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hl-block"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "hl-book-ref"
 version = "0.1.0"
 dependencies = [
