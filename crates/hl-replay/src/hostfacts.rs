@@ -192,18 +192,51 @@ impl HostFacts {
             .collect()
     }
 
-    /// The CPUs the kernel command line isolates (`isolcpus=`), if any.
+    /// The CPUs the kernel command line isolates (`isolcpus=`), in ascending
+    /// order and once each, if it names them one by one and every part of the
+    /// list was read.
     #[must_use]
     pub fn isolated_cpus(&self) -> Option<Vec<usize>> {
-        let mut cpus = Vec::new();
-        // Flags such as `domain` and `managed_irq` are not CPU numbers.
-        for part in self.cmdline_value("isolcpus")?.split(',') {
-            let (first, last) = part.split_once('-').unwrap_or((part, part));
-            if let (Ok(first), Ok(last)) = (first.parse::<usize>(), last.parse::<usize>()) {
-                cpus.extend(first..=last);
+        match self.cpu_list("isolcpus")? {
+            CpuList::Listed(ranges) => Some(
+                (0..MAX_CPUS)
+                    .filter(|cpu| ranges.iter().any(|r| r.contains(*cpu)))
+                    .collect(),
+            ),
+            CpuList::All | CpuList::Unreadable => None,
+        }
+    }
+
+    /// The CPUs a kernel command-line list names, if it is set. One part this
+    /// harness cannot read (the kernel's `N` for the last CPU, an unknown
+    /// word) or the kernel itself refuses (a CPU number at or past
+    /// [`MAX_CPUS`], a stride using more than its group) makes the whole list
+    /// unreadable: a partly read list would report a core as outside a list
+    /// that holds it. Ranges are kept as ranges, never expanded CPU by CPU.
+    fn cpu_list(&self, key: &str) -> Option<CpuList> {
+        let mut ranges = Vec::new();
+        let mut all = false;
+        for part in self.cmdline_value(key)?.split(',') {
+            if part.eq_ignore_ascii_case("all") {
+                all = true;
+                continue;
+            }
+            // `isolcpus=` alone takes flags before its list.
+            if key == "isolcpus" && ISOLCPUS_FLAGS.contains(&part) {
+                continue;
+            }
+            match CpuRange::parse(part) {
+                Some(range) => ranges.push(range),
+                None => return Some(CpuList::Unreadable),
             }
         }
-        (!cpus.is_empty()).then_some(cpus)
+        Some(if all {
+            CpuList::All
+        } else if ranges.iter().all(|r| r.used == 0) {
+            CpuList::Unreadable
+        } else {
+            CpuList::Listed(ranges)
+        })
     }
 
     /// A parsed kernel command-line value the script wrote as `key: value`.
@@ -214,36 +247,104 @@ impl HostFacts {
             .filter(|v| *v != "not set")
     }
 
+    /// Warnings for the pinned cores a kernel CPU list leaves out. `lacking`
+    /// is what such a core is not, for the line written when the list is not
+    /// set at all.
+    fn list_warnings(&self, key: &str, lacking: &str, pinned: &[(&str, usize)]) -> Vec<String> {
+        let raw = self.cmdline_value(key).unwrap_or_default();
+        match self.cpu_list(key) {
+            _ if pinned.is_empty() => Vec::new(),
+            Some(CpuList::All) => Vec::new(),
+            Some(CpuList::Listed(listed)) => pinned
+                .iter()
+                .filter(|(_, core)| !listed.iter().any(|r| r.contains(*core)))
+                .map(|(role, core)| format!("{role} core {core} is not in {key} ({raw})"))
+                .collect(),
+            Some(CpuList::Unreadable) => vec![format!(
+                "{key} ({raw}) is not a CPU list this harness can read: pinned cores not checked against it"
+            )],
+            None => {
+                let (cores, verb) = name_cores(pinned);
+                vec![format!("{key} is not set: {cores} {verb} not {lacking}")]
+            }
+        }
+    }
+
+    /// Warnings about RCU callback offload for cores whose `nohz_full`
+    /// membership is unknown because that list was not read: a core outside
+    /// `rcu_nocbs` may still be offloaded through `nohz_full`, so the line
+    /// says undetermined and never "not offloaded".
+    fn undetermined_offload_warnings(&self, pinned: &[(&str, usize)]) -> Vec<String> {
+        let tickless = self.cmdline_value("nohz_full").unwrap_or_default();
+        let raw = self.cmdline_value("rcu_nocbs").unwrap_or_default();
+        match self.cpu_list("rcu_nocbs") {
+            Some(CpuList::Listed(listed)) => pinned
+                .iter()
+                .filter(|(_, core)| !listed.iter().any(|r| r.contains(*core)))
+                .map(|(role, core)| {
+                    format!(
+                        "{role} core {core} is not in rcu_nocbs ({raw}) and nohz_full ({tickless}) could not be parsed: whether it is offloaded from RCU callbacks is undetermined"
+                    )
+                })
+                .collect(),
+            None if !pinned.is_empty() => {
+                let (cores, verb) = name_cores(pinned);
+                vec![format!(
+                    "rcu_nocbs is not set and nohz_full ({tickless}) could not be parsed: whether {cores} {verb} offloaded from RCU callbacks is undetermined"
+                )]
+            }
+            // `all` offloads every core; an unreadable rcu_nocbs gets its own line.
+            _ => self.list_warnings("rcu_nocbs", "offloaded from RCU callbacks", pinned),
+        }
+    }
+
     /// What a reader must weigh about the cores a run pinned to: a core
-    /// outside the isolated set, or a hot core that shares its physical core.
+    /// outside `isolcpus`, `nohz_full` or `rcu_nocbs`, a pinned CPU 0 that
+    /// `nohz_full` names, or a hot core that shares its physical core.
     /// Warnings only; none of this stops a run.
     fn core_warnings(&self, feeder: Option<usize>, hot: Option<usize>) -> Vec<String> {
         let pinned: Vec<(&str, usize)> = [("feeder", feeder), ("hot", hot)]
             .into_iter()
             .filter_map(|(role, core)| Some((role, core?)))
             .collect();
-        let mut warnings = Vec::new();
-        match self.isolated_cpus() {
-            Some(isolated) => {
-                let raw = self.cmdline_value("isolcpus").unwrap_or_default();
-                for (role, core) in &pinned {
-                    if !isolated.contains(core) {
-                        warnings.push(format!("{role} core {core} is not in isolcpus ({raw})"));
-                    }
-                }
-            }
-            None if !pinned.is_empty() => {
-                let cores: Vec<String> = pinned
-                    .iter()
-                    .map(|(role, core)| format!("{role} core {core}"))
-                    .collect();
-                let verb = if cores.len() == 1 { "is" } else { "are" };
-                warnings.push(format!(
-                    "isolcpus is not set: {} {verb} not isolated",
-                    cores.join(" and ")
-                ));
-            }
-            None => {}
+        let mut warnings = self.list_warnings("isolcpus", "isolated", &pinned);
+        warnings.extend(self.list_warnings("nohz_full", "tickless", &pinned));
+        let tickless = self.cpu_list("nohz_full");
+        // "The boot CPU will be forced outside the range to maintain the
+        // timekeeping" (Linux v6.8 kernel-parameters.txt, nohz_full=). The
+        // capture does not record which CPU booted; it is normally CPU 0.
+        let names_cpu_0 = match &tickless {
+            Some(CpuList::All) => true,
+            Some(CpuList::Listed(listed)) => listed.iter().any(|r| r.contains(0)),
+            Some(CpuList::Unreadable) | None => false,
+        };
+        if names_cpu_0 {
+            let raw = self.cmdline_value("nohz_full").unwrap_or_default();
+            warnings.extend(pinned.iter().filter(|(_, core)| *core == 0).map(|(role, _)| {
+                format!(
+                    "{role} core 0 is in nohz_full ({raw}), but the kernel forces the boot CPU (normally CPU 0) outside nohz_full: it may still take the tick"
+                )
+            }));
+        }
+        if matches!(tickless, Some(CpuList::Unreadable)) {
+            warnings.extend(self.undetermined_offload_warnings(&pinned));
+        } else {
+            // The kernel offloads RCU callbacks on every nohz_full CPU, as if
+            // it were in rcu_nocbs too, so only the other cores are checked.
+            let not_offloaded: Vec<(&str, usize)> = pinned
+                .iter()
+                .copied()
+                .filter(|(_, core)| match &tickless {
+                    Some(CpuList::All) => false,
+                    Some(CpuList::Listed(listed)) => !listed.iter().any(|r| r.contains(*core)),
+                    Some(CpuList::Unreadable) | None => true,
+                })
+                .collect();
+            warnings.extend(self.list_warnings(
+                "rcu_nocbs",
+                "offloaded from RCU callbacks",
+                &not_offloaded,
+            ));
         }
         if let Some(hot) = hot {
             let prefix = format!("cpu{hot} thread siblings: ");
@@ -280,6 +381,78 @@ impl HostFacts {
             )))
         }
     }
+}
+
+/// The flags `isolcpus=` takes before its CPU list (Linux v6.8
+/// `Documentation/admin-guide/kernel-parameters.txt`).
+const ISOLCPUS_FLAGS: [&str; 3] = ["nohz", "domain", "managed_irq"];
+
+/// The CPUs a kernel command-line CPU list names.
+enum CpuList {
+    /// The word `all`.
+    All,
+    /// The CPUs in any of these ranges.
+    Listed(Vec<CpuRange>),
+    /// Set, with a part this harness cannot read.
+    Unreadable,
+}
+
+/// One more than the largest CPU number a list may name: the widest CPU mask
+/// an x86-64 kernel can be built with (Linux v6.8 `arch/x86/Kconfig`,
+/// `NR_CPUS_RANGE_END`, 8192 with `CPUMASK_OFFSTACK`; arm64 stops at 4096).
+/// The kernel refuses a list naming a CPU at or past its mask width (-ERANGE,
+/// v6.8 `lib/bitmap-str.c`, `bitmap_check_region`).
+const MAX_CPUS: usize = 8192;
+
+/// One part of a CPU list: `first`, `first-last` or `first-last:used/group`
+/// (Linux v6.8 `Documentation/admin-guide/kernel-parameters.rst`, "cpu
+/// lists"). The range is split into groups of `group` CPUs and names the
+/// first `used` of each.
+struct CpuRange {
+    first: usize,
+    last: usize,
+    used: usize,
+    group: usize,
+}
+
+impl CpuRange {
+    /// Reads one part, or `None` for a part this harness cannot read or the
+    /// kernel refuses: `bitmap_check_region` returns -EINVAL for a descending
+    /// range, a group of 0 or `used > group`, and -ERANGE for a CPU past the
+    /// mask.
+    fn parse(part: &str) -> Option<Self> {
+        let (range, stride) = match part.split_once(':') {
+            None => (part, None),
+            Some((range, stride)) => {
+                let (used, group) = stride.split_once('/')?;
+                (range, Some((used.parse().ok()?, group.parse().ok()?)))
+            }
+        };
+        let (first, last) = range.split_once('-').unwrap_or((range, range));
+        let (first, last) = (first.parse::<usize>().ok()?, last.parse::<usize>().ok()?);
+        // A plain range is one group, all of it used.
+        let (used, group): (usize, usize) = stride.unwrap_or((1, 1));
+        (first <= last && last < MAX_CPUS && group > 0 && used <= group).then_some(Self {
+            first,
+            last,
+            used,
+            group,
+        })
+    }
+
+    fn contains(&self, cpu: usize) -> bool {
+        (self.first..=self.last).contains(&cpu) && (cpu - self.first) % self.group < self.used
+    }
+}
+
+/// "feeder core 2 and hot core 3" with the verb that agrees with it.
+fn name_cores(pinned: &[(&str, usize)]) -> (String, &'static str) {
+    let cores: Vec<String> = pinned
+        .iter()
+        .map(|(role, core)| format!("{role} core {core}"))
+        .collect();
+    let verb = if cores.len() == 1 { "is" } else { "are" };
+    (cores.join(" and "), verb)
 }
 
 /// What a report says about host facts.

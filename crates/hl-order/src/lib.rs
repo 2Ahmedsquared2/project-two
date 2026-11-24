@@ -36,6 +36,7 @@
 mod action;
 mod client;
 mod decimal;
+mod ecdsa;
 mod hex;
 mod network;
 mod signing;

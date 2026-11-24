@@ -2,10 +2,11 @@
 (***************************************************************************)
 (* Model of the p2-node replay driver: Replay::run / Replay::record and     *)
 (* the timed loop one_pass (crates/p2-node/src/{replay,timing}.rs, lane 3,  *)
-(* draft PR #10). Sync commit 5dc691f (VALIDATE = TRUE); the configs with   *)
-(* VALIDATE = FALSE keep the earlier code at dc993fc and its findings F1,   *)
-(* F2. README.md maps every action below to file:line, lists bounds and    *)
-(* assumptions, and what is NOT covered.                                    *)
+(* draft PR #10). Sync commit 9219ae7 (VALIDATE = TRUE, V9219 = TRUE).     *)
+(* V9219 = FALSE keeps 5dc691f's one_pass line check (time and round only)  *)
+(* and its "state identical" label; VALIDATE = FALSE keeps dc993fc and its  *)
+(* findings F1, F2. README.md maps every action below to file:line, lists  *)
+(* bounds and assumptions, and what is NOT covered.                         *)
 (*                                                                         *)
 (* The driver walks a slice of blocks in slice order. Per block it calls    *)
 (* engine.execute_block, then record(): blocks += 1, compare(b, out) (our   *)
@@ -49,8 +50,11 @@ CONSTANTS
                        \*   line that is not the compared block
     LinesMayDiffer,    \* TRUE: timed pass (one_pass) whose raw line j may decode to a
                        \*   different block than the compared block j
-    EndExact           \* TRUE: the end-of-window check sees every difference
+    EndExact,          \* TRUE: the end-of-window check sees every difference
                        \*   between our book and native's translated state
+    V9219              \* TRUE: code at 9219ae7 (needs VALIDATE): one_pass compares
+                       \*   the whole decoded block with the compared one, and no
+                       \*   report prints "state identical". FALSE: 5dc691f or older.
 
 Heights == 1..MaxH
 Idx == 1..MaxLen
@@ -60,6 +64,9 @@ VARIABLES
     snapH,      \* height of native's snapshot the engine was built from (0 = genesis)
     input,      \* the slice: input[j] = height of the j-th ReplayBlock
     lines,      \* lines[j] = height of the block raw line j decodes to (one_pass)
+    altered,    \* altered[j]: raw line j is block lines[j] by time and round, but
+                \*   differs from the compared block elsewhere (actions, nonces,
+                \*   signers, native responses)
     hasDiffs,   \* hasDiffs[j]: native's book diffs present for the j-th block
     i,          \* index of the block the loop is on
     pc,         \* "idle" | "executed" | "compared" | "resyncedEarly" | "halted"
@@ -75,10 +82,14 @@ VARIABLES
     counted,    \* ghost: indices that incremented `reproduced`
     resynced,   \* ghost: indices passed to engine.resync
     log,        \* ghost: <<[kind |-> "snap"|"apply"|"resync", h |-> height]>>
-    endState    \* end-of-window check: "none" (not run) | "pass" | "fail"
+    endState,   \* end-of-window check: "none" (not run) | "pass" | "fail"
+    execAltered,\* ghost: indices whose executed line was not exactly the compared block
+    claimsSI    \* the report says "state identical" for the counted blocks
 
-vars == <<snapH, input, lines, hasDiffs, i, pc, last, synced, pre, outMatch, verdict,
-          tOut, tState, k, n, counted, resynced, log, endState>>
+vars == <<snapH, input, lines, altered, hasDiffs, i, pc, last, synced, pre, outMatch, verdict,
+          tOut, tState, k, n, counted, resynced, log, endState, execAltered, claimsSI>>
+
+new == <<altered, execAltered, claimsSI>>
 
 Choice(flag) == IF flag THEN BOOLEAN ELSE {FALSE}
 
@@ -87,7 +98,9 @@ Ev(kind, h) == [kind |-> kind, h |-> h]
 AnySlices == UNION {[1..len -> Heights] : len \in 1..MaxLen}
 Slices(s) == IF AnyInput THEN AnySlices ELSE {[j \in 1..(MaxH - s) |-> s + j]}
 
-(* validate(blocks, snapshot), replay.rs:150-166, with its mutations. *)
+(* validate(blocks, snapshot), replay.rs:149-173 at 9219ae7, with its mutations.
+   Its DecodedHeight check (replay.rs:160-167) is checked in ReplayCli.tla; here
+   heights are block identities (A1). *)
 ValidHeight(j) ==
     CASE MUTANT = "validate_no_height_check"  -> TRUE
       [] MUTANT = "validate_ignores_snapshot" -> input[j] = j
@@ -99,6 +112,8 @@ Init ==
     /\ snapH \in 0..(MaxH - 1)
     /\ input \in Slices(snapH)
     /\ lines \in IF LinesMayDiffer THEN [1..Len(input) -> Heights] ELSE {input}
+    /\ altered \in IF LinesMayDiffer THEN [1..Len(input) -> BOOLEAN]
+                                     ELSE {[j \in 1..Len(input) |-> FALSE]}
     /\ hasDiffs \in IF DiffsMayBeMissing THEN [Idx -> BOOLEAN] ELSE {[j \in Idx |-> TRUE]}
     /\ i = 1
     /\ pc = IF VALIDATE /\ ~Valid THEN "refused" ELSE "idle"   \* Err(ReplayError) before any block
@@ -113,6 +128,8 @@ Init ==
     /\ counted = {} /\ resynced = {}
     /\ log = IF snapH > 0 THEN <<Ev("snap", snapH)>> ELSE <<>>
     /\ endState = "none"
+    /\ execAltered = {}
+    /\ claimsSI = FALSE
 
 (* Proposed fix: height guard. Mutations weaken it. *)
 HeightOK(h) ==
@@ -122,12 +139,17 @@ HeightOK(h) ==
 
 (* for b in blocks { let out = engine.execute_block(..) } *)
 LineCheck == VALIDATE /\ MUTANT # "no_line_check"
+(* one_pass's line check. 9219ae7: the whole decoded block equals the compared
+   one (timing.rs:188). 5dc691f (V9219 = FALSE, or the mutant): time and round
+   only, so a line that is the same block by time and round passes. *)
+FullLineCheck == V9219 /\ MUTANT # "line_check_time_round_only"
+LineSame(j) == lines[j] = input[j] /\ (FullLineCheck => ~altered[j])
 
 Execute ==
     /\ pc = "idle"
     /\ i <= Len(input)
     /\ FIX => HeightOK(input[i])
-    /\ LineCheck => lines[i] = input[i]
+    /\ LineCheck => LineSame(i)
     /\ \E ok, lucky \in BOOLEAN, silent \in Choice(SilentDiverge), heal \in Choice(MayHeal) :
           LET hidden == silent /\ ~ok          \* wrong, but outputs equal native's
               healed == heal /\ ~synced /\ ok  \* block overwrites the earlier difference
@@ -141,7 +163,9 @@ Execute ==
     /\ last' = lines[i]
     /\ log' = Append(log, Ev("apply", lines[i]))   \* the block actually executed
     /\ pc' = IF MUTANT = "resync_before_compare" THEN "resyncedEarly" ELSE "executed"
-    /\ UNCHANGED <<snapH, input, lines, hasDiffs, i, verdict, k, n, counted, resynced, endState>>
+    /\ execAltered' = IF lines[i] # input[i] \/ altered[i] THEN execAltered \cup {i} ELSE execAltered
+    /\ UNCHANGED <<snapH, input, lines, hasDiffs, i, verdict, k, n, counted, resynced, endState,
+                   altered, claimsSI>>
 
 (* Proposed fix only: a block whose height is not last+1 stops the run with an error. *)
 RejectHeight ==
@@ -152,21 +176,31 @@ RejectHeight ==
     /\ pc' = "halted"
     /\ UNCHANGED <<snapH, input, lines, hasDiffs, i, last, synced, pre, outMatch, verdict,
                    tOut, tState, k, n, counted, resynced, log, endState>>
+    /\ UNCHANGED new
 
-(* one_pass at 5dc691f: the decoded raw line's time and round must equal the
-   compared block's, else Err(TimingError::Mismatch) (timing.rs:176-183). *)
+(* one_pass at 9219ae7 (timing.rs:174-195): decode the line, execute it, stop
+   the timers, then `if &block != rb.block() { return Err(Mismatch) }`. The
+   line was executed on this pass's engine, but the Err leaves one_pass before
+   record() and `?` in run_passes (timing.rs:138, :148) drops the pass, its
+   engine and every earlier pass: nothing of it is compared, counted or
+   reported. So the step is modelled as the error stop. Mutations:
+   line_mismatch_continue skips the block and goes on; line_mismatch_break
+   ends the pass early as if it were complete. *)
 LineMismatch ==
     /\ LineCheck
     /\ pc = "idle"
     /\ i <= Len(input)
-    /\ lines[i] # input[i]
-    /\ pc' = "halted"
-    /\ UNCHANGED <<snapH, input, lines, hasDiffs, i, last, synced, pre, outMatch, verdict,
+    /\ ~LineSame(i)
+    /\ CASE MUTANT = "line_mismatch_continue" -> i' = i + 1 /\ pc' = "idle"
+          [] MUTANT = "line_mismatch_break"    -> i' = Len(input) + 1 /\ pc' = "idle"
+          [] OTHER                             -> pc' = "halted" /\ UNCHANGED i
+    /\ UNCHANGED <<snapH, input, lines, hasDiffs, last, synced, pre, outMatch, verdict,
                    tOut, tState, k, n, counted, resynced, log, endState>>
+    /\ UNCHANGED new
 
 (* record(): blocks += 1; match compare(b, out) { None => reproduced += 1, .. }
-   At dc993fc absent native diffs give Cause::NoNativeDiffs. At 5dc691f compare
-   uses native_diffs() = &[] when absent (replay.rs:278), so an absent entry
+   At dc993fc absent native diffs give Cause::NoNativeDiffs. Since 5dc691f compare
+   uses native_diffs() = &[] when absent (replay.rs:306 at 9219ae7), so an absent entry
    matches when our diffs are empty (`looksEmpty`); validate() keeps that
    unreachable unless its diffs check is removed. *)
 Compare ==
@@ -181,6 +215,7 @@ Compare ==
     /\ pc' = "compared"
     /\ UNCHANGED <<snapH, input, lines, hasDiffs, i, last, synced, pre, outMatch, tOut, tState,
                    resynced, log, endState>>
+    /\ UNCHANGED new
 
 Advance == /\ i' = i + 1 /\ pc' = "idle"
 
@@ -191,6 +226,7 @@ Reproduced ==
     /\ Advance
     /\ UNCHANGED <<snapH, input, lines, hasDiffs, last, synced, pre, outMatch, verdict, tOut,
                    tState, k, n, counted, resynced, log, endState>>
+    /\ UNCHANGED new
 
 (* Some(m) arm: engine.resync(b.height, b.native_diffs()). With native's diffs
    for this block and our book equal to native's before the block, resync
@@ -210,6 +246,7 @@ Resync ==
           THEN pc' = "executed" /\ outMatch' = TRUE /\ UNCHANGED i
           ELSE Advance /\ UNCHANGED outMatch
     /\ UNCHANGED <<snapH, input, lines, hasDiffs, last, pre, verdict, tOut, tState, k, n, counted, endState>>
+    /\ UNCHANGED new
 
 (* Proposed fix only: native diffs missing -> stop with an error instead of resync(&[]). *)
 HaltNoDiffs ==
@@ -220,6 +257,7 @@ HaltNoDiffs ==
     /\ pc' = "halted"
     /\ UNCHANGED <<snapH, input, lines, hasDiffs, i, last, synced, pre, outMatch, verdict,
                    tOut, tState, k, n, counted, resynced, log, endState>>
+    /\ UNCHANGED new
 
 (* MUTANT resync_before_compare: resync (to native, unconditionally) runs before
    the verdict, and the verdict then compares the resynced book. *)
@@ -231,6 +269,7 @@ ResyncEarly ==
     /\ log' = Append(log, Ev("resync", input[i]))
     /\ pc' = "executed"
     /\ UNCHANGED <<snapH, input, lines, hasDiffs, i, last, pre, verdict, tOut, tState, k, n, counted, endState>>
+    /\ UNCHANGED new
 
 (* MUTANT stop_on_mismatch: `return` on the first mismatch instead of resync. *)
 StopOnMismatch ==
@@ -240,6 +279,7 @@ StopOnMismatch ==
     /\ pc' = "halted"
     /\ UNCHANGED <<snapH, input, lines, hasDiffs, i, last, synced, pre, outMatch, verdict,
                    tOut, tState, k, n, counted, resynced, log, endState>>
+    /\ UNCHANGED new
 
 Done == pc = "idle" /\ i > Len(input)
 
@@ -258,8 +298,14 @@ EndCheck ==
                            THEN TRUE ELSE agree \/ blind
           IN endState' = IF passes THEN "pass" ELSE "fail"
     /\ pc' = "ended"
+    \* The label. 5dc691f: run_passes' summary prints "state identical k/N"
+    \* (timing.rs:363-367 there) and to_text does when the end check passed and
+    \* k = N. 9219ae7: every printer uses verdict_label (replay.rs:182-194),
+    \* which never says "state identical" (replay.rs:393, timing.rs:362,
+    \* main.rs:244). Mutant label_state_identical puts the old label back.
+    /\ claimsSI' = (~V9219 \/ MUTANT = "label_state_identical")
     /\ UNCHANGED <<snapH, input, lines, hasDiffs, i, last, synced, pre, outMatch, verdict,
-                   tOut, tState, k, n, counted, resynced, log>>
+                   tOut, tState, k, n, counted, resynced, log, altered, execAltered>>
 
 DriverNext ==
     IF MUTANT = "stop_on_mismatch"
@@ -284,6 +330,8 @@ TypeOK ==
     /\ snapH \in 0..MaxH /\ i \in 1..(MaxLen + 1) /\ last \in 0..MaxH
     /\ pc \in {"idle", "executed", "compared", "resyncedEarly", "halted", "ended", "refused"}
     /\ endState \in {"none", "pass", "fail"}
+    /\ execAltered \subseteq Idx /\ claimsSI \in BOOLEAN
+    /\ V9219 => VALIDATE
     /\ synced \in BOOLEAN /\ pre \in BOOLEAN /\ outMatch \in BOOLEAN
     /\ verdict \in [Idx -> Verdicts]
     /\ k \in Nat /\ n \in Nat /\ counted \subseteq Idx /\ resynced \subseteq Idx
@@ -340,6 +388,17 @@ E2_AllCountedAndEndPassImpliesAgreedThroughout ==
 E3_EndPassImpliesCountedStateIdentical ==
     endState = "pass" => \A j \in counted : tState[j]
 
+(* P5. The timed pass executes exactly the block it compares: no executed raw
+   line differs from the compared block (identity or content). *)
+P5_ExecutedIsCompared == execAltered = {}
+
+(* P6. A pass that ends normally compared every block of the slice. *)
+P6_FinishedPassCoversSlice == (Done \/ pc = "ended") => n = Len(input)
+
+(* L1. If the report says "state identical", every counted block left our book
+   equal to native's. *)
+L1_StateIdenticalClaimHolds == claimsSI => \A j \in counted : tState[j]
+
 (* Vacuity probes: each must be VIOLATED, showing the run reaches these states. *)
 Probe_NoResync == resynced = {}
 Probe_NoSnapThenApply ==
@@ -349,4 +408,6 @@ Probe_NoMismatchCounted == n = k
 Probe_NeverRefused == pc # "refused"
 Probe_EndNeverFails == endState # "fail"
 Probe_EndNeverPassesAfterResync == ~(endState = "pass" /\ resynced # {})
+\* A line that is the compared block by time and round but differs in content is reached.
+Probe_NoAlteredLine == ~\E j \in 1..Len(input) : lines[j] = input[j] /\ altered[j]
 =============================================================================

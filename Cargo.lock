@@ -877,8 +877,13 @@ dependencies = [
 name = "hl-capture"
 version = "0.1.0"
 dependencies = [
+ "hl-alloc-gate",
  "hl-latency",
+ "inotify",
+ "memchr",
  "proptest",
+ "rtrb",
+ "rustix",
  "serde_json",
  "tempfile",
 ]
@@ -927,9 +932,11 @@ name = "hl-order"
 version = "0.1.0"
 dependencies = [
  "criterion 0.5.1",
+ "hl-alloc-gate",
  "k256",
  "proptest",
  "rmp",
+ "secp256k1",
  "serde_json",
  "sha3",
  "thiserror",
@@ -1462,6 +1469,12 @@ dependencies = [
  "rmp",
  "serde",
 ]
+
+[[package]]
+name = "rtrb"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "342e1478a6e1c839e7405033eabfdc954d4d5dabd39f34e83420a43a95acfb04"
 
 [[package]]
 name = "rustix"
