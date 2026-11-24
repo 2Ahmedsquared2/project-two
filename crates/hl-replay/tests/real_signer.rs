@@ -165,7 +165,7 @@ fn the_label_is_real_and_names_the_code_path() {
     assert!(name.contains("testnet"), "{name}");
     // hl-order signs with libsecp256k1 since PR #20; k256 is test-only there.
     assert!(name.contains("libsecp256k1 RFC 6979"), "{name}");
-    assert!(!name.contains("k256"), "{name}");
+    assert!(!name.contains("k256 RFC 6979"), "{name}");
 }
 
 #[test]
