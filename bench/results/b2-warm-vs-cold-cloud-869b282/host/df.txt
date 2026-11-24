@@ -1,0 +1,26 @@
+$ df -h
+Filesystem      Size  Used Avail Use% Mounted on
+tmpfs           7.9G     0  7.9G   0% /
+/dev/root       3.7G  3.7G     0 100% /usr
+tmpfs           3.9G  122M  3.8G   4% /run
+tmpfs           7.9G     0  7.9G   0% /dev
+devtmpfs        3.9G     0  3.9G   0% /dev/tty
+/dev/vdb        974M  1.5M  956M   1% /run/sc/base
+/dev/vdc        126G   65G   62G  52% /run/sc/layer
+tmpfs           3.9G     0  3.9G   0% /run/sc/agent
+/dev/vdd        219M  202M   13M  95% /run/sc/agent/0.2.716
+tmpfs           7.9G  2.4G  5.6G  30% /tmp
+tmpfs           7.9G     0  7.9G   0% /root
+overlay         126G   65G   62G  52% /home
+tmpfs           7.9G     0  7.9G   0% /home/runner/.reason/workspace/sessions
+overlay         126G   65G   62G  52% /workspace
+overlay         126G   65G   62G  52% /home/runner/.reason
+overlay         126G   65G   62G  52% /home/runner/.local
+overlay         126G   65G   62G  52% /home/runner/.local/share
+tmpfs           7.9G     0  7.9G   0% /tmp/open-browser-use
+tmpfs           7.9G     0  7.9G   0% /run/reason/sessions
+tmpfs           7.9G     0  7.9G   0% /etc/ssh/ssh_config.d
+tmpfs           7.9G     0  7.9G   0% /home/runner/.local/share/reason/automation
+tmpfs           7.9G     0  7.9G   0% /home/runner/.local/share/reason/desktop/display
+overlay         126G   65G   62G  52% /home/runner/.local/share/reason/namespace-guest-automation-v1
+exit=0

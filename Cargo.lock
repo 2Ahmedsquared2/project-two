@@ -788,6 +788,7 @@ name = "p2-node"
 version = "0.1.0"
 dependencies = [
  "hl-block",
+ "hl-book-ref",
  "hl-node-convert",
  "hl-warm",
  "serde_json",

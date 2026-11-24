@@ -13,8 +13,12 @@ publish = false
 hl-block = { path = "../hl-block" }
 hl-warm = { path = "../hl-warm" }
 hl-node-convert = { path = "../hl-node-convert" }
+hl-book-ref = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+hl-block = { path = "../hl-block" }
 
 [lints]
 workspace = true

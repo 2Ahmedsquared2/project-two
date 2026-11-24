@@ -7,5 +7,8 @@
 //! reproduced blocks only; everything else is coverage.
 
 pub mod engine;
+pub mod engines;
+pub mod gen;
 pub mod replay;
 pub mod timing;
+pub mod warmbench;

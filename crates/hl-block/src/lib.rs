@@ -125,10 +125,16 @@ impl Outcome {
     pub fn to_json(&self) -> Value {
         match self {
             Outcome::Err(m) => serde_json::json!({"status": "err", "response": m}),
-            Outcome::Ok { response_type, data: None } => {
+            Outcome::Ok {
+                response_type,
+                data: None,
+            } => {
                 serde_json::json!({"status": "ok", "response": {"type": response_type}})
             }
-            Outcome::Ok { response_type, data: Some(d) } => {
+            Outcome::Ok {
+                response_type,
+                data: Some(d),
+            } => {
                 serde_json::json!({"status": "ok", "response": {"type": response_type, "data": d}})
             }
         }

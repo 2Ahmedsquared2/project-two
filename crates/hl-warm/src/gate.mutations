@@ -1,0 +1,29 @@
+mutation fail does not disarm the window (the bug the regression test reproduced)
+detects gate::proofs::a_failed_step_keeps_it_closed
+-            self.armed_at = None;
++            let _ = 0;
+
+mutation open on the event count alone, ignoring time
+detects gate::proofs::opens_only_when_every_step_passed_and_window_elapsed
+-            if self.window_events >= self.min_window_events && now_ns.saturating_sub(armed) >= self.min_window_ns {
++            if self.window_events >= self.min_window_events {
+
+mutation open one event early
+detects gate::proofs::opens_only_when_every_step_passed_and_window_elapsed
+-            if self.window_events >= self.min_window_events && now_ns.saturating_sub(armed) >= self.min_window_ns {
++            if self.window_events + 1 >= self.min_window_events && now_ns.saturating_sub(armed) >= self.min_window_ns {
+
+mutation arm before the last step passed
+detects gate::proofs::opens_only_when_every_step_passed_and_window_elapsed
+-        if self.passed == self.all() {
++        if self.passed != 0 {
+
+mutation a failed step can be passed later
+detects gate::proofs::opens_only_when_every_step_passed_and_window_elapsed
+-        if (self.passed | self.failed) & bit != 0 {
++        if self.passed & bit != 0 {
+
+mutation open one event late (liveness)
+detects gate::proofs::opens_on_the_first_event_that_meets_both_minimums
+-            if self.window_events >= self.min_window_events && now_ns.saturating_sub(armed) >= self.min_window_ns {
++            if self.window_events > self.min_window_events && now_ns.saturating_sub(armed) >= self.min_window_ns {

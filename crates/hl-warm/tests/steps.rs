@@ -94,3 +94,25 @@ fn pin_and_lock_report_outcome() {
     eprintln!("mlockall: {l:?}");
     let _ = format!("{l}");
 }
+
+#[test]
+fn finite_memlock_limit_is_refused_and_allocation_still_works() {
+    let (soft, _) =
+        nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_MEMLOCK).unwrap();
+    let l = lock_memory();
+    if soft != nix::sys::resource::RLIM_INFINITY {
+        assert!(
+            matches!(&l, hl_warm::LockOutcome::Refused(m) if m.contains("RLIMIT_MEMLOCK")),
+            "{l:?}"
+        );
+    }
+    let v: Vec<u8> = vec![1u8; 64 << 20];
+    assert_eq!(
+        v.iter().map(|&b| u64::from(b)).sum::<u64>(),
+        64 << 20,
+        "{l:?}"
+    );
+    if matches!(l, hl_warm::LockOutcome::Locked) {
+        let _ = hl_warm::unlock_memory();
+    }
+}

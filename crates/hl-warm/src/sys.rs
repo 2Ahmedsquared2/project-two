@@ -48,13 +48,37 @@ impl fmt::Display for LockOutcome {
 }
 
 /// Locks all current and future pages of the process.
+///
+/// Only when `RLIMIT_MEMLOCK` is unlimited: with a finite limit, a successful
+/// `MCL_FUTURE` makes every later allocation past the limit fail (seen on the
+/// dev box, 8 MiB limit: the process aborted on its next allocations). So a
+/// finite limit is reported as refused without calling `mlockall`. A refused
+/// call is undone with `munlockall`.
 #[must_use]
 pub fn lock_memory() -> LockOutcome {
+    use nix::sys::resource::{getrlimit, Resource, RLIM_INFINITY};
     use rustix::mm::{mlockall, MlockAllFlags};
+    match getrlimit(Resource::RLIMIT_MEMLOCK) {
+        Ok((soft, _)) if soft != RLIM_INFINITY => {
+            return LockOutcome::Refused(format!(
+                "RLIMIT_MEMLOCK is {soft} bytes, not unlimited (MCL_FUTURE would make later allocations fail)"
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => return LockOutcome::Refused(format!("getrlimit(RLIMIT_MEMLOCK): {e}")),
+    }
     match mlockall(MlockAllFlags::CURRENT | MlockAllFlags::FUTURE) {
         Ok(()) => LockOutcome::Locked,
-        Err(e) => LockOutcome::Refused(e.to_string()),
+        Err(e) => {
+            let _ = unlock_memory();
+            LockOutcome::Refused(e.to_string())
+        }
     }
+}
+
+/// `munlockall()`: unlocks every page and clears `MCL_FUTURE`.
+pub fn unlock_memory() -> rustix::io::Result<()> {
+    rustix::mm::munlockall()
 }
 
 /// `getrusage(RUSAGE_THREAD)` counters of the calling thread.

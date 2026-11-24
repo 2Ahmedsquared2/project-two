@@ -130,3 +130,15 @@ fn report_lists_steps_in_order_with_state() {
     assert!(lines[2].contains("ENOMEM"), "{r}");
     assert!(lines[3].starts_with("arena PENDING"), "{r}");
 }
+
+#[test]
+fn failing_a_passed_step_after_arming_keeps_it_closed() {
+    // Found while writing the Kani harness: the window was armed by the last
+    // pass, and a later failure of an already-passed step must disarm it.
+    let mut g = gate(&["a", "b"], 0, 0);
+    g.pass("a", 0).unwrap();
+    g.pass("b", 0).unwrap();
+    g.fail("a", "source dropped", 1);
+    assert_eq!(g.on_event(5), Phase::Warmup);
+    assert!(!g.is_open());
+}

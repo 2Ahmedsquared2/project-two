@@ -27,5 +27,7 @@ mod gate;
 mod sys;
 
 pub use arena::{Arena, Backing};
-pub use gate::{GateConfig, GateError, GatedHistogram, Phase, WarmGate};
-pub use sys::{lock_memory, pin_current_thread, LockOutcome, PinError, ThreadUsage, UsageDelta};
+pub use gate::{CoreError, GateConfig, GateCore, GateError, GatedHistogram, Phase, WarmGate};
+pub use sys::{
+    lock_memory, pin_current_thread, unlock_memory, LockOutcome, PinError, ThreadUsage, UsageDelta,
+};

@@ -18,6 +18,7 @@ nix = { version = "0.30", features = ["resource"] }
 rustix = { version = "1", features = ["mm"] }
 
 [dev-dependencies]
+nix = { version = "0.30", features = ["resource"] }
 hl-alloc-gate = { path = "../hl-alloc-gate" }
 
 [lints]
