@@ -3,8 +3,8 @@
 
 use hl_replay::{
     active_pipeline, node_line, stage_table, ActiveSigner, Book, Clock, CompleteLine, Decision,
-    Handle, HeaderScanParser, NodeLineParser, OrderIntent, Parser, ParserMode, Pipeline,
-    PrototypeSigner, Signer, Stage, StageLabel, StubBook, StubDecision, TopOfBook,
+    Handle, HeaderScanParser, HlOrderSigner, NodeLineParser, OrderIntent, Parser, ParserMode,
+    Pipeline, PrototypeSigner, Signer, Stage, StageLabel, StubBook, StubDecision, TopOfBook,
 };
 use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
 use secp256k1::{Message, Secp256k1};
@@ -25,6 +25,16 @@ fn intent(nonce: u64) -> OrderIntent {
     }
 }
 
+/// The real signer by default; the prototype under `--features
+/// prototype-signer`, which exists to compare the two.
+fn active_signer_label() -> StageLabel {
+    if cfg!(feature = "prototype-signer") {
+        StageLabel::Prototype
+    } else {
+        StageLabel::Real
+    }
+}
+
 #[test]
 fn every_stage_carries_its_honest_label() {
     let t = stage_table();
@@ -36,10 +46,11 @@ fn every_stage_carries_its_honest_label() {
             ("parser", StageLabel::Real),
             ("book", StageLabel::Stub),
             ("decision", StageLabel::Stub),
-            ("signer", StageLabel::Prototype),
+            ("signer", active_signer_label()),
             ("send", StageLabel::Prototype),
         ]
     );
+    assert_eq!(<ActiveSigner as Stage>::NAME, t[4].name);
     assert_eq!(
         t[1].name,
         "hl_latency::scan_node_header, falling back to strict parse_node_line"
@@ -48,7 +59,9 @@ fn every_stage_carries_its_honest_label() {
     assert_eq!(StageLabel::Real.to_string(), "real");
     assert_eq!(StageLabel::Stub.to_string(), "stub");
     assert_eq!(StageLabel::Prototype.to_string(), "prototype");
-    assert_eq!(<ActiveSigner as Stage>::LABEL, StageLabel::Prototype);
+    assert_eq!(<ActiveSigner as Stage>::LABEL, active_signer_label());
+    assert_eq!(<HlOrderSigner as Stage>::LABEL, StageLabel::Real);
+    assert_eq!(<PrototypeSigner as Stage>::LABEL, StageLabel::Prototype);
     assert_eq!(<NodeLineParser as Stage>::LABEL, StageLabel::Real);
 }
 

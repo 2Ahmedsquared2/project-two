@@ -4,9 +4,9 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use hl_latency::{parse_node_line, Observation};
+use hl_latency::{parse_node_line, scan_node_header, CompleteLine, Observation, Source};
 
-use crate::lines::{LineSplitter, StampedLine};
+use crate::lines::{LineSink, LineSplitter};
 
 /// Sort key of an hourly file path `.../{YYYYMMDD}/{H}`: `(date, hour)`.
 /// `None` when the last two components are not a date and an hour 0..=23.
@@ -64,13 +64,27 @@ pub fn newest_hourly_file(root: &Path) -> std::io::Result<Option<PathBuf>> {
     }
 }
 
+/// Receives each observation a [`NodeTailer`] completes, in file order.
+pub trait ObservationSink {
+    /// One stamped arrival.
+    fn observe(&mut self, obs: Observation);
+}
+
+/// Collects observations; grows on the heap. For tests and cold callers.
+impl ObservationSink for Vec<Observation> {
+    fn observe(&mut self, obs: Observation) {
+        self.push(obs);
+    }
+}
+
 /// Counters a run reports beside its observations.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TailStats {
-    /// Lines parsed into observations.
+    /// Lines turned into observations.
     pub lines: u64,
-    /// Lines `hl_latency::parse_node_line` rejected, plus unfinished lines
-    /// abandoned at a rotation (counted, not fatal).
+    /// Lines that are not node lines (both `hl_latency::scan_node_header`
+    /// and `hl_latency::parse_node_line` rejected them), plus unfinished
+    /// lines abandoned at a rotation (counted, not fatal).
     pub bad_lines: u64,
     /// Switches to a newer hourly file.
     pub rotations: u64,
@@ -79,6 +93,84 @@ pub struct TailStats {
     /// Lines dropped for exceeding the line cap (see
     /// [`NodeTailer::with_max_line`]); not included in `bad_lines`.
     pub oversized_lines: u64,
+    /// Directory walks looking for a newer hourly file.
+    pub rescans: u64,
+    /// Lines `hl_latency::scan_node_header` refused that the strict
+    /// `hl_latency::parse_node_line` then accepted (included in `lines`).
+    pub scan_fallbacks: u64,
+    /// Observations whose `block_number` is not the previous one plus one.
+    pub height_breaks: u64,
+    /// Observations read by the poll that switched to a file (see
+    /// [`Switch`]); their stamps can be late by the rescan interval.
+    pub post_rotation_lines: u64,
+}
+
+/// What the poll that switched to a new file read from it. That file may
+/// have existed for up to the caller's rescan interval before the switch, so
+/// these observations' stamps are an upper bound, not an arrival time: leave
+/// them out of latency percentiles.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Switch {
+    /// Observations read from the new file by the switching poll.
+    pub lines: u64,
+    /// `block_number` of the first of them.
+    pub first_block_number: Option<u64>,
+    /// `block_number` of the last of them.
+    pub last_block_number: Option<u64>,
+}
+
+/// Turns each complete line into an observation, in place.
+struct Parser<'a, S: ?Sized> {
+    stats: &'a mut TailStats,
+    last_height: &'a mut Option<u64>,
+    /// Set while the file just switched to is read for the first time.
+    switch: Option<&'a mut Switch>,
+    sink: &'a mut S,
+}
+
+impl<S: ObservationSink + ?Sized> LineSink for Parser<'_, S> {
+    fn line(&mut self, bytes: &[u8], recv_ns: u64) {
+        // The splitter only hands out lines whose newline it has seen.
+        let line = CompleteLine::assume_newline_seen(bytes);
+        let obs = if let Some((block_time_ms, block_number)) = scan_node_header(line) {
+            Observation {
+                source: Source::Node,
+                block_time_ms,
+                block_number: Some(block_number),
+                recv_ns,
+            }
+        } else {
+            // Not hl-node's exact header shape: let the strict parse decide.
+            // Cold: hl-node writes the header shape, so this is a foreign or
+            // damaged line, and it costs a full parse on this thread.
+            let strict = std::str::from_utf8(bytes)
+                .ok()
+                .and_then(|s| parse_node_line(s, recv_ns).ok());
+            let Some(obs) = strict else {
+                self.stats.bad_lines += 1;
+                return;
+            };
+            self.stats.scan_fallbacks += 1;
+            obs
+        };
+        self.stats.lines += 1;
+        let height = obs.block_number;
+        if let Some(prev) = *self.last_height {
+            if height != prev.checked_add(1) {
+                self.stats.height_breaks += 1;
+            }
+        }
+        if height.is_some() {
+            *self.last_height = height;
+        }
+        if let Some(sw) = self.switch.as_deref_mut() {
+            sw.lines += 1;
+            sw.first_block_number = sw.first_block_number.or(height);
+            sw.last_block_number = height;
+            self.stats.post_rotation_lines += 1;
+        }
+        self.sink.observe(obs);
+    }
 }
 
 #[derive(Debug)]
@@ -105,9 +197,22 @@ pub struct NodeTailer {
     polled: bool,
     splitter: LineSplitter,
     buf: Vec<u8>,
-    lines: Vec<StampedLine>,
     stats: TailStats,
     backlogged: bool,
+    rescan_due: bool,
+    last_height: Option<u64>,
+    switch: SwitchState,
+}
+
+/// Where the report of the latest switch stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitchState {
+    /// Nothing to report.
+    None,
+    /// The new file has not been read to its end yet: still counting.
+    Reading(Switch),
+    /// Complete; waits for [`NodeTailer::take_switch`].
+    Ready(Switch),
 }
 
 impl NodeTailer {
@@ -129,28 +234,56 @@ impl NodeTailer {
             polled: false,
             splitter: LineSplitter::with_max_line(max_line),
             buf: vec![0; BUF],
-            lines: Vec::new(),
             stats: TailStats::default(),
             backlogged: false,
+            rescan_due: true,
+            last_height: None,
+            switch: SwitchState::None,
         }
     }
 
-    /// Reads what is available now, at most [`MAX_READS_PER_POLL`] reads,
-    /// and returns the observations it completed. `clock` is called once
-    /// right after each `read` returns data, before that data is parsed.
-    /// When the budget runs out, [`Self::backlogged`] is true and the rest
-    /// (including any switch to a newer file) waits for the next poll.
+    /// [`Self::request_rescan`] then [`Self::poll_into`], collected into a
+    /// new `Vec`: walks the directory and allocates on every call, so it is
+    /// for tests and cold callers, not for a capture loop.
     pub fn poll(&mut self, clock: &mut dyn FnMut() -> u64) -> std::io::Result<Vec<Observation>> {
-        let first = !self.polled;
-        self.polled = true;
         let mut out = Vec::new();
+        self.request_rescan();
+        self.poll_into(clock, &mut out)?;
+        Ok(out)
+    }
+
+    /// Reads what is available now, at most [`MAX_READS_PER_POLL`] reads,
+    /// and hands each observation it completes to `sink`. `clock` is called
+    /// once right after each `read` returns data, before that data is
+    /// parsed. When the budget runs out, [`Self::backlogged`] is true and
+    /// the rest (including any switch to a newer file) waits for the next
+    /// poll.
+    ///
+    /// The directory is walked for a newer file only when a rescan is due
+    /// (the first poll, and after each [`Self::request_rescan`]) and the
+    /// current file has been read to its end, so the old file is always
+    /// drained before a switch. Every other poll is `read` calls on the open
+    /// file and nothing else: it does not allocate, lines being parsed in
+    /// place from the read buffer or the splitter's reserved buffer.
+    pub fn poll_into<S: ObservationSink + ?Sized>(
+        &mut self,
+        clock: &mut dyn FnMut() -> u64,
+        sink: &mut S,
+    ) -> std::io::Result<()> {
         let mut budget = MAX_READS_PER_POLL;
         self.backlogged = false;
-        self.drain(clock, &mut out, &mut budget)?;
+        self.drain(clock, sink, &mut budget)?;
         if self.backlogged {
-            // Finish the current file before looking for a newer one.
-            return Ok(out);
+            // Finish the current file before looking for a newer one; a
+            // rescan that is due stays due.
+            return Ok(());
         }
+        self.finish_switch();
+        if !std::mem::take(&mut self.rescan_due) {
+            return Ok(());
+        }
+        self.stats.rescans += 1;
+        let first = !std::mem::replace(&mut self.polled, true);
         if let Some(newest) = newest_hourly_file(&self.root)? {
             let key = hourly_key(&newest);
             let newer = match (&self.current, key) {
@@ -165,28 +298,44 @@ impl NodeTailer {
                     if self.splitter.clear() {
                         self.stats.bad_lines += 1;
                     }
-                } else if first {
+                }
+                if self.current.is_none() && first {
+                    // History is not an arrival.
                     file.seek(SeekFrom::End(0))?;
+                } else {
+                    self.switch = SwitchState::Reading(Switch::default());
                 }
                 self.current = Some(Current {
                     path: newest,
                     key,
                     file,
                 });
-                self.drain(clock, &mut out, &mut budget)?;
+                self.drain(clock, sink, &mut budget)?;
+                if !self.backlogged {
+                    self.finish_switch();
+                }
             }
         }
-        Ok(out)
+        Ok(())
     }
 
-    fn drain(
+    fn drain<S: ObservationSink + ?Sized>(
         &mut self,
         clock: &mut dyn FnMut() -> u64,
-        out: &mut Vec<Observation>,
+        sink: &mut S,
         budget: &mut usize,
     ) -> std::io::Result<()> {
         let Some(cur) = self.current.as_mut() else {
             return Ok(());
+        };
+        let mut parser = Parser {
+            stats: &mut self.stats,
+            last_height: &mut self.last_height,
+            switch: match &mut self.switch {
+                SwitchState::Reading(sw) => Some(sw),
+                SwitchState::None | SwitchState::Ready(_) => None,
+            },
+            sink,
         };
         loop {
             if *budget == 0 {
@@ -200,26 +349,38 @@ impl NodeTailer {
             }
             // Stamp before anything else touches the bytes.
             let recv_ns = clock();
-            self.stats.reads += 1;
-            self.splitter.push(
-                self.buf.get(..n).unwrap_or_default(),
-                recv_ns,
-                &mut self.lines,
-            );
-        }
-        for line in self.lines.drain(..) {
-            match std::str::from_utf8(&line.bytes)
-                .ok()
-                .and_then(|s| parse_node_line(s, line.recv_ns).ok())
-            {
-                Some(o) => {
-                    self.stats.lines += 1;
-                    out.push(o);
-                }
-                None => self.stats.bad_lines += 1,
-            }
+            parser.stats.reads += 1;
+            self.splitter
+                .push(self.buf.get(..n).unwrap_or_default(), recv_ns, &mut parser);
         }
         Ok(())
+    }
+
+    /// Asks the next poll that reaches the end of the current file to look
+    /// for a newer one.
+    ///
+    /// The capture loop calls this on a coarse timer or on a directory
+    /// event. Until that poll, lines in a newer file wait, which is why the
+    /// poll that switches reports what it read as a [`Switch`].
+    pub fn request_rescan(&mut self) {
+        self.rescan_due = true;
+    }
+
+    /// The most recent switch to a file that was not yet reported, once the
+    /// new file has been read to its end, if any.
+    pub fn take_switch(&mut self) -> Option<Switch> {
+        let SwitchState::Ready(sw) = self.switch else {
+            return None;
+        };
+        self.switch = SwitchState::None;
+        Some(sw)
+    }
+
+    /// The file switched to has been read to its end: its report is complete.
+    fn finish_switch(&mut self) {
+        if let SwitchState::Reading(sw) = self.switch {
+            self.switch = SwitchState::Ready(sw);
+        }
     }
 
     /// True when the last [`Self::poll`] stopped at its read budget with

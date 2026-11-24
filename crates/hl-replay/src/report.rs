@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crate::arms::{ArmReport, Run};
 use crate::stage::{active_parser_mode, stage_table, ParserMode};
-use crate::{LatencyHist, ReplayError};
+use crate::{HostFactsNote, LatencyHist, ReplayError};
 
 /// The commit this harness was built from (`git rev-parse HEAD` at build
 /// time, with `-dirty` appended when tracked files had uncommitted changes).
@@ -70,6 +70,8 @@ pub struct RunMeta {
     pub interval: Duration,
     /// What was replayed, in words.
     pub input: String,
+    /// The host-facts capture this run carries, if any.
+    pub host_facts: HostFactsNote,
 }
 
 /// The five metrics of an arm, headline first: file-name-safe label and histogram.
@@ -81,6 +83,47 @@ fn metrics(a: &ArmReport) -> [(&'static str, &LatencyHist); 5] {
         ("feed-t0", &a.hists.detect),
         ("feed-t2", &a.hists.total),
     ]
+}
+
+/// The `host facts:` lines: which capture a run carries, or that it has none.
+fn render_host_facts(s: &mut String, note: &HostFactsNote) {
+    match note {
+        HostFactsNote::NotRequired => {
+            let _ = writeln!(s, "host facts: not captured (nothing written to disk)");
+        }
+        HostFactsNote::Waived => {
+            let _ = writeln!(
+                s,
+                "host facts: NOT CAPTURED (--allow-missing-host-facts): local run, not a result for a write-up"
+            );
+        }
+        HostFactsNote::Captured {
+            path,
+            captured_utc,
+            unavailable,
+            manual_rtt,
+            warnings,
+        } => {
+            let gaps = if unavailable.is_empty() {
+                "none".to_owned()
+            } else {
+                unavailable.join(", ")
+            };
+            let _ = writeln!(
+                s,
+                "host facts: {path}, captured {captured_utc}, {} sections checked, unavailable in: {gaps}",
+                crate::HostFacts::REQUIRED.len()
+            );
+            let _ = writeln!(
+                s,
+                "  rtt-manual: {} (operator step, never checked by the harness)",
+                if *manual_rtt { "present" } else { "absent" }
+            );
+            for w in warnings {
+                let _ = writeln!(s, "  warning: {w}");
+            }
+        }
+    }
 }
 
 /// Renders the plain-text report: commit, host, pinning, stage labels and one
@@ -96,6 +139,7 @@ pub fn render_report(meta: &RunMeta, arms: &[ArmReport]) -> String {
     let _ = writeln!(s, "kernel: {}", meta.host.kernel);
     let _ = writeln!(s, "cpu: {}", meta.host.cpu_model);
     let _ = writeln!(s, "cores: {}", meta.host.cores);
+    render_host_facts(&mut s, &meta.host_facts);
     let core = |c: Option<usize>| c.map_or_else(|| "unpinned".to_owned(), |c| format!("core {c}"));
     if meta.feeder_core.is_none() && meta.hot_core.is_none() {
         let _ = writeln!(s, "pinning: none");

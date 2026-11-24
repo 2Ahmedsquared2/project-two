@@ -88,8 +88,14 @@ the vectors and fails on any drift.
 
 ## Crates
 
-- `k256` (RustCrypto, pure Rust, no C toolchain) with `precomputed-tables`:
-  recoverable RFC 6979 signatures.
+- `secp256k1` (bindings to libsecp256k1, Bitcoin Core's C library) with
+  `recovery`: recoverable RFC 6979 signatures, low-s. One signing context per
+  process, built with the first `Signer` and reused; a signature creates no
+  context and does not allocate (`tests/alloc.rs`). Building it needs a C
+  compiler for the target (`secp256k1-sys` compiles vendored C).
+- `k256` (RustCrypto, pure Rust) is a dev-dependency only: the backend until
+  PR #20, kept as the oracle that every signature is compared with
+  (`src/ecdsa.rs`, `tests/backend_equiv.rs`).
 - `sha3` `Keccak256`: implements `io::Write`, so the action is msgpack-encoded
   straight into the hasher; signing does not allocate.
 - `rmp` (low-level msgpack writer): minimal-width encodings identical to Python's
