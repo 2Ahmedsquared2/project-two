@@ -4,6 +4,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::process::Command;
 use std::time::Duration;
 
@@ -514,21 +515,21 @@ fn an_unreadable_nohz_full_leaves_rcu_offload_undetermined() {
         list_warnings("isolcpus: 2-3\nnohz_full: 2-N\nrcu_nocbs: not set", Some(2), Some(3)),
         [
             unread,
-            "rcu_nocbs is not set and nohz_full (2-N) was not read: whether feeder core 2 and hot core 3 are offloaded from RCU callbacks is undetermined"
+            "rcu_nocbs is not set and nohz_full (2-N) could not be parsed: whether feeder core 2 and hot core 3 are offloaded from RCU callbacks is undetermined"
         ]
     );
     assert_eq!(
         list_warnings("isolcpus: 2-3\nnohz_full: 2-N\nrcu_nocbs: not set", None, Some(3)),
         [
             unread,
-            "rcu_nocbs is not set and nohz_full (2-N) was not read: whether hot core 3 is offloaded from RCU callbacks is undetermined"
+            "rcu_nocbs is not set and nohz_full (2-N) could not be parsed: whether hot core 3 is offloaded from RCU callbacks is undetermined"
         ]
     );
     assert_eq!(
         list_warnings("isolcpus: 2-3\nnohz_full: 2-N\nrcu_nocbs: 2", Some(2), Some(3)),
         [
             unread,
-            "hot core 3 is not in rcu_nocbs (2) and nohz_full (2-N) was not read: whether it is offloaded from RCU callbacks is undetermined"
+            "hot core 3 is not in rcu_nocbs (2) and nohz_full (2-N) could not be parsed: whether it is offloaded from RCU callbacks is undetermined"
         ]
     );
     // A core rcu_nocbs names is offloaded whatever nohz_full says.
