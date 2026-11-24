@@ -17,8 +17,16 @@
 //! unsupported action or leg, no oid hint differed from our counter, every
 //! response equals native's and our diff sequence equals native's. Leg
 //! pre-rejects are derived from the action and static metadata only. The
-//! acting user is taken from native's response (`user`): signature recovery
-//! and agent-to-master mapping are not implemented (input, not outcome).
+//! acting user is taken from native's response (`user`): agent-to-master
+//! mapping is not implemented (input, not outcome).
+//!
+//! `--signers FILE` (lane 2's `signers_<height>.txt`, one address per line;
+//! pass a `.gz` through `<(zcat …)`) turns on the unknown-wallet rule: each
+//! L1 action's signer is recovered from its own signature (mainnet phantom
+//! agent) and, when it is not in the set, the action is a noop answered
+//! `User or API Wallet {signer} does not exist.` An `approveAgent` native
+//! accepted adds its agent to the set (acceptance read from native: input).
+//! User-signed actions (`signatureChainId`) and `multiSig` are not ruled.
 #![allow(
     missing_docs,
     clippy::unwrap_used,
@@ -46,6 +54,9 @@ use hl_exec::{
     UserAction,
 };
 use serde_json::Value;
+
+#[path = "replay_support/signers.rs"]
+mod signers;
 
 #[derive(Clone, Debug)]
 struct AssetInfo {
@@ -264,6 +275,19 @@ struct Block {
     bundle_lens: Vec<u32>,
     /// Per action, its range in `assets`.
     act_assets: Vec<(usize, usize)>,
+    /// Per action, the recovered signer the unknown-wallet rule found absent
+    /// (kind 5; `None` for every other action).
+    unknown_signer: Vec<Option<[u8; 20]>>,
+    /// Per action, whether the rule was applied (signer recovered and checked).
+    ruled: Vec<bool>,
+}
+
+/// The unknown-wallet rule's state across blocks.
+struct WalletRule {
+    set: signers::Signers,
+    ctx: secp256k1::Secp256k1<secp256k1::VerifyOnly>,
+    not_recovered: usize,
+    agents_added: usize,
 }
 
 impl Block {
@@ -284,7 +308,7 @@ impl Block {
                     user: self.users[i],
                     modifies: &self.modifies[j],
                 },
-                3 => UserAction::Noop,
+                3 | 5 => UserAction::Noop,
                 _ => UserAction::Unsupported("x"),
             })
             .collect()
@@ -311,8 +335,10 @@ fn time_ms(s: &str) -> u64 {
     (((days * 24 + h) * 60 + mi) * 60 + se) as u64 * 1000 + ms as u64
 }
 
-fn decode_block(meta: &Meta, line: &str) -> Block {
+fn decode_block(meta: &Meta, line: &str, mut rule: Option<&mut WalletRule>) -> Block {
     let v: Value = serde_json::from_str(line).unwrap();
+    let l1 = rule.as_ref().map(|_| signers::signed_actions(line));
+    let mut act_no = 0usize;
     let ab = &v["abci_block"];
     let mut b = Block {
         height: v["height"].as_u64().unwrap(),
@@ -397,6 +423,38 @@ fn decode_block(meta: &Meta, line: &str) -> Block {
                 _ => 4,
             };
             let kind = if unsupported { 4 } else { kind };
+            // Unknown-wallet rule: a signer outside the set makes the whole
+            // action a noop with native's error, whatever its type.
+            let mut unknown = None;
+            let mut ruled = false;
+            if let (Some(r), Some(l1)) = (rule.as_deref_mut(), l1.as_ref()) {
+                let user_signed = a.get("signatureChainId").is_some() || t == "multiSig";
+                if !user_signed && !expired {
+                    match l1[act_no].recover(&r.ctx, signers::MAINNET) {
+                        Some(s) => {
+                            ruled = true;
+                            if !r.set.exists(&s) {
+                                unknown = Some(s);
+                            }
+                        }
+                        None => r.not_recovered += 1,
+                    }
+                }
+                if t == "approveAgent" && b.native.last().is_some_and(|x| x["status"] == "ok") {
+                    if let Some(ag) = a["agentAddress"].as_str() {
+                        r.agents_added += usize::from(r.set.add_hex(ag));
+                    }
+                }
+            }
+            act_no += 1;
+            let kind = if unknown.is_some() {
+                b.assets.truncate(a0);
+                5
+            } else {
+                kind
+            };
+            b.unknown_signer.push(unknown);
+            b.ruled.push(ruled);
             b.act_assets.push((a0, b.assets.len()));
             b.acts.push((
                 kind,
@@ -545,6 +603,10 @@ fn response_json(meta: &Meta, b: &Block, i: usize, st: &[OrderStatus], expired: 
             }
         }
         3 => serde_json::json!({"status":"ok","response":{"type":"default"}}),
+        5 => serde_json::json!({"status":"err","response":format!(
+            "User or API Wallet {} does not exist.",
+            signers::addr_hex(&b.unknown_signer[i].unwrap())
+        )}),
         _ => Value::Null,
     }
 }
@@ -912,6 +974,19 @@ fn main() {
             *ent = (*ent).max(m);
         }
     }
+    let mut wallet_rule = arg("--signers").map(|p| {
+        let set = signers::Signers::from_reader(BufReader::new(File::open(&p).unwrap()));
+        eprintln!("signers: {} addresses from {p}", set.len());
+        WalletRule {
+            set,
+            ctx: secp256k1::Secp256k1::verification_only(),
+            not_recovered: 0,
+            agents_added: 0,
+        }
+    });
+    // Unknown-wallet rule tallies over counted blocks: (native says absent,
+    // we said absent), native absent only, we absent only.
+    let (mut uw_both, mut uw_missed, mut uw_false) = (0usize, 0usize, 0usize);
     let mut k = 0usize;
     // (height, verdict): "reproduced" or the block's mismatch classes.
     let mut verdicts: Vec<(u64, String)> = Vec::new();
@@ -926,7 +1001,7 @@ fn main() {
         if n >= max {
             break;
         }
-        let b = &decode_block(&meta, &line.unwrap());
+        let b = &decode_block(&meta, &line.unwrap(), wallet_rule.as_mut());
         if b.height <= seed_h {
             continue;
         }
@@ -965,6 +1040,7 @@ fn main() {
         }
         let mut resp_bad = None;
         let mut unknown_wallet = false;
+        let mut uw_class: Option<&str> = None;
         for i in 0..b.acts.len() {
             let expired = out.responses[i].expired;
             if b.acts[i].0 == 4 && !expired {
@@ -982,6 +1058,34 @@ fn main() {
                 continue;
             }
             let ours = response_json(&meta, b, i, out.statuses_of(i), expired);
+            let native_unknown = b.native[i]["status"] == "err"
+                && b.native[i]["response"].as_str().is_some_and(|r| {
+                    r.starts_with("User or API Wallet ") && r.ends_with(" does not exist.")
+                });
+            if wallet_rule.is_some() {
+                let ours_unknown = b.acts[i].0 == 5;
+                match (native_unknown, ours_unknown) {
+                    (true, true) => uw_both += 1,
+                    (true, false) => uw_missed += 1,
+                    (false, true) => uw_false += 1,
+                    (false, false) => {}
+                }
+                if ours != b.native[i] && (native_unknown || ours_unknown) {
+                    // A rule miss gets its own class; keep comparing.
+                    uw_class.get_or_insert(if !ours_unknown {
+                        if b.ruled[i] {
+                            "resp:unknown-wallet-missed"
+                        } else {
+                            "resp:unknown-wallet-unruled"
+                        }
+                    } else if native_unknown {
+                        "resp:unknown-wallet-text"
+                    } else {
+                        "resp:unknown-wallet-false"
+                    });
+                    continue;
+                }
+            }
             // Native rejects an action whose signer is not a known user or
             // agent (an account-side check the engine does not model). It
             // keeps the block out of k under its own class; keep comparing.
@@ -1004,6 +1108,9 @@ fn main() {
         }
         if unknown_wallet {
             why.push("resp:unknown-wallet".into());
+        }
+        if let Some(c) = uw_class {
+            why.push(c.into());
         }
         if let Some(ex) = resp_bad {
             let cls = if ex.contains("Post only") {
@@ -1098,6 +1205,14 @@ fn main() {
         }
     }
     println!("blocks N={n} heights {first_seen}..={last_seen}  reproduced k={k}");
+    if let Some(r) = &wallet_rule {
+        println!(
+            "unknown-wallet rule (actions the comparison reached): both absent {uw_both}, native absent only {uw_missed}, ours absent only {uw_false}; L1 signatures not recovered {}; agents added {}; set now {}",
+            r.not_recovered,
+            r.agents_added,
+            r.set.len()
+        );
+    }
     // The engine's own score: blocks whose every action and native diff is on
     // a book the seed holds (and, second, with no action the engine skips).
     let held = |v: &str| !v.contains("unseeded-book") && !v.contains("diffs:unmodelled-coin");
