@@ -292,7 +292,7 @@ fn run(args: &Args) -> std::io::Result<()> {
         Err(e) => (Err(e), 0),
     };
     eprintln!(
-        "{{\"lines\":{},\"written\":{},\"ring_dropped\":{},\"bad_lines\":{},\"oversized_lines\":{},\"scan_fallbacks\":{},\"height_breaks\":{},\"rotations\":{},\"post_rotation_lines\":{},\"rescans\":{},\"reads\":{},\"stop_signal\":{}}}",
+        "{{\"lines\":{},\"written\":{},\"ring_dropped\":{},\"bad_lines\":{},\"oversized_lines\":{},\"scan_fallbacks\":{},\"height_breaks\":{},\"height_repeats\":{},\"height_gaps\":{},\"height_backwards\":{},\"rotations\":{},\"post_rotation_lines\":{},\"rescans\":{},\"reads\":{},\"stop_signal\":{}}}",
         s.lines,
         written.as_ref().map_or(0, |w| *w),
         dropped,
@@ -300,6 +300,9 @@ fn run(args: &Args) -> std::io::Result<()> {
         s.oversized_lines,
         s.scan_fallbacks,
         s.height_breaks,
+        s.height_repeats,
+        s.height_gaps,
+        s.height_backwards,
         s.rotations,
         s.post_rotation_lines,
         // The reader's one walk at start plus the scout's.

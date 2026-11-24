@@ -167,8 +167,20 @@ impl<S: ObservationSink + ?Sized> LineSink for Parser<'_, S> {
         };
         self.stats.lines += 1;
         let height = obs.block_number;
-        if let Some(prev) = *self.last_height {
-            if height != prev.checked_add(1) {
+        if let (Some(prev), Some(now)) = (*self.last_height, height) {
+            // The definitions `hl-strict-pass` uses. Three compares on
+            // values already in registers; nothing else on this path.
+            let kind = if now == prev {
+                Some(&mut self.stats.height_repeats)
+            } else if now < prev {
+                Some(&mut self.stats.height_backwards)
+            } else if prev.checked_add(1) != Some(now) {
+                Some(&mut self.stats.height_gaps)
+            } else {
+                None
+            };
+            if let Some(counter) = kind {
+                *counter += 1;
                 self.stats.height_breaks += 1;
             }
         }
