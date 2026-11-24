@@ -7,7 +7,7 @@
 //! ```text
 //! cargo run --release -p hl-exec --example replay -- \
 //!   --meta DIR --seed l4.json --replica replica.jsonl --diffs diffs.jsonl \
-//!   [--statuses statuses.jsonl] [--max N] [--show K]
+//!   [--statuses statuses.jsonl] [--max N] [--show K] [--heights-out FILE]
 //! ```
 //!
 //! `--meta DIR` holds `meta.json`, `spotMeta.json`, `perpDexs.json` and
@@ -214,6 +214,11 @@ fn decode_leg(meta: &Meta, o: &Value, priority: u64) -> (OrderReq, bool) {
     let notional = u128::from(req.px.0) * u128::from(req.sz.0);
     let ten = 10u128 * 10u128.pow(info.px_dec + info.sz_dec);
     let unsupported = req.pre_reject.is_none() && notional < ten;
+    if unsupported {
+        // Hand the leg to the engine as unmodelled: it answers `Unsupported`
+        // but still takes the oid native spends on it.
+        req.tif = Tif::Other;
+    }
     (req, unsupported)
 }
 
@@ -319,8 +324,9 @@ fn decode_block(meta: &Meta, line: &str) -> Block {
                     }
                     let mut legs = Vec::new();
                     for o in a["orders"].as_array().into_iter().flatten() {
-                        let (leg, uns) = decode_leg(meta, o, prio);
-                        unsupported |= uns || leg.reduce_only || leg.tif == Tif::Other;
+                        // An unmodelled leg goes to the engine, which answers
+                        // it `Unsupported` and takes its oid (native does).
+                        let (leg, _uns) = decode_leg(meta, o, prio);
                         b.assets.push(leg.asset);
                         legs.push(leg);
                     }
@@ -357,8 +363,7 @@ fn decode_block(meta: &Meta, line: &str) -> Block {
                             }
                             x => OrderRef::Oid(Oid(x.as_u64().unwrap_or(0))),
                         };
-                        let (leg, uns) = decode_leg(meta, &m["order"], 0);
-                        unsupported |= uns || leg.reduce_only || leg.tif == Tif::Other;
+                        let (leg, _uns) = decode_leg(meta, &m["order"], 0);
                         b.assets.push(leg.asset);
                         ms.push(ModifyReq { target, order: leg });
                     }
@@ -753,6 +758,7 @@ fn main() {
         }
     }
     let mut k = 0usize;
+    let mut reproduced: Vec<u64> = Vec::new();
     let mut classes: BTreeMap<String, usize> = BTreeMap::new();
     let mut examples: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut times_ns: Vec<u64> = Vec::new();
@@ -805,6 +811,11 @@ fn main() {
         for i in 0..b.acts.len() {
             let expired = out.responses[i].expired;
             if b.acts[i].0 == 4 && !expired {
+                continue;
+            }
+            // A leg the engine answered `Unsupported` already keeps the block
+            // out of k; compare the next action instead.
+            if out.statuses_of(i).contains(&OrderStatus::Unsupported) {
                 continue;
             }
             // An action on a book the seed lacks cannot match (the block is
@@ -899,6 +910,7 @@ fn main() {
         }
         if why.is_empty() {
             k += 1;
+            reproduced.push(b.height);
             counted_ns.push(ns);
         } else {
             for w in &why {
@@ -913,6 +925,16 @@ fn main() {
         }
     }
     println!("blocks N={n} heights {first_seen}..={last_seen}  reproduced k={k}");
+    if let Some(p) = arg("--heights-out") {
+        let body = reproduced
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&p, body).unwrap();
+        println!("reproduced heights written to {p}");
+    }
     println!("non-reproduced blocks by class (a block can be in several):");
     let mut cl: Vec<_> = classes.into_iter().collect();
     cl.sort_by_key(|c| std::cmp::Reverse(c.1));

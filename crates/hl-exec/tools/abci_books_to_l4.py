@@ -22,9 +22,15 @@ Every level walk is checked: it must end at `l`, visit exactly `s.n` live
 orders whose remaining sizes sum to `s.s`, all on the half's side and at the
 level's price. Any failure aborts (no silent repair).
 
-Usage: abci_books_to_l4.py BOOKS_JSON META_DIR HEIGHT NEXT_OID OUT_JSON
+Spot books carry `asset` = the spotMeta universe index (observed: 0, 1, 2, ...
+in `spot_books[]`), and are named by their spotMeta name, which the replay maps
+to asset 10000 + index.
+
+Usage: abci_books_to_l4.py BOOKS_JSON[,MORE_JSON...] META_DIR HEIGHT NEXT_OID OUT_JSON
+(each input may be gzipped; e.g. the perp cut and the separate spot cut)
 """
 
+import gzip
 import json
 import sys
 
@@ -127,7 +133,8 @@ def iter_books(path):
     """Yield (section, book_json) from the pretty-printed fragment."""
     section = None
     buf = None
-    with open(path) as f:
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt") as f:
         for line in f:
             if line.startswith('    "perp_dexs": ['):
                 section = "perp"
@@ -162,12 +169,19 @@ def iter_books(path):
 def main():
     src, meta_dir, height, next_oid, dst = sys.argv[1:6]
     names, spot_names = load_names(meta_dir)
-    spot_by_internal = {10000 + k: v for k, v in spot_names.items()}
-    stats = {"books": 0, "levels": 0, "orders": 0, "reduce_only": 0, "spot_books": 0}
+    stats = {"books": 0, "levels": 0, "orders": 0, "reduce_only": 0, "spot_books": 0,
+             "spot_unlisted_books": 0, "spot_unlisted_orders": 0}
     books = []
     seen = set()
-    for section, book in iter_books(src):
-        table = names if section == "perp" else spot_by_internal
+    for section, book in (b for path in src.split(",") for b in iter_books(path)):
+        table = names if section == "perp" else spot_names
+        if section == "spot" and book["asset"] not in table:
+            # spotMeta lists only some native spot indices; a book without a
+            # name cannot be addressed by the replay. Count it, never drop it
+            # silently.
+            stats["spot_unlisted_books"] += 1
+            stats["spot_unlisted_orders"] += sum(1 for e in book["bod"]["e"] if "o" in e)
+            continue
         cb = walk_book(book, table, stats)
         if cb[0] in seen:
             raise SystemExit(f"duplicate book {cb[0]}")
