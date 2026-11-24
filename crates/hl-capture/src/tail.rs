@@ -99,8 +99,19 @@ pub struct TailStats {
     /// Lines `hl_latency::scan_node_header` refused that the strict
     /// `hl_latency::parse_node_line` then accepted (included in `lines`).
     pub scan_fallbacks: u64,
-    /// Observations whose `block_number` is not the previous one plus one.
+    /// Observations whose `block_number` is not the previous one plus one:
+    /// the sum of the three counters below.
     pub height_breaks: u64,
+    /// Observations with the same `block_number` as the one before. With
+    /// `--stream-with-block-info` the node is thought to write several lines
+    /// per block, which would make these normal (inferred from the node's
+    /// README, not confirmed on real output).
+    pub height_repeats: u64,
+    /// Observations whose `block_number` is more than one above the one
+    /// before.
+    pub height_gaps: u64,
+    /// Observations whose `block_number` is below the one before.
+    pub height_backwards: u64,
     /// Observations read by the poll that switched to a file (see
     /// [`Switch`]); their stamps can be late by the rescan interval.
     pub post_rotation_lines: u64,

@@ -197,3 +197,48 @@ fn height_breaks_count_block_numbers_that_do_not_follow_on() {
         "a gap, a repeat, a step back"
     );
 }
+
+/// Issue #40: a repeated height is not the same finding as a missing or an
+/// out-of-order one, so each kind has its own counter (the definitions
+/// `hl-strict-pass` uses) and `height_breaks` stays their sum.
+#[test]
+fn height_breaks_are_split_into_repeats_gaps_and_backward_steps() {
+    let t = tempfile::tempdir().unwrap();
+    let f = touch(t.path(), "20261119", "8");
+    let mut tail = NodeTailer::new(t.path());
+    poll(&mut tail);
+    let kinds = |tail: &NodeTailer| {
+        let s = tail.stats();
+        (
+            s.height_repeats,
+            s.height_gaps,
+            s.height_backwards,
+            s.height_breaks,
+        )
+    };
+    // Several lines of one block, then the next block: repeats only.
+    for h in [5, 5, 5, 6, 6, 7] {
+        append(&f, &node_line(h));
+    }
+    poll(&mut tail);
+    assert_eq!(kinds(&tail), (3, 0, 0, 3));
+    // A gap of one block and a gap of many.
+    for h in [9, 100] {
+        append(&f, &node_line(h));
+    }
+    poll(&mut tail);
+    assert_eq!(kinds(&tail), (3, 2, 0, 5));
+    // A step back, by one and by many; the step forward after it is a gap.
+    for h in [99, 4, 5, 50] {
+        append(&f, &node_line(h));
+    }
+    poll(&mut tail);
+    assert_eq!(kinds(&tail), (3, 3, 2, 8));
+    // Carried across a rotation: the first line of the next file repeats.
+    let g = touch(t.path(), "20261119", "9");
+    append(&g, &node_line(50));
+    append(&g, &node_line(51));
+    tail.request_rescan();
+    poll(&mut tail);
+    assert_eq!(kinds(&tail), (4, 3, 2, 9));
+}
