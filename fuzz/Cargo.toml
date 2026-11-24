@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 hl-latency = { path = "../crates/hl-latency" }
+hl-capture = { path = "../crates/hl-capture" }
 serde = "1"
 serde_json = "1"
 
@@ -20,6 +21,13 @@ path = "src/lib.rs"
 [[bin]]
 name = "hl_latency_parsers"
 path = "fuzz_targets/hl_latency_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hl_capture_inputs"
+path = "fuzz_targets/hl_capture_inputs.rs"
 test = false
 doc = false
 bench = false
