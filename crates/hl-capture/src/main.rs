@@ -11,7 +11,10 @@
 //! microseconds (default 100: pin the probe to its own core) and stops after
 //! `--duration-s` seconds (default: never; the last sleep is cut short so the
 //! run ends on time). Lines longer than `--max-line-bytes` (default 1 MiB)
-//! are dropped and counted. Counters go to stderr at exit.
+//! are dropped and counted. After its first poll it writes `{"ready":true}`
+//! to stderr: a file that appears from then on is read from its start (one
+//! already there at the first poll is history and is read from its end).
+//! Counters go to stderr at exit.
 //! Exit codes: 0 ok, 1 I/O error, 2 usage.
 //!
 //! The public `WebSocket` arm (`hl_capture::WsFilter`) gets its socket
@@ -79,9 +82,15 @@ fn run(args: &Args) -> std::io::Result<()> {
     );
     let mut tail = NodeTailer::with_max_line(&args.root, args.max_line);
     let mut clock = realtime_ns;
+    let mut ready = false;
     let deadline = args.duration.and_then(|d| Instant::now().checked_add(d));
     while deadline.is_none_or(|d| Instant::now() < d) {
         let obs = tail.poll(&mut clock)?;
+        if !ready {
+            // Callers wait for this before creating files they expect read.
+            eprintln!("{{\"ready\":true}}");
+            ready = true;
+        }
         // Serialise after stamping; flush per batch so a crash loses little.
         for o in &obs {
             serde_json::to_writer(&mut out, o)?;
