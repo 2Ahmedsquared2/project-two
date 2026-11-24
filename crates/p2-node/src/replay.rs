@@ -124,6 +124,15 @@ pub enum ReplayError {
         /// Snapshot height.
         snapshot: u64,
     },
+    /// F1 / CI/CD #2: the line carries its own height and it is not the
+    /// height it would be replayed as (the CLI numbers lines by position).
+    #[error("block replayed as height {height} carries height {decoded}")]
+    DecodedHeight {
+        /// Height it would be replayed as.
+        height: u64,
+        /// Height the line carries.
+        decoded: u64,
+    },
     /// F2: no native diffs for this height. Absent is not empty: the block can
     /// be neither compared nor resynced, so the run stops before it. Replay a
     /// range that ends at the last height with native diffs.
@@ -148,11 +157,40 @@ pub fn validate(blocks: &[ReplayBlock], snapshot: u64) -> Result<(), ReplayError
                 snapshot,
             });
         }
+        if let Some(decoded) = b.block.height {
+            if decoded != b.height {
+                return Err(ReplayError::DecodedHeight {
+                    height: b.height,
+                    decoded,
+                });
+            }
+        }
         if b.native_diffs.is_none() {
             return Err(ReplayError::NoNativeDiffs { height: b.height });
         }
     }
     Ok(())
+}
+
+/// The one verdict label every report prints (lead planner's rule A, Proof
+/// config `end_heal_E2`). A per-block k/N proves only that outputs matched;
+/// a passing end check at height H adds that the final books agree there. It
+/// never proves the books agreed after every block (a wrong resting order can
+/// be cancelled before H; diffs carry no TIF, trigger flag or cloid), so no
+/// path prints "state identical".
+#[must_use]
+pub fn verdict_label(k: u64, n: u64, end_state: Option<(bool, u64)>) -> String {
+    match end_state {
+        None => format!("per-block outputs matched {k}/{n}; end-state check not run"),
+        Some((true, h)) => {
+            format!("per-block outputs matched {k}/{n}; end state equals native's at height {h}")
+        }
+        Some((false, h)) => {
+            format!(
+                "per-block outputs matched {k}/{n}; end state DIFFERS from native's at height {h}"
+            )
+        }
+    }
 }
 
 /// Why a block was not reproduced. A block counts once, under its first cause.
@@ -320,10 +358,13 @@ impl Replay {
         {
             self.blocks_with_unsupported += 1;
         }
-        self.actions += u64::try_from(b.native_responses.len()).unwrap_or(u64::MAX);
+        let n_actions = b.native_responses.len();
+        self.actions += u64::try_from(n_actions).unwrap_or(u64::MAX);
+        // CI/CD #8: results past the block's action count are not actions.
         self.actions_executed += u64::try_from(
             out.results
                 .iter()
+                .take(n_actions)
                 .filter(|x| matches!(x, ActionResult::Response(_)))
                 .count(),
         )
@@ -348,11 +389,8 @@ impl Replay {
     #[must_use]
     pub fn to_text(&self) -> String {
         let mut s = String::new();
-        let verdict = match self.end_state {
-            Some(true) if self.reproduced == self.blocks => "state identical",
-            _ => "per-block outputs matched",
-        };
-        let _ = writeln!(s, "{verdict} {}/{}", self.reproduced, self.blocks);
+        let end = self.end_state.map(|ok| (ok, self.last_height.unwrap_or(0)));
+        let _ = writeln!(s, "{}", verdict_label(self.reproduced, self.blocks, end));
         let _ = writeln!(
             s,
             "snapshot {}, heights {}..={}",

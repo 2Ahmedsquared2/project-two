@@ -116,7 +116,7 @@ fn passes_time_only_reproduced_blocks_and_exclude_warmup() {
         assert!(p.exec_ns[0] >= 200_000);
         assert!(p.parse_exec_ns[0] >= p.exec_ns[0]);
     }
-    assert_eq!(r.state_identical, (2, 3));
+    assert_eq!(r.outputs_matched, (2, 3));
     let s = r.summary();
     assert_eq!(s.samples, 5);
     assert!(s.exec.p50 >= 200_000);
@@ -178,9 +178,11 @@ fn state_identical_reports_worst_pass() {
         &cfg,
     )
     .unwrap();
-    assert_eq!(r.state_identical, (3, 3));
+    assert_eq!(r.outputs_matched, (3, 3));
     let t = r.summary().to_text();
-    assert!(t.contains("state identical 3/3"), "{t}");
+    // CI/CD #4 / planner A: no end-state evidence here, so never "state identical".
+    assert!(t.contains("per-block outputs matched 3/3"), "{t}");
+    assert!(!t.contains("state identical"), "{t}");
     assert!(t.contains("median"), "{t}");
     assert!(t.contains("worst"), "{t}");
 }
@@ -249,4 +251,30 @@ fn f1_f2_apply_to_timed_passes() {
         &cfg
     )
     .is_err());
+}
+
+/// CI/CD #3: the timed line must be the compared block in full, not only its
+/// time and round: a changed order price is refused.
+#[test]
+fn timed_line_with_changed_action_is_refused() {
+    let (mut lines, blocks) = input();
+    let i = lines
+        .iter()
+        .position(|l| l.contains("\"p\":\"0.038385\""))
+        .unwrap();
+    lines[i] = lines[i].replacen("\"p\":\"0.038385\"", "\"p\":\"0.038386\"", 1);
+    let cfg = TimingConfig {
+        passes: 5,
+        prewarm_passes: 0,
+        window_blocks: 0,
+    };
+    let e = run_passes(
+        &mut factory(&blocks, Duration::ZERO, None),
+        &lines,
+        &blocks,
+        999,
+        &cfg,
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("not the block compared"), "{e}");
 }

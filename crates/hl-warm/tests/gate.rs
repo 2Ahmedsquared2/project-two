@@ -142,3 +142,22 @@ fn failing_a_passed_step_after_arming_keeps_it_closed() {
     assert_eq!(g.on_event(5), Phase::Warmup);
     assert!(!g.is_open());
 }
+
+/// CI/CD #7: more than 64 required steps must fail closed, never drop the
+/// extra steps and open with step 65 still pending.
+#[test]
+fn more_than_64_steps_fails_closed() {
+    let names: Vec<&'static str> = (0..65)
+        .map(|i| &*Box::leak(format!("s{i}").into_boxed_str()))
+        .collect();
+    let mut g = gate(&names, 0, 0);
+    for n in &names[..64] {
+        let _ = g.pass(n, 0);
+    }
+    assert_eq!(g.on_event(1), Phase::Warmup);
+    assert!(!g.is_open());
+    assert!(g.pass("s64", 1).is_err());
+    assert_eq!(g.on_event(2), Phase::Warmup);
+    assert!(!g.is_open());
+    assert!(g.report().contains("more than 64"), "{}", g.report());
+}

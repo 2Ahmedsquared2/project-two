@@ -50,7 +50,7 @@ pub enum TimingError {
     #[error(transparent)]
     Input(#[from] ReplayError),
     /// F1: the raw line executed is not the block compared against.
-    #[error("line {index}: block time {line_ns} ns is not the block compared (height {height}, block time {block_ns} ns)")]
+    #[error("line {index}: decoded line (block time {line_ns} ns) is not the block compared (height {height}, block time {block_ns} ns)")]
     Mismatch {
         /// Index.
         index: usize,
@@ -105,8 +105,10 @@ pub struct Pass {
 pub struct Timed {
     /// Passes in run order.
     pub passes: Vec<Pass>,
-    /// (min over passes of blocks reproduced, blocks).
-    pub state_identical: (u64, u64),
+    /// (min over passes of blocks whose outputs matched, blocks). Per-block
+    /// outputs only: never a "state identical" claim (see
+    /// [`crate::replay::verdict_label`]).
+    pub outputs_matched: (u64, u64),
 }
 
 fn ns(t: Instant) -> u64 {
@@ -148,7 +150,7 @@ pub fn run_passes<E: Engine>(
     let min = passes.iter().map(|p| p.reproduced).min().unwrap_or(0);
     Ok(Timed {
         passes,
-        state_identical: (min, u64::try_from(blocks.len()).unwrap_or(u64::MAX)),
+        outputs_matched: (min, u64::try_from(blocks.len()).unwrap_or(u64::MAX)),
     })
 }
 
@@ -173,7 +175,17 @@ fn one_pass<E: Engine>(
         let t_parse = Instant::now();
         let block =
             hl_block::decode_block(line).map_err(|e| TimingError::Decode(i + 1, e.to_string()))?;
-        if block.time_ns != rb.block().time_ns || block.round != rb.block().round {
+        let acts: Vec<UserAction<'_>> = block.actions().map(UserAction::from_signed).collect();
+        let t_exec = Instant::now();
+        let out = engine.execute_block(block.time_ns, &acts);
+        let exec_ns = ns(t_exec);
+        let parse_exec_ns = ns(t_parse);
+        drop(acts);
+        // F1 / CI/CD #3: the executed line must be the compared block in full
+        // (every action, nonce, signer and native response), checked after
+        // the timers stop so the check is not in the timed span; a mismatch
+        // aborts the pass, so its time is never recorded.
+        if &block != rb.block() {
             return Err(TimingError::Mismatch {
                 index: i,
                 height: rb.height(),
@@ -181,12 +193,6 @@ fn one_pass<E: Engine>(
                 block_ns: rb.block().time_ns,
             });
         }
-        let acts: Vec<UserAction<'_>> = block.actions().map(UserAction::from_signed).collect();
-        let t_exec = Instant::now();
-        let out = engine.execute_block(block.time_ns, &acts);
-        let exec_ns = ns(t_exec);
-        let parse_exec_ns = ns(t_parse);
-        drop(acts);
         let phase = gate.on_event(0);
         let before = pass.replay.reproduced;
         pass.replay.record(rb, &out, &mut engine);
@@ -271,8 +277,8 @@ pub struct Summary {
     pub exec: Column,
     /// Decode + `execute_block`.
     pub parse_exec: Column,
-    /// (blocks reproduced in the worst pass, blocks).
-    pub state_identical: (u64, u64),
+    /// (blocks whose outputs matched in the worst pass, blocks).
+    pub outputs_matched: (u64, u64),
 }
 
 impl Timed {
@@ -288,7 +294,7 @@ impl Timed {
             passes: u64::try_from(self.passes.len()).unwrap_or(0),
             exec: column(&self.passes, |p| &p.exec_ns),
             parse_exec: column(&self.passes, |p| &p.parse_exec_ns),
-            state_identical: self.state_identical,
+            outputs_matched: self.outputs_matched,
         }
     }
 
@@ -352,8 +358,8 @@ impl Summary {
         row(&mut s, "mean", self.exec.mean, self.parse_exec.mean);
         let _ = writeln!(
             s,
-            "state identical {}/{}",
-            self.state_identical.0, self.state_identical.1
+            "{}",
+            crate::replay::verdict_label(self.outputs_matched.0, self.outputs_matched.1, None)
         );
         s
     }

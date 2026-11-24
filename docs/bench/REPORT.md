@@ -11,7 +11,7 @@ blocks" cannot be filled in yet:
 | row | our engine | native |
 |---|---|---|
 | median / p90 / p99 / worst / mean | not measured: the `hl-exec` adapter is not wired (lane 1's engine is on an unmerged branch) and no seed book at height 1232430000 has been loaded | see "Native timing" below (catch-up, not at tip) |
-| state identical k/N | not measured | n/a |
+| per-block outputs matched k/N; end state at H | not measured | n/a |
 
 **No speed comparison with native is claimed.** Even when the adapter runs,
 the census below shows a book-only engine cannot reproduce most blocks, so a
@@ -75,8 +75,10 @@ processes per configuration, configuration order shuffled per round,
 | warm without arena | 28.7 µs | 22.3 µs | 31.0 µs | 0 |
 | warm without prewarm | 66.4 µs | 25.0 µs | 48.7 µs | 71-74 |
 
-Read: on this host, prewarm is the step that earns its place (first block
-about 2x faster, page faults in the window go from ~73 to 0). Pinning and the
+Read: these rows are the warm-vs-cold harness's raw output on one shared
+2-vCPU cloud box, not a speed claim (no Criterion bench backs a ratio; CI/CD
+review of PR #10). What they do show: removing prewarm brings the
+measured-window page faults back from 0 to ~73 per trial. Pinning and the
 pre-touched arena show no measurable effect on this 2-vCPU shared box; they
 stay in the sequence for the Tokyo host, where they are unmeasured. `mlockall`
 was not testable here (RLIMIT_MEMLOCK 8 MiB); on the bench host the run

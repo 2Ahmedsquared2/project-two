@@ -41,3 +41,12 @@ fn unknown_field_is_an_error() {
         .replacen("\"height\"", "\"x\":1,\"height\"", 1);
     assert!(parse_line(&l).is_err());
 }
+
+/// CI/CD #9: extreme exponents are rejected or truncated, never overflow.
+#[test]
+fn extreme_exponents_do_not_overflow() {
+    assert_eq!(parse_duration_ns("1e2147483647"), None);
+    assert_eq!(parse_duration_ns("1e-2147483648"), Some(0));
+    assert_eq!(parse_duration_ns("0.1e-2147483647"), Some(0));
+    assert_eq!(parse_duration_ns("1e20"), None);
+}

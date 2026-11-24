@@ -41,6 +41,8 @@ enum Mutation {
     DropDiff,
     Unsupported,
     ExtraResponse,
+    /// Three extra `Response` results (CI/CD #8: "actions executed 6/3").
+    ExtraOk,
 }
 
 impl Scripted {
@@ -79,6 +81,12 @@ impl Engine for Scripted {
                     }
                     Mutation::Unsupported => out.results[0] = ActionResult::Unsupported,
                     Mutation::ExtraResponse => out.results.push(ActionResult::Unsupported),
+                    Mutation::ExtraOk => {
+                        for _ in 0..3 {
+                            out.results
+                                .push(ActionResult::Response(serde_json::json!({"status":"ok"})));
+                        }
+                    }
                 }
             }
         }
@@ -263,4 +271,42 @@ fn report_text() {
 fn native_diff_fixture_parses_with_converter_schema() {
     let b = parse_batch::<BookDiff>(DIFFS.lines().next().unwrap()).unwrap();
     assert_eq!(b.block_number, 1000);
+}
+
+/// CI/CD #2: a block whose decoded height differs from the height it is
+/// replayed as is refused, even when its block time lines up.
+#[test]
+fn decoded_height_must_equal_replayed_height() {
+    let diffs = load_native_diffs(DIFFS.as_bytes()).unwrap();
+    let blocks: Vec<ReplayBlock> = BLOCKS
+        .lines()
+        .enumerate()
+        .map(|(i, l)| {
+            let h = 1000 + u64::try_from(i).unwrap();
+            let mut b = decode_block(l).unwrap();
+            b.height = Some(77);
+            ReplayBlock::new(h, b, diffs.get(&h).cloned()).unwrap()
+        })
+        .collect();
+    let mut e = Scripted::new(&blocks, None);
+    let err = Replay::run(&mut e, &blocks, 999).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ReplayError::DecodedHeight {
+                height: 1000,
+                decoded: 77
+            }
+        ),
+        "{err}"
+    );
+}
+
+/// CI/CD #8: extra engine results never count as executed actions.
+#[test]
+fn extra_results_never_exceed_actions() {
+    let blocks = input();
+    let mut e = Scripted::new(&blocks, Some((1, Mutation::ExtraOk)));
+    let r = Replay::run(&mut e, &blocks, 999).unwrap();
+    assert!(r.actions_executed <= r.actions, "{}", r.to_text());
 }

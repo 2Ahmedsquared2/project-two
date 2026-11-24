@@ -54,7 +54,16 @@ pub fn parse_time_ns(s: &str) -> Result<u64, TimeError> {
         return Err(TimeError);
     }
     let days = days_from_civil(y, mo, d);
-    Ok(((days * 24 + h) * 60 + mi) * 60_000_000_000 + sec * 1_000_000_000 + frac)
+    // Checked: u64 ns since 1970 ends in 2554, so later years are an error,
+    // not an overflow (CI/CD #9).
+    days.checked_mul(24)
+        .and_then(|x| x.checked_add(h))
+        .and_then(|x| x.checked_mul(60))
+        .and_then(|x| x.checked_add(mi))
+        .and_then(|x| x.checked_mul(60_000_000_000))
+        .and_then(|x| x.checked_add(sec * 1_000_000_000))
+        .and_then(|x| x.checked_add(frac))
+        .ok_or(TimeError)
 }
 
 fn is_leap(y: u64) -> bool {

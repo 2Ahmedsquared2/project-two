@@ -79,7 +79,10 @@ pub fn parse_duration_ns(s: &str) -> Option<u64> {
     // digits * 10^(exp - frac_len) seconds = digits * 10^(9 + exp - frac_len) ns
     let digits = format!("{int}{frac}");
     let digits = digits.trim_start_matches('0');
-    let shift = 9 + exp - i32::try_from(frac.len()).ok()?;
+    // Checked: an exponent near i32::MAX must be rejected, not overflow (CI/CD #9).
+    let shift = exp
+        .checked_add(9)?
+        .checked_sub(i32::try_from(frac.len()).ok()?)?;
     if digits.is_empty() {
         return Some(0);
     }
@@ -87,7 +90,7 @@ pub fn parse_duration_ns(s: &str) -> Option<u64> {
         let v: u64 = digits.parse().ok()?;
         v.checked_mul(10u64.checked_pow(u32::try_from(shift).ok()?)?)
     } else {
-        let cut = usize::try_from(-shift).ok()?;
+        let cut = usize::try_from(shift.checked_neg()?).ok()?;
         if cut >= digits.len() {
             return Some(0);
         }

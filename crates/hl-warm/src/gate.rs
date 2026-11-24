@@ -175,16 +175,25 @@ impl WarmGate {
     #[must_use]
     pub fn new(cfg: GateConfig) -> Self {
         let n = cfg.steps.len();
-        let core = GateCore::new(
-            u32::try_from(n).unwrap_or(64),
+        let mut core = GateCore::new(
+            u32::try_from(n.min(64)).unwrap_or(64),
             cfg.min_window_ns,
             cfg.min_window_events,
         );
+        let mut notes = vec![None; n];
+        if n > 64 {
+            // Fail closed: GateCore tracks 64 steps; dropping the rest would
+            // open the gate with required steps still pending.
+            core.fail(0);
+            notes[0] = Some(format!(
+                "gate configured with {n} steps, more than 64 supported: never opens"
+            ));
+        }
         Self {
             names: cfg.steps,
             core,
             passed_at: vec![0; n],
-            notes: vec![None; n],
+            notes,
         }
     }
 
@@ -198,6 +207,9 @@ impl WarmGate {
     /// Marks `step` passed at `now_ns`. Arms the window when it is the last.
     pub fn pass(&mut self, step: &str, now_ns: u64) -> Result<(), GateError> {
         let i = self.idx(step)?;
+        if i >= 64 {
+            return Err(GateError::UnknownStep(step.to_owned()));
+        }
         let ci = u32::try_from(i).map_err(|_| GateError::UnknownStep(step.to_owned()))?;
         self.core
             .pass(ci, now_ns)

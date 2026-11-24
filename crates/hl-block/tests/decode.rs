@@ -200,3 +200,15 @@ fn real_schema_still_rejects_unknown_fields() {
         serde_json::json!(true);
     assert!(decode_block(&v.to_string()).is_err());
 }
+
+/// CI/CD #9: a year past u64 ns range is an error, not an overflow panic.
+#[test]
+fn far_future_time_is_an_error() {
+    assert!(parse_time_ns("9999-12-31T23:59:59.999999999").is_err());
+    // u64::MAX ns after 1970 is 2554-07-21T23:34:33.709551615.
+    assert_eq!(
+        parse_time_ns("2554-07-21T23:34:33.709551615").unwrap(),
+        u64::MAX
+    );
+    assert!(parse_time_ns("2554-07-21T23:34:33.709551616").is_err());
+}

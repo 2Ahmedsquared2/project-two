@@ -229,15 +229,21 @@ fn replay(a: &Args) -> ExitCode {
     let _ = writeln!(report, "engine {engine}  blocks {}  passes {passes}  prewarm {prewarm}  window {window}  core {core:?}", blocks.len());
     report.push_str(&first_pass.to_text());
     report.push_str(&timed.summary().to_text());
-    let like_for_like = timed.state_identical.0 == timed.state_identical.1
+    // Like-for-like also needs the end-state check, which this CLI does not
+    // run yet: until it does, every speed row stays "not like-for-like".
+    let end_state_checked = first_pass.end_state == Some(true);
+    let like_for_like = end_state_checked
+        && timed.outputs_matched.0 == timed.outputs_matched.1
         && first_pass.actions_executed == first_pass.actions
         && engine != "echo"
         && engine != "null";
     if !like_for_like {
         let _ = writeln!(
             report,
-            "NOT a like-for-like speed claim: engine {engine}, state identical {}/{}, actions executed {}/{}",
-            timed.state_identical.0, timed.state_identical.1, first_pass.actions_executed, first_pass.actions
+            "NOT a like-for-like speed claim: engine {engine}, {}, actions executed {}/{}",
+            p2_node::replay::verdict_label(timed.outputs_matched.0, timed.outputs_matched.1, None),
+            first_pass.actions_executed,
+            first_pass.actions
         );
     }
     print!("{report}");
