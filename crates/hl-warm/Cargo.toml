@@ -1,0 +1,31 @@
+[package]
+name = "hl-warm"
+description = "Warm-up sequence and WarmGate: nothing is served or measured before every warm-up step passed and a warm-up window elapsed."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+hdrhistogram = { version = "7.5", default-features = false }
+memmap2 = "0.9"
+
+# Pinning, mlockall and per-thread getrusage are Linux-only; on other systems
+# those steps report "unsupported on this OS" (src/sys.rs).
+[target.'cfg(target_os = "linux")'.dependencies]
+core_affinity = "0.8"
+nix = { version = "0.30", features = ["resource"] }
+rustix = { version = "1", features = ["mm"] }
+
+[dev-dependencies]
+hl-alloc-gate = { path = "../hl-alloc-gate" }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+nix = { version = "0.30", features = ["resource"] }
+
+[lints]
+workspace = true

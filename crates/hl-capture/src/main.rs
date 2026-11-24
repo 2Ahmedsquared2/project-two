@@ -34,7 +34,23 @@
 //! Reading stops after `--duration-s` seconds (default: never; a sleep is
 //! cut short so it ends on time) and `{"reader_stopped":true}` goes to
 //! stderr; the writer then writes what the ring still holds, so the process
-//! exits later by the time that backlog takes (nothing read is discarded). A newer hourly file is looked for every
+//! exits later by the time that backlog takes (nothing read is discarded).
+//!
+//! `SIGTERM` or `SIGINT` ends a run the same way as the deadline: the reader
+//! stops (at once in `busy-poll` and default `poll`; within 100 ms when it
+//! sleeps longer, since every wait is capped at that), the writer writes
+//! what the ring holds, the counters are printed with `stop_signal` set to
+//! the signal's number, and the exit code is 0. Bytes the node wrote that
+//! the reader had not read yet are not captured. A second signal ends the
+//! process at once with status 128 + the signal number and no counters:
+//! that run is invalid; it is the way out when the writer cannot finish.
+//! `SIGKILL` and `SIGHUP` are not handled. A signal that arrives after the
+//! reader has already stopped at the `--duration-s` deadline, while the
+//! writer is still writing the ring, counts as the first one and changes
+//! nothing: the writer carries on, `stop_signal` stays `null`, and only a
+//! second signal ends the process.
+//!
+//! A newer hourly file is looked for every
 //! `--rescan-ms` milliseconds (default 1000) and, in `inotify` mode, as soon
 //! as a directory changes; never per poll. The look is a directory walk on
 //! the reader thread, which cannot read while it walks (measured 13 us with
@@ -42,7 +58,9 @@
 //! that lands during a walk is stamped that much late without any flag: keep
 //! the interval coarse and prune old date directories. While no file is
 //! followed yet there is nothing to read, so the look happens every 10 ms at
-//! most. What the switching
+//! most. When a newer file is found, the old one is read to its end once
+//! more before the switch, so a line appended to it during the look is not
+//! lost. What the switching
 //! poll reads from a new file may be stamped up to that much late, so it is
 //! reported on stderr as a `rotation` line and counted in
 //! `post_rotation_lines`. Lines longer than `--max-line-bytes` (default
@@ -61,13 +79,18 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use hl_capture::{ring, Detect, NodeTailer, Waiter};
+use hl_capture::{ring, Detect, NodeTailer, Stop, Waiter};
 
 const USAGE: &str = "usage: hl-capture node <dir> --out <obs.jsonl> [--detect busy-poll|poll|inotify] [--poll-us N] [--duration-s N] [--max-line-bytes N] [--ring-records N] [--rescan-ms N]";
 
 /// Longest gap between looks for a first file, while none is followed: with
 /// nothing to read, the walk costs no stamp accuracy.
 const RESCAN_NO_FILE: Duration = Duration::from_millis(10);
+
+/// Longest single wait of the reader, so a sleeping reader (a long
+/// `--poll-us`, or `inotify` with nothing written) notices a stop signal
+/// within this long. Costs an idle reader about ten empty reads a second.
+const STOP_CHECK: Duration = Duration::from_millis(100);
 
 /// How long the writer thread sleeps when the ring is empty.
 const WRITER_IDLE: Duration = Duration::from_millis(1);
@@ -143,6 +166,8 @@ fn announce(requested: Detect, live: Detect, fallback: Option<&str>) {
 }
 
 fn run(args: &Args) -> std::io::Result<()> {
+    // First, so a signal at any later point stops the run cleanly.
+    let stop = Stop::install()?;
     let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let (mut waiter, note) = Waiter::new(args.detect, args.poll, cpus);
     announce(args.detect, waiter.mode(), note.as_deref());
@@ -161,7 +186,9 @@ fn run(args: &Args) -> std::io::Result<()> {
     let deadline = args.duration.and_then(|d| next_rescan.checked_add(d));
     let read = loop {
         let now = Instant::now();
-        if deadline.is_some_and(|d| now >= d) {
+        // The stop flag is read here, after everything the previous
+        // iteration read was stamped and pushed: stopping loses no record.
+        if deadline.is_some_and(|d| now >= d) || stop.requested() {
             break Ok(());
         }
         if now >= next_rescan {
@@ -205,13 +232,22 @@ fn run(args: &Args) -> std::io::Result<()> {
             // More data waits: check the deadline, then read on at once.
             continue;
         }
-        // Never wait past the deadline or the next rescan.
+        // Never wait past the deadline or the next rescan, nor longer than
+        // a stop signal may go unnoticed.
         let until = deadline.map_or(next_rescan, |d| d.min(next_rescan));
+        let until = now.checked_add(STOP_CHECK).map_or(until, |s| s.min(until));
         if waiter.wait(until).rescan {
             tail.request_rescan();
         }
     };
     let dropped = sink.dropped();
+    let signal = stop.signal();
+    if let Some(n) = signal {
+        // Cold: once.
+        eprintln!(
+            "{{\"signal\":{n},\"note\":\"stopped reading; writing what the ring holds, then the counters. A second signal exits at once without them and makes this run invalid\"}}"
+        );
+    }
     // Cold: once. Reading ends here, on time; the writer still has whatever
     // the ring holds to write, and that takes as long as the backlog needs.
     eprintln!("{{\"reader_stopped\":true}}");
@@ -222,7 +258,7 @@ fn run(args: &Args) -> std::io::Result<()> {
         .unwrap_or_else(|_| Err(std::io::Error::other("writer thread panicked")));
     let s = tail.stats();
     eprintln!(
-        "{{\"lines\":{},\"written\":{},\"ring_dropped\":{},\"bad_lines\":{},\"oversized_lines\":{},\"scan_fallbacks\":{},\"height_breaks\":{},\"rotations\":{},\"post_rotation_lines\":{},\"rescans\":{},\"reads\":{}}}",
+        "{{\"lines\":{},\"written\":{},\"ring_dropped\":{},\"bad_lines\":{},\"oversized_lines\":{},\"scan_fallbacks\":{},\"height_breaks\":{},\"rotations\":{},\"post_rotation_lines\":{},\"rescans\":{},\"reads\":{},\"stop_signal\":{}}}",
         s.lines,
         written.as_ref().map_or(0, |w| *w),
         dropped,
@@ -233,7 +269,8 @@ fn run(args: &Args) -> std::io::Result<()> {
         s.rotations,
         s.post_rotation_lines,
         s.rescans,
-        s.reads
+        s.reads,
+        signal.map_or_else(|| "null".to_owned(), |n| n.to_string())
     );
     read?;
     written.map(drop)

@@ -1,0 +1,11 @@
+$ lsblk -o NAME,MODEL,SIZE,ROTA,SCHED,MOUNTPOINT
+NAME MODEL  SIZE ROTA SCHED       MOUNTPOINT
+vda         3.7G    1 mq-deadline /run/sc/os
+vdb           1G    1 mq-deadline /run/sc/base
+vdc         128G    1 mq-deadline /run/sc/layer
+vdd           1G    1 mq-deadline /run/sc/agent/0.2.716
+vde           1G    1 mq-deadline 
+vdf           1G    1 mq-deadline 
+vdg           1G    1 mq-deadline 
+vdh           1G    1 mq-deadline 
+exit=0

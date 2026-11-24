@@ -1,0 +1,2 @@
+blocks 2000, heights 1232430001..=1232432000, contiguous yes
+apply_duration ns: median 13115163 p90 29413726 p99 53011721 max 109364275 mean 15067432

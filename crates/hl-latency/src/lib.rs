@@ -32,6 +32,9 @@ use serde::de::DeserializeSeed as _;
 use serde::{Deserialize, Serialize};
 
 mod strict;
+mod strict_drop;
+
+pub use strict_drop::{StrictDrop, StrictFailures, StrictReadError};
 
 /// Where an arrival was observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -222,3 +222,69 @@ impl Ledger {
         }
     }
 }
+
+/// Addresses native knows as a user or a registered agent. A signed action whose
+/// recovered signer is not here gets native's "User or API Wallet 0x… does not
+/// exist." Seed it from the snapshot (perp and spot users, `agent_tracker`,
+/// sub-accounts) and [`Signers::add`] each agent approved and each user created
+/// after the seed height.
+#[derive(Debug, Default)]
+pub struct Signers {
+    known: std::collections::HashSet<[u8; 20]>,
+}
+
+fn parse_addr(s: &str) -> Result<[u8; 20], String> {
+    let hex = s.trim();
+    let hex = hex
+        .strip_prefix("0x")
+        .or_else(|| hex.strip_prefix("0X"))
+        .unwrap_or(hex);
+    if hex.len() != 40 {
+        return Err(format!("not a 20-byte address: {s:?}"));
+    }
+    let mut out = [0u8; 20];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte =
+            u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|e| format!("{s:?}: {e}"))?;
+    }
+    Ok(out)
+}
+
+impl Signers {
+    /// Parses one address per line; `#` lines and blank lines are skipped.
+    pub fn from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Result<Self, String> {
+        let mut s = Self::default();
+        for line in lines {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            s.known.insert(parse_addr(t)?);
+        }
+        Ok(s)
+    }
+
+    /// Registers an address (an approved agent or a new user).
+    pub fn add(&mut self, addr: &str) -> Result<(), String> {
+        self.known.insert(parse_addr(addr)?);
+        Ok(())
+    }
+
+    /// Whether `addr` exists. A malformed address does not.
+    #[must_use]
+    pub fn exists(&self, addr: &str) -> bool {
+        parse_addr(addr).is_ok_and(|a| self.known.contains(&a))
+    }
+
+    /// Number of known addresses.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.known.len()
+    }
+
+    /// Whether no address is known.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.known.is_empty()
+    }
+}

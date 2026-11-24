@@ -261,8 +261,11 @@ impl NodeTailer {
     ///
     /// The directory is walked for a newer file only when a rescan is due
     /// (the first poll, and after each [`Self::request_rescan`]) and the
-    /// current file has been read to its end, so the old file is always
-    /// drained before a switch. Every other poll is `read` calls on the open
+    /// current file has been read to its end. When the walk finds a newer
+    /// file, the old one is read to its end once more before the switch, so
+    /// what the node appended to it up to the moment the new file was seen
+    /// is kept. (What it appends to the old file after that is not read:
+    /// the node is taken to finish a file before it starts the next.) Every other poll is `read` calls on the open
     /// file and nothing else: it does not allocate, lines being parsed in
     /// place from the read buffer or the splitter's reserved buffer.
     pub fn poll_into<S: ObservationSink + ?Sized>(
@@ -270,6 +273,28 @@ impl NodeTailer {
         clock: &mut dyn FnMut() -> u64,
         sink: &mut S,
     ) -> std::io::Result<()> {
+        self.poll_into_with(clock, sink, newest_hourly_file)
+    }
+
+    /// [`Self::poll_into`] with the look for the newest hourly file under
+    /// the root supplied by the caller. `find` is called at most once, and
+    /// only by a poll that rescans; [`Self::poll_into`] passes
+    /// [`newest_hourly_file`]. Tests use it to act at the exact point of the
+    /// look.
+    ///
+    /// Not a stable part of the API: it is public only so the integration
+    /// tests can reach it, and may change or go without notice.
+    #[doc(hidden)]
+    pub fn poll_into_with<S, F>(
+        &mut self,
+        clock: &mut dyn FnMut() -> u64,
+        sink: &mut S,
+        find: F,
+    ) -> std::io::Result<()>
+    where
+        S: ObservationSink + ?Sized,
+        F: FnOnce(&Path) -> std::io::Result<Option<PathBuf>>,
+    {
         let mut budget = MAX_READS_PER_POLL;
         self.backlogged = false;
         self.drain(clock, sink, &mut budget)?;
@@ -284,7 +309,7 @@ impl NodeTailer {
         }
         self.stats.rescans += 1;
         let first = !std::mem::replace(&mut self.polled, true);
-        if let Some(newest) = newest_hourly_file(&self.root)? {
+        if let Some(newest) = find(&self.root)? {
             let key = hourly_key(&newest);
             let newer = match (&self.current, key) {
                 (None, Some(_)) => true,
@@ -292,6 +317,20 @@ impl NodeTailer {
                 (_, None) => false,
             };
             if let (true, Some(key)) = (newer, key) {
+                if self.current.is_some() {
+                    // The node may have appended to the old file after the
+                    // drain above and before the look found the new one:
+                    // read it to its end once more, or that tail is lost.
+                    // Cold: once per switch. These are ordinary lines, not
+                    // post-rotation ones.
+                    self.drain(clock, sink, &mut budget)?;
+                    if self.backlogged {
+                        // More than this poll may read: finish the old file
+                        // first and look again.
+                        self.rescan_due = true;
+                        return Ok(());
+                    }
+                }
                 let mut file = File::open(&newest)?;
                 if self.current.is_some() {
                     self.stats.rotations += 1;

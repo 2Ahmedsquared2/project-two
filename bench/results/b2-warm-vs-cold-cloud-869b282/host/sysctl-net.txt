@@ -1,0 +1,8 @@
+== /proc/sys/net/core/busy_poll
+cat: /proc/sys/net/core/busy_poll: No such file or directory
+== /proc/sys/net/core/busy_read
+cat: /proc/sys/net/core/busy_read: No such file or directory
+== /proc/sys/net/core/netdev_budget
+cat: /proc/sys/net/core/netdev_budget: No such file or directory
+== /proc/sys/net/ipv4/tcp_low_latency
+cat: /proc/sys/net/ipv4/tcp_low_latency: No such file or directory

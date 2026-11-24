@@ -863,6 +863,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hl-block"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "hl-book-ref"
 version = "0.1.0"
 dependencies = [
@@ -884,6 +893,7 @@ dependencies = [
  "rtrb",
  "rustix",
  "serde_json",
+ "signal-hook",
  "tempfile",
 ]
 
@@ -971,6 +981,31 @@ dependencies = [
  "sha3",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "hl-strict-pass"
+version = "0.1.0"
+dependencies = [
+ "hl-capture",
+ "hl-latency",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "hl-warm"
+version = "0.1.0"
+dependencies = [
+ "core_affinity",
+ "hdrhistogram",
+ "hl-alloc-gate",
+ "memmap2",
+ "nix",
+ "rustix",
+ "thiserror",
 ]
 
 [[package]]
@@ -1150,6 +1185,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "memmap2"
+version = "0.9.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1175,6 +1219,18 @@ name = "mod_use"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "21909324aa58f5c284d91cac514c6d081210901dc372d7c8ea6a9d7e0406097a"
+
+[[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
 
 [[package]]
 name = "nom"
@@ -1224,6 +1280,19 @@ name = "oorandom"
 version = "11.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
+
+[[package]]
+name = "p2-node"
+version = "0.1.0"
+dependencies = [
+ "hl-block",
+ "hl-book-ref",
+ "hl-node-convert",
+ "hl-warm",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "page_size"
@@ -1590,6 +1659,26 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
 
 [[package]]
 name = "signature"

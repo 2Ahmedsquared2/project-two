@@ -13,6 +13,8 @@ hl-latency = { path = "../hl-latency", version = "0.1.0" }
 memchr = "2"
 rtrb = "0.3"
 serde_json = { workspace = true }
+# Safe signal handlers: flags only, plus the documented second-signal exit.
+signal-hook = { version = "0.3", default-features = false }
 
 # inotify exists on Linux only; elsewhere `--detect inotify` falls back to
 # `poll` and says so (same shape as hl-replay's file-inotify arm).
