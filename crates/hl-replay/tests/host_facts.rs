@@ -1288,3 +1288,111 @@ fn a_last_isolcpus_word_without_its_comma_is_not_read() {
         assert_eq!(f.isolated_cpus(), None, "{raw}");
     }
 }
+
+#[test]
+fn a_refused_region_refuses_the_list_before_what_follows_its_stride_is_read() {
+    // lib/bitmap-str.c bitmap_parselist (Linux v6.8): each region goes
+    // through bitmap_check_region before the next one is parsed, so a region
+    // refused on any host refuses the list whatever follows its stride, an
+    // `N` included.
+    for raw in [
+        "0-3:3/2N",
+        "5-3:1/2N",
+        "0-3:1/0N",
+        "0-3:3/2all",
+        "0-3:3/2N-2",
+    ] {
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: 2-3\nnohz_full: {raw}\nrcu_nocbs: all"),
+                Some(2),
+                Some(3)
+            ),
+            [ignored(
+                "nohz_full",
+                raw,
+                "feeder core 2 and hot core 3 are not tickless"
+            )],
+            "{raw}"
+        );
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: 2-3\nnohz_full: not set\nrcu_nocbs: {raw}"),
+                Some(2),
+                Some(3)
+            ),
+            [
+                "nohz_full is not set: feeder core 2 and hot core 3 are not tickless".to_owned(),
+                rcu_refused(raw)
+            ],
+            "{raw}"
+        );
+    }
+}
+
+#[test]
+fn a_stride_using_nothing_before_an_n_is_still_for_the_host_to_settle() {
+    // bitmap_check_region refuses `off > group_len` and `group_len == 0`,
+    // not `off == 0`: `0-3:0/2` is accepted and sets no bit, so with an `N`
+    // after it the list is the host's last CPU, which only the host knows.
+    for raw in ["0-3:0/2N", "0-3:2/2N"] {
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: 2-3\nnohz_full: {raw}\nrcu_nocbs: all"),
+                Some(2),
+                Some(3)
+            ),
+            [unread("nohz_full", raw)],
+            "{raw}"
+        );
+    }
+}
+
+#[test]
+fn a_group_of_zero_is_refused_whatever_it_uses() {
+    // bitmap_check_region: `group_len == 0` is -EINVAL on its own, also when
+    // `off` is 0 and so not above it.
+    for raw in ["0-7:0/0", "2,0-7:0/0"] {
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: 2-3\nnohz_full: {raw}\nrcu_nocbs: all"),
+                Some(2),
+                Some(3)
+            ),
+            [ignored(
+                "nohz_full",
+                raw,
+                "feeder core 2 and hot core 3 are not tickless"
+            )],
+            "{raw}"
+        );
+    }
+}
+
+#[test]
+fn a_refused_region_after_a_stride_refuses_the_list() {
+    // bitmap_parse_region returns the text after the group as the next
+    // region, with no comma needed; bitmap_getnum refuses one that starts
+    // with no digit and no `N`, and bitmap_check_region a descending one.
+    for raw in [
+        "0-7:1/2x",
+        "0-7:1/2-",
+        "0-7:1/25-3",
+        "0-7:1/2N-",
+        "0-7:1/2:",
+    ] {
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: 2-3\nnohz_full: {raw}\nrcu_nocbs: all"),
+                Some(2),
+                Some(3)
+            ),
+            [ignored(
+                "nohz_full",
+                raw,
+                "feeder core 2 and hot core 3 are not tickless"
+            )],
+            "{raw}"
+        );
+    }
+}
