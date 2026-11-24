@@ -130,6 +130,9 @@ pub struct RoundConfig {
     pub feeder_core: Option<usize>,
     /// Core for the hot thread, or `None`.
     pub hot_core: Option<usize>,
+    /// Core for the kernel's submission-queue polling thread of the
+    /// `compio-sqpoll` arm, or `None`.
+    pub sqpoll_core: Option<usize>,
     /// Directory for the file the detect-mode arms tail (`/dev/shm` is the
     /// honest choice: the node's output is read from the page cache).
     pub tail_dir: PathBuf,
@@ -149,6 +152,10 @@ pub struct RoundResult {
     /// `Some(true)` if the hot thread was pinned as asked, `Some(false)` if
     /// pinning was refused, `None` if this arm was not asked to pin.
     pub hot_pinned: Option<bool>,
+    /// The CPUs the kernel's submission-queue polling thread may run on
+    /// (its `Cpus_allowed_list`, read from `/proc` once the ring exists).
+    /// `None` for an arm without such a thread, or when it could not be read.
+    pub sqpoll_cpus: Option<String>,
 }
 
 /// A round either ran or could not on this host.
@@ -736,6 +743,7 @@ fn checked(
         sink,
         fed: total,
         hot_pinned,
+        sqpoll_cpus: None,
     })))
 }
 
@@ -752,6 +760,8 @@ pub struct ArmReport {
     pub orders: u64,
     /// Whether the hot thread was pinned; see [`RoundResult::hot_pinned`].
     pub hot_pinned: Option<bool>,
+    /// See [`RoundResult::sqpoll_cpus`]; the last round's.
+    pub sqpoll_cpus: Option<String>,
     /// Why the arm could not run here, if it could not.
     pub unavailable: Option<String>,
 }
@@ -833,6 +843,7 @@ fn run_rounds(
             hists: Hists::default(),
             orders: 0,
             hot_pinned: None,
+            sqpoll_cpus: None,
             unavailable: None,
         })
         .collect();

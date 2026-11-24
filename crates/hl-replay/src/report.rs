@@ -60,6 +60,8 @@ pub struct RunMeta {
     pub feeder_core: Option<usize>,
     /// Core the hot thread was pinned to, if any.
     pub hot_core: Option<usize>,
+    /// Core the `compio-sqpoll` arm's kernel polling thread was given, if any.
+    pub sqpoll_core: Option<usize>,
     /// Rounds per arm.
     pub rounds: u32,
     /// Recorded lines per round.

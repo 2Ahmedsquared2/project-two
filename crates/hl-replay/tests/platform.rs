@@ -65,6 +65,7 @@ fn the_inotify_round_runs_or_reports_the_platform_reason() {
         interval: Duration::from_micros(50),
         feeder_core: None,
         hot_core: None,
+        sqpoll_core: None,
         tail_dir: tail_dir.clone(),
         sink_bind: LoopbackAddr::ephemeral(),
     };

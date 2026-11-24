@@ -631,6 +631,7 @@ fn meta(host_facts: HostFactsNote) -> RunMeta {
         host: HostInfo::default(),
         feeder_core: None,
         hot_core: None,
+        sqpoll_core: None,
         rounds: 1,
         measured_per_round: 1,
         warmup_per_round: 0,
