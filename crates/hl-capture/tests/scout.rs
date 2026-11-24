@@ -218,6 +218,9 @@ fn the_writer_calls_its_hook_between_chunks() {
                 block_time_ms: 1,
                 block_number: Some(u64::try_from(i).unwrap()),
                 recv_ns: 1,
+                file_date: None,
+                file_hour: None,
+                line_offset: None,
             },
         );
     }

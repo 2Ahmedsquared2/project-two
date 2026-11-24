@@ -43,6 +43,18 @@ Observation line format (one per arrival):
 {"source":"public_ws","block_time_ms":1753606210051,"recv_ns":1753606210467000000}
 ```
 
+A node observation written by `hl-capture` also says which line of the node's
+output it is: `"file_date":20250727,"file_hour":8,"line_offset":1048576` (the
+hourly file `.../20250727/8` and the byte offset, from 0, of the line's first
+byte in it). All three are present or none is: none for `public_ws` and in
+files captured before the fields existed, which still parse. `hl-strict-pass`
+reports a failed line by the same file and offset, so a torn line can be
+matched to its one observation. The offset is the real file position: for the
+file that already exists at start, which is read from its end, it counts from
+that end position, and dropped lines (oversized, bad, empty) still advance
+it. (Dropping only the matched observation in `hl-latency` is a follow-up;
+today it drops the whole block.)
+
 ## Host prep (before every run; done with/through the AWS Reason)
 
 - ENA Express off on the interface.

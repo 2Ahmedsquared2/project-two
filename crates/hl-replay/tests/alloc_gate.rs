@@ -167,6 +167,9 @@ impl Parser for ScanParser {
             block_time_ms: hl_latency::parse_naive_utc_ms(bt).unwrap(),
             block_number: Some(bn.parse().unwrap()),
             recv_ns,
+            file_date: None,
+            file_hour: None,
+            line_offset: None,
         })
     }
 }
