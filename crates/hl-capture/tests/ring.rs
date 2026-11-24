@@ -154,6 +154,52 @@ mod encoding {
         }
     }
 
+    /// The three file fields with each one present or absent on its own.
+    fn any_file_fields() -> impl Strategy<Value = Observation> {
+        (
+            any_observation(),
+            proptest::option::of(any::<u32>()),
+            proptest::option::of(any::<u8>()),
+            proptest::option::of(any::<u64>()),
+        )
+            .prop_map(|(o, file_date, file_hour, line_offset)| Observation {
+                file_date,
+                file_hour,
+                line_offset,
+                ..o
+            })
+    }
+
+    proptest! {
+        /// The file fields are all three or none. An observation with only
+        /// one or two of them is written with none, the other fields
+        /// unchanged; with all three it is written as it is.
+        #[test]
+        fn some_but_not_all_file_fields_are_written_as_none(
+            obs in prop::collection::vec(any_file_fields(), 0..40),
+        ) {
+            let (mut sink, mut source) = ring(64);
+            let mut want_obs = Vec::new();
+            let mut want = Vec::new();
+            for o in &obs {
+                sink.observe(*o);
+                let whole = o.file_date.is_some() && o.file_hour.is_some() && o.line_offset.is_some();
+                let written = if whole {
+                    *o
+                } else {
+                    Observation { file_date: None, file_hour: None, line_offset: None, ..*o }
+                };
+                serde_json::to_writer(&mut want, &written).unwrap();
+                want.push(b'\n');
+                want_obs.push(written);
+            }
+            let mut out = Vec::new();
+            source.write_available(&mut out).unwrap();
+            prop_assert_eq!(String::from_utf8(out.clone()).unwrap(), String::from_utf8(want).unwrap());
+            prop_assert_eq!(read_observations(&out[..]).unwrap(), want_obs);
+        }
+    }
+
     /// Every number at its widest still fits the line buffer.
     #[test]
     fn the_widest_line_is_written_whole() {
