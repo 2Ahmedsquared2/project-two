@@ -58,6 +58,29 @@ struct Meta {
     by_name: HashMap<String, Asset>,
 }
 
+/// Outcome-market asset id for coin "#E": actions name it 100,000,000 + E
+/// (observed in our node's order actions, e.g. "#414130" is a = 100414130).
+const OUTCOME_ASSET_BASE: Asset = 100_000_000;
+
+impl Meta {
+    /// Register outcome coin "#E" (the seed holds its book). szDecimals 0 and
+    /// 8 price decimals (spot rule 8 - szDecimals) are inferred: every "#E"
+    /// size in the window is a whole number and outcomeMeta has no szDecimals.
+    fn add_outcome(&mut self, coin: &str) -> Option<Asset> {
+        let e: Asset = coin.strip_prefix('#')?.parse().ok()?;
+        let a = OUTCOME_ASSET_BASE.checked_add(e)?;
+        self.by_idx.insert(
+            a,
+            AssetInfo {
+                sz_dec: 0,
+                px_dec: 8,
+            },
+        );
+        self.by_name.insert(coin.to_owned(), a);
+        Some(a)
+    }
+}
+
 fn load_meta(dir: &str) -> Meta {
     let rd = |f: &str| -> Value {
         serde_json::from_reader(BufReader::new(File::open(format!("{dir}/{f}")).unwrap())).unwrap()
@@ -622,7 +645,7 @@ struct Seed {
     seeded: std::collections::HashSet<Asset>,
 }
 
-fn load_seed(meta: &Meta, path: &str) -> Seed {
+fn load_seed(meta: &mut Meta, path: &str) -> Seed {
     let v: Value = serde_json::from_reader(BufReader::new(File::open(path).unwrap())).unwrap();
     let h = v[0].as_u64().unwrap();
     let mut out = Vec::new();
@@ -630,7 +653,12 @@ fn load_seed(meta: &Meta, path: &str) -> Seed {
     let mut seeded = std::collections::HashSet::new();
     for cb in v[1].as_array().unwrap() {
         let coin = cb[0].as_str().unwrap();
-        let Some(&asset) = meta.by_name.get(coin) else {
+        let Some(asset) = meta
+            .by_name
+            .get(coin)
+            .copied()
+            .or_else(|| meta.add_outcome(coin))
+        else {
             skipped += 1;
             continue;
         };
@@ -675,7 +703,7 @@ fn arg(name: &str) -> Option<String> {
 }
 
 fn main() {
-    let meta = load_meta(&arg("--meta").expect("--meta"));
+    let mut meta = load_meta(&arg("--meta").expect("--meta"));
     let max: usize = arg("--max").map_or(usize::MAX, |s| s.parse().unwrap());
     let show: usize = arg("--show").map_or(5, |s| s.parse().unwrap());
     let Seed {
@@ -684,7 +712,8 @@ fn main() {
         skipped,
         next_oid: seed_next,
         seeded,
-    } = load_seed(&meta, &arg("--seed").expect("--seed"));
+    } = load_seed(&mut meta, &arg("--seed").expect("--seed"));
+    let meta = meta;
     eprintln!(
         "seed height {seed_h}: {} resting orders in {} books, {skipped} coins not in meta, next_oid {seed_next:?}",
         seed.len(),
@@ -809,6 +838,7 @@ fn main() {
             why.push("oid-hint".into());
         }
         let mut resp_bad = None;
+        let mut unknown_wallet = false;
         for i in 0..b.acts.len() {
             let expired = out.responses[i].expired;
             if b.acts[i].0 == 4 && !expired {
@@ -826,6 +856,18 @@ fn main() {
                 continue;
             }
             let ours = response_json(&meta, b, i, out.statuses_of(i), expired);
+            // Native rejects an action whose signer is not a known user or
+            // agent (an account-side check the engine does not model). It
+            // keeps the block out of k under its own class; keep comparing.
+            if ours != b.native[i]
+                && b.native[i]["status"] == "err"
+                && b.native[i]["response"].as_str().is_some_and(|r| {
+                    r.starts_with("User or API Wallet ") && r.ends_with(" does not exist.")
+                })
+            {
+                unknown_wallet = true;
+                continue;
+            }
             if ours != b.native[i] {
                 resp_bad = Some(format!(
                     "h{} act{i} {}: ours {} native {}",
@@ -833,6 +875,9 @@ fn main() {
                 ));
                 break;
             }
+        }
+        if unknown_wallet {
+            why.push("resp:unknown-wallet".into());
         }
         if let Some(ex) = resp_bad {
             let cls = if ex.contains("Post only") {
@@ -927,6 +972,17 @@ fn main() {
         }
     }
     println!("blocks N={n} heights {first_seen}..={last_seen}  reproduced k={k}");
+    // The engine's own score: blocks whose every action and native diff is on
+    // a book the seed holds (and, second, with no action the engine skips).
+    let held = |v: &str| !v.contains("unseeded-book") && !v.contains("diffs:unmodelled-coin");
+    let n_held = verdicts.iter().filter(|(_, v)| held(v)).count();
+    let n_held_modelled = verdicts
+        .iter()
+        .filter(|(_, v)| held(v) && !v.contains("unsupported:"))
+        .count();
+    println!(
+        "held books only: k={k} of N={n_held}; and no unsupported action: k={k} of N={n_held_modelled}"
+    );
     if let Some(p) = arg("--heights-out") {
         let body = verdicts
             .iter()

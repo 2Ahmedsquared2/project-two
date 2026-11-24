@@ -94,6 +94,20 @@ ends. The writer thread then writes every record the ring still holds, so the
 process exits after the deadline by however long that backlog takes (measured
 0.5 to 0.95 s for 350k to 600k queued records, debug build, loaded shared
 machine); nothing already read is discarded.
+
+`SIGTERM` or `SIGINT` (Ctrl-C) ends a run the same way as the deadline: the
+reader stops, prints a `signal` line and `{"reader_stopped":true}`, the writer
+writes what the ring holds, the counters are printed with
+`"stop_signal":15` (or `2`; `null` for a run no signal stopped), and the exit
+status is 0. Such a run is as valid as a `--duration-s` run and is judged by
+`ring_dropped` like one; bytes the node wrote that the reader had not read yet
+are not captured. `busy-poll` and the default `poll` notice the signal at
+once; a long `--poll-us` and `inotify` notice it within 100 ms (every wait is
+capped at that, about ten empty reads a second while idle). **A second signal
+ends the process at once** with status 128 + the signal number (143, 130), no
+counters and possibly a cut-off last record: that run is invalid. Use it only
+when the writer cannot finish (a disk that stopped accepting writes).
+`SIGKILL` and `SIGHUP` are not handled: they lose the ring and the counters.
 After its first poll it writes `{"ready":true}` to stderr (after the `detect`
 line); a harness that creates or renames in a file it expects read must wait
 for that line first, or a slow start can make the file count as history (read
@@ -121,12 +135,57 @@ a slow node; a counted drop is only a missing sample. **A run with
 The strict parser (`parse_node_line`) runs on the reader only for a line the
 header scan refuses (`scan_fallbacks`, expected 0 on hl-node output). Lines the
 scan accepts are not strict-validated by this tool: `height_breaks` counts
-block numbers that do not follow on, and an offline strict pass over the same
-hourly files is the planned check for writer-torn lines.
+block numbers that do not follow on, and the offline strict pass over the same
+hourly files (`hl-strict-pass`, below) is the check for writer-torn lines.
+
+### Offline strict pass (`crates/hl-strict-pass`)
+
+Run after a capture, never beside the reader:
+`hl-strict-pass [--max-failures N] [--max-line-bytes N]
+[--allow-unterminated-tail] [--fail-on-height-gap] <path>...`, where a path is
+an hourly file or a directory whose `{date}/{hour}` files are read oldest
+first. A record is a newline-terminated line, and it passes when it is valid
+UTF-8, `hl_latency::parse_node_line` accepts it (the whole line is one JSON
+object with a timestamp `block_time` and a u64 `block_number`), its top level
+has `local_time` (string) and `events` (array) with none of the four keys
+repeated, and the header scan, where it answers, agrees with the strict parse.
+What the events hold is not checked.
+
+stdout is JSON lines: a `failure` line per failed record (`path`, `line`,
+`offset`, `len`, `reason`, `scan_accepted`, and for a scan-accepted line the
+`block_number` and `block_time_ms` hl-capture recorded for it, so that
+observation can be dropped from the pairing); a `file` line per file with its
+counters and first/last `block_number` and `block_time_ms`; one `total` line.
+Counters: `records`, `failed`, `scan_accepted_failed` (failed lines the reader
+stamped), `unterminated_tail`, `height_breaks` split into `height_repeats`,
+`height_gaps` and `height_backwards`, `block_time_backwards`,
+`duplicate_block_numbers` (a height seen earlier in the pass, other than a
+repeat of the line before: an overlapping or rewritten file). At most
+`--max-failures` (default 100) failures are listed; the counts are never
+capped and `failures_omitted` says how many were left out. A line over
+`--max-line-bytes` (default 64 MiB) fails as `oversized` without being parsed.
+A last line with no newline fails as `unterminated`, unless
+`--allow-unterminated-tail`, which applies to the last file only (the hour
+still being written).
+
+Heights are compared with the last record that passed, across files; a failed
+record is not a reference. hl-capture's own `height_breaks` also counts from
+torn lines its scan accepted, so the two numbers can differ on a damaged file.
+Height breaks do not fail the run: with `--stream-with-block-info` a block can
+span several lines. `--fail-on-height-gap` makes gaps and backward steps (not
+repeats) fail it.
+
+Exit codes: 0 every record passed, 1 a record failed (or a gap, when asked),
+2 usage, 3 unreadable path or no hourly file found.
 
 A newer hourly file is looked for every `--rescan-ms` (default 1000) and, in
 `inotify` mode, when a directory changes; never per poll, and only once the
-current file is read to its end. The look is a directory walk on the reader
+current file is read to its end. When the look finds a newer file, the old one
+is read to its end once more before the switch, so a line the node appended to
+it while the look ran is kept (those are ordinary lines, not post-rotation
+ones). What the node appends to the old file after that is not read: the node
+is taken to finish a file before it starts the next (not verified against real
+`hl-node` output). The look is a directory walk on the reader
 thread (13 us with one date directory, 262 us with thirty, shared machine):
 keep the interval coarse and **prune old date directories**. What the
 switching poll reads from a new file may be stamped up to `--rescan-ms` late:
@@ -137,7 +196,7 @@ the walk to the writer thread is the follow-up.
 
 Counters at exit (stderr, one JSON object): `lines`, `written`, `ring_dropped`,
 `bad_lines`, `oversized_lines`, `scan_fallbacks`, `height_breaks`, `rotations`,
-`post_rotation_lines`, `rescans`, `reads`.
+`post_rotation_lines`, `rescans`, `reads`, `stop_signal`.
 `WsFilter` drops the first `l2Book`/`trades` frame per coin after each
 (re)connect and counts malformed frames, including `l2Book`/`trades` frames
 whose coin is missing, null, empty, not a string or (for `trades`) not the

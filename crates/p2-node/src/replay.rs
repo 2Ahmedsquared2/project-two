@@ -399,7 +399,8 @@ impl Replay {
     }
 
     /// [`Replay::run`] over a stream: each block is checked (F1/F2), run,
-    /// recorded, shown to `each` with whether it reproduced, then dropped, so
+    /// recorded, shown to `each` with the engine's outcome and whether it
+    /// reproduced, then dropped, so
     /// memory does not grow with N. Unlike `run`, F1/F2 are checked as blocks
     /// arrive, so blocks before a refused one have run; the run still returns
     /// an error and no report, so nothing is counted.
@@ -407,7 +408,7 @@ impl Replay {
         engine: &mut E,
         blocks: I,
         snapshot: u64,
-        mut each: impl FnMut(&ReplayBlock, bool),
+        mut each: impl FnMut(&ReplayBlock, &BlockOutcome, bool),
     ) -> Result<Self, StreamError<X>>
     where
         E: Engine,
@@ -423,7 +424,7 @@ impl Replay {
             drop(acts);
             let before = r.reproduced;
             r.record(&b, &out, engine)?;
-            each(&b, r.reproduced > before);
+            each(&b, &out, r.reproduced > before);
         }
         Ok(r)
     }

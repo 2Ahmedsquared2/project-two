@@ -26,7 +26,14 @@ Spot books carry `asset` = the spotMeta universe index (observed: 0, 1, 2, ...
 in `spot_books[]`), and are named by their spotMeta name, which the replay maps
 to asset 10000 + index.
 
-Usage: abci_books_to_l4.py BOOKS_JSON[,MORE_JSON...] META_DIR HEIGHT NEXT_OID OUT_JSON
+Outcome-market books ("#E" coins) are spot books spotMeta does not list. With
+OUTCOME_MAP (from outcome_book_map.py: coin -> spot book index, read from
+data) those books are named "#E" and decoded with szDecimals 0 and 8 price
+decimals (the spot rule 8 - szDecimals). szDecimals 0 is an inference: every
+"#E" size in the window's order statuses is a whole number, and outcomeMeta
+has no szDecimals field.
+
+Usage: abci_books_to_l4.py BOOKS_JSON[,MORE_JSON...] META_DIR HEIGHT NEXT_OID OUT_JSON [OUTCOME_MAP]
 (each input may be gzipped; e.g. the perp cut and the separate spot cut)
 """
 
@@ -169,8 +176,13 @@ def iter_books(path):
 def main():
     src, meta_dir, height, next_oid, dst = sys.argv[1:6]
     names, spot_names = load_names(meta_dir)
+    if len(sys.argv) > 6:
+        for coin, v in json.load(open(sys.argv[6]))["coins"].items():
+            if v["book"] in spot_names:
+                raise SystemExit(f"{coin}: book {v['book']} is spotMeta-listed")
+            spot_names[v["book"]] = (coin, 0, 8)
     stats = {"books": 0, "levels": 0, "orders": 0, "reduce_only": 0, "spot_books": 0,
-             "spot_unlisted_books": 0, "spot_unlisted_orders": 0}
+             "outcome_books": 0, "spot_unlisted_books": 0, "spot_unlisted_orders": 0}
     books = []
     seen = set()
     for section, book in (b for path in src.split(",") for b in iter_books(path)):
@@ -189,6 +201,7 @@ def main():
         books.append(cb)
         stats["books"] += 1
         stats["spot_books"] += section == "spot"
+        stats["outcome_books"] += cb[0].startswith("#")
     max_oid = max((o["oid"] for _, s in books for side in s for _, o in side), default=0)
     if int(next_oid) <= max_oid:
         raise SystemExit(f"next_oid {next_oid} <= max resting oid {max_oid}")

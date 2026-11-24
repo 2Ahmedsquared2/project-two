@@ -330,7 +330,7 @@ fn streaming_run_equals_slice_run() {
             &mut b,
             input().into_iter().map(Ok::<_, String>),
             999,
-            |blk, _| seen.push(blk.height()),
+            |blk, _, _| seen.push(blk.height()),
         )
         .unwrap();
         assert_eq!(
@@ -367,7 +367,7 @@ fn streaming_run_refuses_f1_f2_and_bad_input() {
         &mut e,
         blocks.into_iter().map(Ok::<_, String>),
         999,
-        |_, _| {},
+        |_, _, _| {},
     )
     .unwrap_err();
     assert!(
@@ -382,7 +382,7 @@ fn streaming_run_refuses_f1_f2_and_bad_input() {
         &mut e,
         input().into_iter().map(Ok::<_, String>),
         1000,
-        |_, _| {},
+        |_, _, _| {},
     )
     .unwrap_err();
     assert!(
@@ -394,7 +394,7 @@ fn streaming_run_refuses_f1_f2_and_bad_input() {
         &mut e,
         vec![Err("line 1: bad json".to_owned())],
         999,
-        |_, _| {},
+        |_, _, _| {},
     )
     .unwrap_err();
     assert!(

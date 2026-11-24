@@ -122,6 +122,157 @@ impl RestingSeed {
     }
 }
 
+/// Outcome-market asset id base: coin `#E` is asset `100_000_000 + E` (lane
+/// 1's `OUTCOME_ASSET_BASE`, from our node's order actions).
+pub const OUTCOME_ASSET_BASE: u32 = 100_000_000;
+
+/// Static meta for outcome coin `#E`: szDecimals 0 and 8 price decimals,
+/// as lane 1 infers them (every `#E` size in the window is whole; the spot
+/// rule 8 - szDecimals gives 8). `None` for any other coin.
+#[must_use]
+pub fn outcome_meta(coin: &str) -> Option<AssetMeta> {
+    let e: u32 = coin.strip_prefix('#')?.parse().ok()?;
+    Some(AssetMeta {
+        asset: OUTCOME_ASSET_BASE.checked_add(e)?,
+        coin: coin.to_owned(),
+        sz_decimals: 0,
+        px_decimals: 8,
+    })
+}
+
+/// Book kind by asset id: perp below 10,000, spot 10,000..100,000,
+/// builder perp 100,000..100,000,000, outcome from 100,000,000.
+#[must_use]
+pub fn asset_kind(asset: u32) -> &'static str {
+    match asset {
+        0..=9_999 => "perp",
+        10_000..=99_999 => "spot",
+        100_000..=99_999_999 => "builder-perp",
+        _ => "outcome",
+    }
+}
+
+/// Book kind by raw-diff coin name (`#E` outcome, `@N` or `A/B` spot,
+/// `dex:NAME` builder perp, else perp).
+#[must_use]
+pub fn coin_kind(coin: &str) -> &'static str {
+    if coin.starts_with('#') {
+        "outcome"
+    } else if coin.starts_with('@') || coin.contains('/') {
+        "spot"
+    } else if coin.contains(':') {
+        "builder-perp"
+    } else {
+        "perp"
+    }
+}
+
+/// Lane 1's l4 book seed (`l4so_<H>.json`, `abci_books_to_l4.py` output):
+/// `[height, [[coin, [bids, asks]], ..], {"next_oid", ..}]`, each side a
+/// queue-ordered list of `[user, {limitPx, sz, oid, timestamp, cloid,
+/// isTrigger, ..}]`. Perp, spot and outcome books alike; a book the seed
+/// lists is held even when empty. Trigger orders are not on the book and
+/// are skipped, as lane 1's loader does.
+#[derive(Clone, Debug)]
+pub struct L4Seed {
+    /// The state height the seed was cut at.
+    pub height: u64,
+    /// Native's next oid at that height, when the seed carries it.
+    pub next_oid: Option<Oid>,
+    /// Resting orders, per book in queue order.
+    pub orders: Vec<RestingOrder>,
+    /// The held books: every seeded coin's static meta.
+    pub table: AssetTable,
+    /// Seed coins with no meta (neither in the asset table nor `#E`).
+    pub skipped_coins: Vec<String>,
+}
+
+impl L4Seed {
+    /// Reads the seed, resolving coins through `all` (static meta for every
+    /// listed asset) and `#E` outcome coins through [`outcome_meta`].
+    pub fn read(reader: impl std::io::Read, all: &AssetTable) -> Result<Self, String> {
+        let v: Value = serde_json::from_reader(reader).map_err(|e| format!("l4 seed: {e}"))?;
+        let height = v
+            .get(0)
+            .and_then(Value::as_u64)
+            .ok_or("l4 seed: [0] is not a height")?;
+        let books = v
+            .get(1)
+            .and_then(Value::as_array)
+            .ok_or("l4 seed: [1] is not a list of books")?;
+        let next_oid = v
+            .get(2)
+            .and_then(|m| m.get("next_oid"))
+            .and_then(Value::as_u64)
+            .map(Oid);
+        let mut orders = Vec::new();
+        let mut held = Vec::new();
+        let mut skipped_coins = Vec::new();
+        for cb in books {
+            let coin = cb
+                .get(0)
+                .and_then(Value::as_str)
+                .ok_or("l4 seed: book without a coin")?;
+            let Some(m) = all.by_coin(coin).cloned().or_else(|| outcome_meta(coin)) else {
+                skipped_coins.push(coin.to_owned());
+                continue;
+            };
+            for (si, side) in [(0, Side::Bid), (1, Side::Ask)] {
+                let queue = cb
+                    .get(1)
+                    .and_then(|s| s.get(si))
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| format!("l4 seed: {coin}: side {si} is not a list"))?;
+                for uo in queue {
+                    orders.extend(seed_order(&m, side, uo).map_err(|e| format!("{coin}: {e}"))?);
+                }
+            }
+            held.push(m);
+        }
+        Ok(Self {
+            height,
+            next_oid,
+            orders,
+            table: AssetTable::new(held),
+            skipped_coins,
+        })
+    }
+}
+
+/// One `[user, order]` entry of an l4 queue; `None` for a trigger order.
+fn seed_order(m: &AssetMeta, side: Side, uo: &Value) -> Result<Option<RestingOrder>, String> {
+    let (u, o) = (&uo[0], &uo[1]);
+    if o.get("isTrigger").and_then(Value::as_bool).unwrap_or(false) {
+        return Ok(None);
+    }
+    let oid = o
+        .get("oid")
+        .and_then(Value::as_u64)
+        .ok_or("order without oid")?;
+    let dec = |k: &str, d: u32| {
+        let s = o
+            .get(k)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("oid {oid}: no {k}"))?;
+        to_units(&canonical_decimal(s).unwrap_or_else(|| s.to_owned()), d)
+            .map_err(|e| format!("oid {oid}: {k} {s}: {e:?}"))
+    };
+    let user = u
+        .as_str()
+        .and_then(parse_user)
+        .ok_or_else(|| format!("oid {oid}: user {u}"))?;
+    Ok(Some(RestingOrder {
+        asset: m.asset,
+        user,
+        oid: Oid(oid),
+        side,
+        px: Px(dec("limitPx", m.px_decimals)?),
+        sz: Sz(dec("sz", m.sz_decimals)?),
+        cloid: o.get("cloid").and_then(Value::as_str).and_then(parse_cloid),
+        t_ms: o.get("timestamp").and_then(Value::as_u64).unwrap_or(0),
+    }))
+}
+
 /// Every asset id an action names (order and modify legs `a`, cancels `a`,
 /// cancel-by-cloid `asset`), whether or not the adapter supports it.
 #[must_use]
@@ -167,6 +318,164 @@ pub fn touches_unseeded(meta: &AssetTable, b: &crate::replay::ReplayBlock) -> bo
             .any(|d| meta.by_coin(&d.coin).is_none())
 }
 
+/// Every reason a block did not reproduce, from every action (not only the
+/// first mismatch), as short class names for a per-height verdict file, in
+/// the order they first occur (actions in block order, then diffs), so the
+/// first entry is the first cause:
+///
+/// - `unseeded-book:<kind>`: an action names, or a native diff touches, a
+///   book the seed does not hold but the asset meta lists (outcome coins
+///   count as listed); `unknown-book:<kind>` when no meta lists it either.
+///   `<kind>` is perp, spot, builder-perp or outcome.
+/// - `unsupported:<type>`: the adapter does not model the action.
+/// - `resp:<type>:<what>`: our response differs from native's; `<what>` is
+///   `unknown-wallet`, `oid-offset` (equal but for oids), a native-only
+///   reject the engine does not model (`margin`, `spot-balance`,
+///   `min-value`, `reduce-only`, `too-many-orders`), `alo`,
+///   `cancel-unknown`, `ioc-no-match`, `modify-unknown`, `filled`,
+///   `resting` or `other`.
+/// - `diffs:content` / `diffs:order`: the held books' diffs differ and no
+///   action-level class explains the block (unexplained). When an action
+///   class exists, a diff mismatch is attributed to it and not listed.
+/// - `result-count`: our result list has the wrong length.
+///
+/// `seeded` holds the seeded books, `all` every asset the static meta lists.
+/// Empty = every action and diff matched.
+#[must_use]
+pub fn block_classes(
+    seeded: &AssetTable,
+    all: &AssetTable,
+    b: &crate::replay::ReplayBlock,
+    out: &crate::engine::BlockOutcome,
+) -> Vec<String> {
+    let mut cls: Vec<String> = Vec::new();
+    let book_class = |listed: bool, kind: &str| {
+        let what = if listed || kind == "outcome" {
+            "unseeded-book"
+        } else {
+            "unknown-book"
+        };
+        format!("{what}:{kind}")
+    };
+    let native = b.native_responses();
+    if out.results.len() != native.len() {
+        push_once(&mut cls, "result-count".to_owned());
+    }
+    for (i, (a, nat)) in b.user_actions().iter().zip(native).enumerate() {
+        let ours = out.results.get(i);
+        if matches!(ours, Some(ActionResult::Response(v)) if v == nat) {
+            continue;
+        }
+        if let Some(x) = named_assets(a)
+            .into_iter()
+            .find(|x| seeded.get(*x).is_none())
+        {
+            push_once(&mut cls, book_class(all.get(x).is_some(), asset_kind(x)));
+            continue;
+        }
+        push_once(
+            &mut cls,
+            match ours {
+                Some(ActionResult::Response(v)) => {
+                    format!("resp:{}:{}", a.action_type, response_mismatch(nat, v))
+                }
+                _ => format!("unsupported:{}", a.action_type),
+            },
+        );
+    }
+    let action_level = !cls.is_empty();
+    let mut held = Vec::new();
+    for d in b.native_diffs() {
+        if seeded.by_coin(&d.coin).is_some() {
+            held.push(canonical_node_diff(d));
+        } else {
+            push_once(
+                &mut cls,
+                book_class(all.by_coin(&d.coin).is_some(), coin_kind(&d.coin)),
+            );
+        }
+    }
+    let ours: Vec<BookDiff> = out.book_diffs.iter().map(canonical_node_diff).collect();
+    if !action_level && ours != held {
+        let key = |d: &BookDiff| format!("{d:?}");
+        let (mut x, mut y) = (ours, held);
+        x.sort_by_key(key);
+        y.sort_by_key(key);
+        push_once(
+            &mut cls,
+            if x == y {
+                "diffs:order"
+            } else {
+                "diffs:content"
+            }
+            .to_owned(),
+        );
+    }
+    cls
+}
+
+/// Appends `c` unless `v` already holds it (keeps first-occurrence order).
+fn push_once(v: &mut Vec<String>, c: String) {
+    if !v.contains(&c) {
+        v.push(c);
+    }
+}
+
+/// What differs between native's response and ours (see [`block_classes`]).
+fn response_mismatch(native: &Value, ours: &Value) -> &'static str {
+    let (n, o) = (native.to_string(), ours.to_string());
+    let either = |s: &str| n.contains(s) || o.contains(s);
+    if n.contains("User or API Wallet ") && n.contains(" does not exist.") {
+        "unknown-wallet"
+    } else if zero_oids(native) == zero_oids(ours) {
+        "oid-offset"
+    } else if n.contains("Insufficient margin") {
+        "margin"
+    } else if n.contains("Insufficient spot balance") {
+        "spot-balance"
+    } else if n.contains("minimum value") {
+        "min-value"
+    } else if n.contains("educe only") {
+        "reduce-only"
+    } else if n.contains("Too many") {
+        "too-many-orders"
+    } else if either("Post only") {
+        "alo"
+    } else if either("never placed") {
+        "cancel-unknown"
+    } else if either("could not immediately match") {
+        "ioc-no-match"
+    } else if either("Cannot modify") {
+        "modify-unknown"
+    } else if either("\"filled\"") {
+        "filled"
+    } else if either("\"resting\"") {
+        "resting"
+    } else {
+        "other"
+    }
+}
+
+/// The value with every `"oid"` number set to 0.
+fn zero_oids(v: &Value) -> Value {
+    match v {
+        Value::Object(m) => Value::Object(
+            m.iter()
+                .map(|(k, x)| {
+                    let x = if k == "oid" && x.is_number() {
+                        json!(0)
+                    } else {
+                        zero_oids(x)
+                    };
+                    (k.clone(), x)
+                })
+                .collect(),
+        ),
+        Value::Array(a) => Value::Array(a.iter().map(zero_oids).collect()),
+        other => other.clone(),
+    }
+}
+
 /// One asset's static metadata.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 pub struct AssetMeta {
@@ -197,6 +506,72 @@ impl AssetTable {
     pub fn from_json(s: &str) -> Result<Self, String> {
         let f: MetaFile = serde_json::from_str(s).map_err(|e| format!("asset meta: {e}"))?;
         Ok(Self::new(f.assets))
+    }
+
+    /// From a Hyperliquid info-API meta directory, by lane 1's rules
+    /// (`crates/hl-exec/examples/replay.rs` `load_meta`): `meta.json`
+    /// universe i = perp i (px 6 - szDecimals); `spotMeta.json` universe
+    /// index i = spot 10000 + i, szDecimals of its base token (px 8 -
+    /// szDecimals); `perpDexs.json` entry k with name N = builder perps
+    /// 100000 + 10000k + i from `meta_N.json` (px 6 - szDecimals).
+    pub fn from_meta_dir(dir: &std::path::Path) -> Result<Self, String> {
+        let rd = |f: &str| -> Result<Value, String> {
+            let p = dir.join(f);
+            let s = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+            serde_json::from_str(&s).map_err(|e| format!("{}: {e}", p.display()))
+        };
+        let n32 = |v: &Value, what: &str| -> Result<u32, String> {
+            v.as_u64()
+                .and_then(|x| u32::try_from(x).ok())
+                .ok_or_else(|| format!("{what}: not a small integer: {v}"))
+        };
+        let mut out = Vec::new();
+        let mut perps = |base: u32, m: &Value, f: &str| -> Result<(), String> {
+            let uni = m["universe"]
+                .as_array()
+                .ok_or_else(|| format!("{f}: no universe"))?;
+            for (i, u) in uni.iter().enumerate() {
+                let sz = n32(&u["szDecimals"], f)?;
+                out.push(AssetMeta {
+                    asset: base + u32::try_from(i).map_err(|e| e.to_string())?,
+                    coin: u["name"]
+                        .as_str()
+                        .ok_or_else(|| format!("{f}: name"))?
+                        .to_owned(),
+                    sz_decimals: sz,
+                    px_decimals: 6u32.saturating_sub(sz),
+                });
+            }
+            Ok(())
+        };
+        perps(0, &rd("meta.json")?, "meta.json")?;
+        if let Some(dexs) = rd("perpDexs.json")?.as_array() {
+            for (k, d) in dexs.iter().enumerate() {
+                let Some(name) = d["name"].as_str() else {
+                    continue;
+                };
+                let f = format!("meta_{name}.json");
+                let k = u32::try_from(k).map_err(|e| e.to_string())?;
+                perps(100_000 + k * 10_000, &rd(&f)?, &f)?;
+            }
+        }
+        let spot = rd("spotMeta.json")?;
+        let mut tok = HashMap::new();
+        for t in spot["tokens"].as_array().into_iter().flatten() {
+            tok.insert(t["index"].as_u64(), n32(&t["szDecimals"], "spot token")?);
+        }
+        for u in spot["universe"].as_array().into_iter().flatten() {
+            let sz = *tok
+                .get(&u["tokens"][0].as_u64())
+                .ok_or_else(|| format!("spotMeta: pair {u} has no base token"))?;
+            out.push(AssetMeta {
+                asset: 10_000 + n32(&u["index"], "spot index")?,
+                coin: u["name"].as_str().ok_or("spotMeta: name")?.to_owned(),
+                sz_decimals: sz,
+                px_decimals: 8u32.saturating_sub(sz),
+            });
+        }
+        Ok(Self::new(out))
     }
 
     /// From a list.
@@ -956,6 +1331,22 @@ fn from_node_diff(meta: &AssetTable, d: &BookDiff) -> Result<XDiff, String> {
 /// neither the responses (an error string) nor the book diffs show. Resync
 /// only: it sets the counter after a block that did not reproduce.
 pub fn load_status_max_oids(reader: impl std::io::BufRead) -> Result<HashMap<u64, u64>, String> {
+    load_statuses(reader).map(|i| i.max_oids)
+}
+
+/// What resync takes from native's order-status file.
+#[derive(Clone, Debug, Default)]
+pub struct StatusIndex {
+    /// Highest oid per height (see [`load_status_max_oids`]).
+    pub max_oids: HashMap<u64, u64>,
+    /// Every order's cloid by oid, where the status records one: resync
+    /// gives an adopted order its cloid even when the block's responses do
+    /// not show it (lane 1's harness does the same).
+    pub cloids: HashMap<u64, Cloid>,
+}
+
+/// Reads native's order-status file once for [`StatusIndex`].
+pub fn load_statuses(reader: impl std::io::BufRead) -> Result<StatusIndex, String> {
     #[derive(serde::Deserialize)]
     struct Line {
         block_number: u64,
@@ -968,16 +1359,25 @@ pub fn load_status_max_oids(reader: impl std::io::BufRead) -> Result<HashMap<u64
     #[derive(serde::Deserialize)]
     struct Order {
         oid: Option<u64>,
+        cloid: Option<String>,
     }
-    let mut out = HashMap::new();
+    let mut out = StatusIndex::default();
     for (i, line) in reader.lines().enumerate() {
         let line = line.map_err(|e| format!("line {}: {e}", i + 1))?;
         if line.trim().is_empty() {
             continue;
         }
         let l: Line = serde_json::from_str(&line).map_err(|e| format!("line {}: {e}", i + 1))?;
-        if let Some(m) = l.events.iter().filter_map(|e| e.order.as_ref()?.oid).max() {
-            out.insert(l.block_number, m);
+        let mut max = None;
+        for o in l.events.iter().filter_map(|e| e.order.as_ref()) {
+            let Some(oid) = o.oid else { continue };
+            max = max.max(Some(oid));
+            if let Some(c) = o.cloid.as_deref().and_then(parse_cloid) {
+                out.cloids.insert(oid, c);
+            }
+        }
+        if let Some(m) = max {
+            out.max_oids.insert(l.block_number, m);
         }
     }
     Ok(out)
@@ -990,6 +1390,7 @@ pub struct HlExecEngine {
     last_core_ns: Option<u64>,
     unadopted_diffs: u64,
     status_max_oids: HashMap<u64, u64>,
+    status_cloids: HashMap<u64, Cloid>,
 }
 
 impl std::fmt::Debug for HlExecEngine {
@@ -1011,7 +1412,17 @@ impl HlExecEngine {
             last_core_ns: None,
             unadopted_diffs: 0,
             status_max_oids: HashMap::new(),
+            status_cloids: HashMap::new(),
         }
+    }
+
+    /// Every order's cloid by oid from native's order-status file
+    /// ([`load_statuses`]); resync gives an adopted order its cloid from it
+    /// when the block's responses do not show one. Resync only.
+    #[must_use]
+    pub fn with_status_cloids(mut self, m: HashMap<u64, Cloid>) -> Self {
+        self.status_cloids = m;
+        self
     }
 
     /// Native's highest oid per height from its order-status file
@@ -1127,7 +1538,10 @@ impl Engine for HlExecEngine {
             let mut x = from_node_diff(&self.meta, d)?;
             if matches!(x.kind, DiffKind::New { .. }) {
                 max_oid = max_oid.max(x.oid.0);
-                x.cloid = cloids.get(&x.oid.0).copied();
+                x.cloid = cloids
+                    .get(&x.oid.0)
+                    .or_else(|| self.status_cloids.get(&x.oid.0))
+                    .copied();
             }
             xs.push(x);
         }

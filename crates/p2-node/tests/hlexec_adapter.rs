@@ -363,3 +363,225 @@ fn resync_adopts_the_oid_counter_from_native_order_statuses() {
     e.resync(1, &native_diffs, &native_resp).unwrap();
     assert_eq!(e.engine().next_oid(), Oid(503));
 }
+
+/// Lane 1's l4 book seed (`l4so_<H>.json`): perp, spot and outcome (`#E` =
+/// asset 100000000+E) books, trigger orders skipped, coins without meta
+/// reported and not held.
+#[test]
+fn l4_seed_loads_perp_spot_and_outcome_books() {
+    let all = AssetTable::new(vec![
+        AssetMeta {
+            asset: 0,
+            coin: "BTC".into(),
+            sz_decimals: 5,
+            px_decimals: 1,
+        },
+        AssetMeta {
+            asset: 10_001,
+            coin: "@1".into(),
+            sz_decimals: 2,
+            px_decimals: 6,
+        },
+    ]);
+    let o = |oid: u64, px: &str, sz: &str, trig: bool| {
+        json!({"limitPx": px, "sz": sz, "oid": oid, "timestamp": 5, "isTrigger": trig,
+               "cloid": "0x0000000000000000000000000000abcd"})
+    };
+    let seed = json!([
+        42,
+        [
+            ["BTC", [[[ALICE, o(10, "61223", "0.01633", false)]], [[BOB, o(11, "61300.5", "1", true)]]]],
+            ["@1", [[], [[BOB, o(12, "0.123456", "2.5", false)]]]],
+            ["#90", [[[ALICE, o(13, "0.5", "3", false)]], []]],
+            ["NOPE", [[], []]]
+        ],
+        {"next_oid": 99}
+    ]);
+    let s = p2_node::hlexec::L4Seed::read(seed.to_string().as_bytes(), &all).unwrap();
+    assert_eq!((s.height, s.next_oid), (42, Some(Oid(99))));
+    assert_eq!(s.table.ids(), vec![0, 10_001, 100_000_090]);
+    assert_eq!(s.skipped_coins, vec!["NOPE".to_owned()]);
+    let got: Vec<_> = s
+        .orders
+        .iter()
+        .map(|r| (r.asset, r.oid.0, r.side, r.px.0, r.sz.0, r.cloid.is_some()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (0, 10, Side::Bid, 612_230, 1_633, true),
+            (10_001, 12, Side::Ask, 123_456, 250, true),
+            (100_000_090, 13, Side::Bid, 50_000_000, 3, true),
+        ]
+    );
+}
+
+/// The asset table from an info-API meta directory follows lane 1's rules.
+#[test]
+fn asset_table_from_meta_dir() {
+    let dir = std::env::temp_dir().join(format!("p2-meta-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let w = |f: &str, v: Value| std::fs::write(dir.join(f), v.to_string()).unwrap();
+    w(
+        "meta.json",
+        json!({"universe": [{"name": "BTC", "szDecimals": 5}]}),
+    );
+    w("perpDexs.json", json!([null, {"name": "xyz"}]));
+    w(
+        "meta_xyz.json",
+        json!({"universe": [{"name": "xyz:TSLA", "szDecimals": 3}]}),
+    );
+    w(
+        "spotMeta.json",
+        json!({"tokens": [{"index": 0, "szDecimals": 2}, {"index": 1, "szDecimals": 8}],
+               "universe": [{"name": "PURR/USDC", "index": 0, "tokens": [0, 1]}]}),
+    );
+    let t = AssetTable::from_meta_dir(&dir).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let got: Vec<_> = t
+        .ids()
+        .into_iter()
+        .map(|a| {
+            let m = t.get(a).unwrap();
+            (a, m.coin.clone(), m.sz_decimals, m.px_decimals)
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (0, "BTC".into(), 5, 1),
+            (10_000, "PURR/USDC".into(), 2, 6),
+            (110_000, "xyz:TSLA".into(), 3, 3),
+        ]
+    );
+}
+
+/// One `replica_cmds` line: one bundle of `(action, user, native response)`.
+fn block_line(acts: &[(Value, &str, Value)]) -> String {
+    let sa: Vec<Value> = acts
+        .iter()
+        .map(|(a, _, _)| json!({"signature": {"r": "0x1", "s": "0x2", "v": 27}, "action": a, "nonce": 1}))
+        .collect();
+    let rs: Vec<Value> = acts
+        .iter()
+        .map(|(_, u, r)| json!({"user": u, "res": r}))
+        .collect();
+    json!({"abci_block": {"time": "2025-09-08T06:41:57.997372546", "round": 1, "parent_round": 0,
+        "proposer": BOB, "hardfork": {"version": 57, "round": 1},
+        "signed_action_bundles": [["0xb4", {"signed_actions": sa, "broadcaster": BOB, "broadcaster_nonce": 1}]]},
+        "resps": {"Full": [["0xb4", rs]]}})
+    .to_string()
+}
+
+fn replay_block(line: &str, diffs: Value) -> p2_node::replay::ReplayBlock {
+    let b = hl_block::decode_block(line).unwrap();
+    let ms = b.time_ns / 1_000_000;
+    let d: Vec<hl_node_convert::node::BookDiff> = serde_json::from_value(diffs).unwrap();
+    p2_node::replay::ReplayBlock::new(1, b, Some((ms, d))).unwrap()
+}
+
+/// Every cause in a block is listed, not only the first; a diff mismatch is
+/// attributed to an action cause when one exists, and listed as
+/// diffs:content only when none does.
+#[test]
+fn block_classes_lists_every_cause_not_the_first() {
+    let all = AssetTable::new(vec![
+        meta().get(7).unwrap().clone(),
+        AssetMeta {
+            asset: 10_007,
+            coin: "@7".into(),
+            sz_decimals: 2,
+            px_decimals: 6,
+        },
+    ]);
+    let ok_default = json!({"status": "ok", "response": {"type": "default"}});
+    let alo = |a: u64| json!({"type": "order", "grouping": "na", "orders": [{"a": a, "b": true, "p": "9.0", "s": "1.0", "r": false, "t": {"limit": {"tif": "Alo"}}}]});
+    let line = block_line(&[
+        (
+            json!({"type": "scheduleCancel", "time": 5}),
+            ALICE,
+            ok_default.clone(),
+        ),
+        (
+            json!({"type": "noop", "nonce": 1}),
+            ALICE,
+            json!({"status": "err", "response": "User or API Wallet 0xabc does not exist."}),
+        ),
+        (
+            alo(10_007),
+            ALICE,
+            json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 204}}]}}}),
+        ),
+        (
+            alo(7),
+            ALICE,
+            json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 205}}]}}}),
+        ),
+    ]);
+    let b = replay_block(
+        &line,
+        json!([
+            {"user": ALICE, "oid": 205, "coin": "TST", "side": "B", "px": "9.0", "raw_book_diff": {"new": {"sz": "1.0"}}},
+            {"user": BOB, "oid": 9, "coin": "#5", "side": "A", "px": "0.5", "raw_book_diff": "remove"}
+        ]),
+    );
+    let mut e = engine();
+    let out = e.execute_block(b.block().time_ns, &b.user_actions());
+    assert_eq!(
+        p2_node::hlexec::block_classes(&meta(), &all, &b, &out),
+        vec![
+            "unsupported:scheduleCancel",
+            "resp:noop:unknown-wallet",
+            "unseeded-book:spot",
+            "resp:order:oid-offset",
+            "unseeded-book:outcome",
+        ]
+    );
+
+    // Every response matches; a held book's diffs differ: unexplained.
+    let line = block_line(&[(json!({"type": "noop", "nonce": 1}), ALICE, ok_default)]);
+    let b = replay_block(
+        &line,
+        json!([{"user": BOB, "oid": 100, "coin": "TST", "side": "A", "px": "10.0", "raw_book_diff": "remove"}]),
+    );
+    let out = engine().execute_block(b.block().time_ns, &b.user_actions());
+    assert_eq!(
+        p2_node::hlexec::block_classes(&meta(), &all, &b, &out),
+        vec!["diffs:content"]
+    );
+}
+
+/// Resync gives an adopted order the cloid native's order-status file
+/// records for its oid when the block's responses do not carry it (end-state
+/// check at 1232440000: 220 books differed only in such cloids). Lane 1's
+/// harness does the same (`resync_diffs_get_cloids_from_native_statuses`).
+#[test]
+fn resync_takes_cloids_from_native_order_statuses() {
+    let statuses = concat!(
+        r#"{"block_number":1,"events":[{"status":"open","order":{"oid":600,"cloid":"0x0000000000000000000001a1eed3c127"}},"#,
+        r#"{"status":"open","order":{"oid":601,"cloid":null}}]}"#,
+        "\n"
+    );
+    let idx = p2_node::hlexec::load_statuses(statuses.as_bytes()).unwrap();
+    assert_eq!(idx.max_oids.get(&1), Some(&601));
+    let mut e = engine()
+        .with_status_max_oids(idx.max_oids)
+        .with_status_cloids(idx.cloids);
+    let native_diffs: Vec<hl_node_convert::node::BookDiff> = serde_json::from_value(json!([
+        {"user": BOB, "oid": 600, "coin": "TST", "side": "A", "px": "11.0", "raw_book_diff": {"new": {"sz": "1.0"}}},
+        {"user": BOB, "oid": 601, "coin": "TST", "side": "A", "px": "12.0", "raw_book_diff": {"new": {"sz": "1.0"}}}
+    ]))
+    .unwrap();
+    e.resync(1, &native_diffs, &[]).unwrap();
+    let book = e.final_book().unwrap();
+    assert!(
+        book.lines()
+            .any(|l| l.contains(" 600 ") && l.ends_with(" 0x0000000000000000000001a1eed3c127")),
+        "{book}"
+    );
+    assert!(
+        book.lines()
+            .any(|l| l.contains(" 601 ") && l.ends_with(" -")),
+        "{book}"
+    );
+}

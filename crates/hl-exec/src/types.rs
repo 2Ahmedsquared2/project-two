@@ -89,7 +89,9 @@ pub struct OrderReq {
     /// The oid native assigned to this leg, when the driver knows it from
     /// native's response. Used ONLY for comparison: the engine always uses
     /// its own counter and counts a differing hint in
-    /// [`BlockOutcome::oid_mismatches`].
+    /// [`BlockOutcome::oid_mismatches`]. On a leg that takes no oid (a
+    /// pre-reject, size or price 0, a modify of an unknown order or asset)
+    /// any `Some` hint counts, since native spent an oid the engine did not.
     pub oid_hint: Option<Oid>,
 }
 
@@ -310,7 +312,8 @@ pub struct BlockOutcome {
     pub fills: Vec<Fill>,
     /// At least one action or leg was unsupported: the block cannot count as reproduced.
     pub has_unsupported: bool,
-    /// Legs whose `oid_hint` differed from the engine's own counter.
+    /// Legs whose `oid_hint` differed from the engine's own counter, or
+    /// was `Some` on a leg that took no oid.
     pub oid_mismatches: u32,
 }
 

@@ -275,3 +275,62 @@ fn replay_compare_only_snapshot_at_u64_max_is_refused() {
     assert_eq!(o.status.code(), Some(1), "{err}");
     assert!(err.contains("overflows u64"), "{err}");
 }
+
+/// Gzip inputs (`.gz`, read via `gzip -dc`) and a `--blocks` list split
+/// across two files give the same report as the plain single files; a
+/// corrupt gzip is an error, not a short input.
+#[test]
+fn replay_compare_only_reads_gzip_and_split_block_files() {
+    let dir = tmp("gz-input");
+    std::fs::create_dir_all(&dir).unwrap();
+    let blocks = std::fs::read_to_string(data("three_blocks.jsonl")).unwrap();
+    let lines: Vec<&str> = blocks.lines().collect();
+    let gz = |name: &str, text: String| {
+        let plain = dir.join(name);
+        std::fs::write(&plain, text).unwrap();
+        let st = std::process::Command::new("gzip")
+            .arg("-f")
+            .arg(&plain)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        format!("{}.gz", plain.display())
+    };
+    let a = gz("a.jsonl", format!("{}\n", lines[0]));
+    let b = gz("b.jsonl", format!("{}\n{}\n", lines[1], lines[2]));
+    let d = gz(
+        "d.jsonl",
+        std::fs::read_to_string(data("diffs_1000.jsonl")).unwrap(),
+    );
+    let run = |blocks: &str, diffs: &str| {
+        bin()
+            .args(["replay", "--compare-only", "--engine", "echo"])
+            .args(["--blocks", blocks, "--diffs", diffs])
+            .args(["--snapshot-height", "999"])
+            .output()
+            .unwrap()
+    };
+    let plain = run(&data("three_blocks.jsonl"), &data("diffs_1000.jsonl"));
+    let split = run(&format!("{a},{b}"), &d);
+    assert!(
+        split.status.success(),
+        "{}",
+        String::from_utf8_lossy(&split.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&split.stdout),
+        String::from_utf8_lossy(&plain.stdout)
+    );
+    assert!(String::from_utf8_lossy(&split.stdout).contains("per-block outputs matched 3/3"));
+    let bad = dir.join("bad.jsonl.gz");
+    let mut bytes = std::fs::read(&d).unwrap();
+    bytes.truncate(bytes.len() / 2);
+    std::fs::write(&bad, bytes).unwrap();
+    let o = run(&data("three_blocks.jsonl"), bad.to_str().unwrap());
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+}
