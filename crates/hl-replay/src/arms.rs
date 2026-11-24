@@ -446,6 +446,21 @@ fn tokio_arm(
     }
 }
 
+/// Whether this host sets up an `io_uring` with a polling thread when no CPU
+/// is named for it. The ring, and its thread, are gone on return.
+#[cfg(feature = "compio")]
+fn sqpoll_ring_without_cpu() -> bool {
+    use compio::driver::{DriverType, ProactorBuilder};
+
+    let mut proactor = ProactorBuilder::new();
+    proactor.driver_type(DriverType::IoUring);
+    proactor.sqpoll_idle(Duration::from_secs(10));
+    compio::runtime::RuntimeBuilder::new()
+        .with_proactor(proactor)
+        .build()
+        .is_ok_and(|rt| rt.driver_type() == DriverType::IoUring)
+}
+
 #[cfg(feature = "compio")]
 fn compio_arm(
     sqpoll: Option<SqPoll>,
@@ -483,7 +498,22 @@ fn compio_arm(
         .build()
     {
         Ok(rt) => rt,
-        Err(e) => return unavailable(format!("io_uring could not be set up on this host: {e}")),
+        Err(e) => {
+            // The kernel answers EINVAL both to a host without a polling
+            // thread and to a polling-thread CPU it will not use (not
+            // possible, offline, or outside the task's cpuset: v6.1
+            // `io_sq_offload_create`). A ring that polls with no CPU named
+            // tells the two apart.
+            let core = sqpoll.and_then(|sq| sq.core);
+            let its_core =
+                e.kind() == std::io::ErrorKind::InvalidInput && sqpoll_ring_without_cpu();
+            return unavailable(match core {
+                Some(core) if its_core => format!(
+                    "io_uring refused --sqpoll-core {core} ({e}): the core is offline, not a CPU of this host, or outside this process's cpuset; a polling thread with no core named was accepted"
+                ),
+                _ => format!("io_uring could not be set up on this host: {e}"),
+            });
+        }
     };
     if rt.driver_type() != DriverType::IoUring {
         return unavailable(format!(

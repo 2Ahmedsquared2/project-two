@@ -79,6 +79,7 @@ sections that hold one, so read that list before trusting a run.
 
 The report also prints `warning:` lines, which never stop a run:
 
+- what the `compio-sqpoll` section below says about `--sqpoll-core`;
 - a pinned feeder or hot core outside `isolcpus`, `nohz_full` or `rcu_nocbs`,
   or one of those three not set at all. A core in `nohz_full` is not reported
   as missing from `rcu_nocbs`, because the kernel offloads RCU callbacks on
@@ -190,14 +191,35 @@ names the core asked for, and each `compio-sqpoll` row carries
 `sqpoll=cpus:<list>`: the thread's `Cpus_allowed_list` as the kernel reports
 it once the ring exists (`unknown` if it could not be read).
 
+If the kernel refuses the core (`EINVAL`: not a CPU of the host, offline, or
+outside the process's cpuset) the arm is `unavailable` and the reason names
+`--sqpoll-core N`. The harness tells that from a host with no polling thread
+at all by setting up one more ring with no core named: only if that one is
+accepted is the core blamed.
+
+With `--host-facts`, the report warns (never stops) when the polling thread's
+core is the feeder or hot core, shares a physical core with either (the
+capture's `thread siblings` line), is outside `isolcpus`, or is on another
+NUMA node than the hot core. `nohz_full` and `rcu_nocbs` are not asked of it.
+A capture without that core's sibling line or without NUMA nodes gives no
+line for that check.
+
 Why: in the Tokyo runs of d7f9087 (hot core 15, kernel 7.0) this arm's t1-t0,
 the parser alone, was p50 9 ms against about 1 µs on every other arm, in whole
-milliseconds. The likely cause is the polling thread spinning on the hot core,
-where it starts and, on a core the scheduler does not balance, stays. That
-cause is **inferred, not confirmed**: on a 2-core Linux 6.1 machine the thread
-was seen on the hot core in 4 of 5 samples while allowed on both cores, but
-the millisecond t1-t0 did not reproduce there. A Tokyo run with
-`--sqpoll-core` on a third core confirms it if t1-t0 returns to about 1 µs.
+milliseconds. The cause was the polling thread spinning on the hot core. Two
+one-round Tokyo runs on 2026-11-24 (issue #61; feeder 14, hot 15, generated
+lines, n=10000):
+
+| run | polling thread | t1-t0 p50 | t1-t0 p99 | t2-t0 p50 |
+|---|---|---|---|---|
+| d7f9087, no flag | core 15 in 6 of 6 samples, allowed list 15, 97% CPU | 9,019,391 ns | 19,005,439 ns | 10,018,815 ns |
+| 8327974, `--sqpoll-core 13` | core 13 in 6 of 6 samples, allowed list 13, 100% CPU | 1,619 ns | 276,991 ns | 34,303 ns |
+
+The first row is as the operator reported it; the second is also in that
+run's `report.txt`. Not explained: the second run's tail (t2-t0 p99 1.0 ms,
+max 4.0 ms). No core on that box is isolated and hl-node's threads ran on
+cores 13 to 15 during the run, which is a likely cause and not a measured
+one. On a 2-core Linux 6.1 machine the millisecond t1-t0 never reproduced.
 
 Detect arms (`--arms detect`): lines are appended to a file in `--tail-dir`
 (default `/dev/shm`) and the reader tails it, as the node's output is read.

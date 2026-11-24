@@ -349,12 +349,25 @@ impl HostFacts {
     /// outside `isolcpus`, `nohz_full` or `rcu_nocbs`, a pinned CPU 0 that
     /// `nohz_full` names, or a hot core that shares its physical core.
     /// Warnings only; none of this stops a run.
-    fn core_warnings(&self, feeder: Option<usize>, hot: Option<usize>) -> Vec<String> {
+    fn core_warnings(
+        &self,
+        feeder: Option<usize>,
+        hot: Option<usize>,
+        sqpoll: Option<usize>,
+    ) -> Vec<String> {
         let pinned: Vec<(&str, usize)> = [("feeder", feeder), ("hot", hot)]
             .into_iter()
             .filter_map(|(role, core)| Some((role, core?)))
             .collect();
-        let mut warnings = self.list_warnings("isolcpus", "isolated", &pinned);
+        // Isolation is the one list asked of the polling thread's core: it is
+        // a kernel thread that spins, and what must not happen to it is
+        // another task being scheduled there.
+        let with_sqpoll: Vec<(&str, usize)> = pinned
+            .iter()
+            .copied()
+            .chain(sqpoll.map(|core| ("sqpoll", core)))
+            .collect();
+        let mut warnings = self.list_warnings("isolcpus", "isolated", &with_sqpoll);
         warnings.extend(self.list_warnings("nohz_full", "tickless", &pinned));
         let tickless = self.cpu_list("nohz_full");
         // "The boot CPU will be forced outside the range to maintain the
@@ -414,7 +427,61 @@ impl HostFacts {
                 }
             }
         }
+        if let Some(sqpoll) = sqpoll {
+            warnings.extend(self.sqpoll_warnings(&pinned, sqpoll));
+        }
         warnings
+    }
+
+    /// What a reader must weigh about the core given to the `compio-sqpoll`
+    /// arm's kernel polling thread, beside its isolation: the thread spins at
+    /// close to 100%, so it takes about half of whatever shares its physical
+    /// core, and it works on the hot thread's ring, so another NUMA node puts
+    /// that memory a node away from one of the two.
+    fn sqpoll_warnings(&self, pinned: &[(&str, usize)], sqpoll: usize) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let prefix = format!("cpu{sqpoll} thread siblings: ");
+        let siblings = self
+            .section("smt")
+            .and_then(|body| body.lines().find_map(|l| l.strip_prefix(prefix.as_str())));
+        for &(role, core) in pinned {
+            if core == sqpoll {
+                let against = if role == "hot" {
+                    "the hot thread"
+                } else {
+                    "the feeder and sink"
+                };
+                warnings.push(format!(
+                    "sqpoll core {sqpoll} is the {role} core: the kernel polling thread spins there against {against}"
+                ));
+            } else if let Some(siblings) = siblings {
+                if sysfs_list_contains(siblings, core) {
+                    warnings.push(format!(
+                        "sqpoll core {sqpoll} shares its physical core with {role} core {core} (siblings {siblings})"
+                    ));
+                }
+            }
+        }
+        let hot = pinned.iter().find(|(role, _)| *role == "hot");
+        if let Some(&(_, hot)) = hot {
+            if let (Some(ours), Some(theirs)) = (self.numa_node(sqpoll), self.numa_node(hot)) {
+                if ours != theirs {
+                    warnings.push(format!(
+                        "sqpoll core {sqpoll} is on NUMA node {ours} and hot core {hot} is on NUMA node {theirs}"
+                    ));
+                }
+            }
+        }
+        warnings
+    }
+
+    /// The NUMA node whose `nodeN cpus:` line lists `cpu`, if the capture
+    /// has one.
+    fn numa_node(&self, cpu: usize) -> Option<&str> {
+        self.section("numa")?.lines().find_map(|line| {
+            let (node, cpus) = line.strip_prefix("node")?.split_once(" cpus: ")?;
+            sysfs_list_contains(cpus, cpu).then_some(node)
+        })
     }
 
     /// Whether the operator appended the manual RTT section. The harness
@@ -641,14 +708,32 @@ impl Region {
     }
 }
 
-/// "feeder core 2 and hot core 3" with the verb that agrees with it.
+/// "feeder core 2 and hot core 3" (or "a, b and c") with the verb that
+/// agrees with it.
 fn name_cores(pinned: &[(&str, usize)]) -> (String, &'static str) {
     let cores: Vec<String> = pinned
         .iter()
         .map(|(role, core)| format!("{role} core {core}"))
         .collect();
     let verb = if cores.len() == 1 { "is" } else { "are" };
-    (cores.join(" and "), verb)
+    let named = match cores.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => cores.concat(),
+    };
+    (named, verb)
+}
+
+/// Whether a CPU list as sysfs prints one (`cpulist`,
+/// `thread_siblings_list`: `0-3,8` from `%*pbl`) names `cpu`. A part that is
+/// not a number or an ascending pair of numbers names nothing.
+fn sysfs_list_contains(list: &str, cpu: usize) -> bool {
+    list.trim().split(',').any(|part| {
+        let (from, to) = part.split_once('-').unwrap_or((part, part));
+        match (from.parse::<usize>(), to.parse::<usize>()) {
+            (Ok(from), Ok(to)) => (from..=to).contains(&cpu),
+            _ => false,
+        }
+    })
 }
 
 /// What a report says about host facts.
@@ -684,13 +769,7 @@ impl HostFactsNote {
         feeder_core: Option<usize>,
         hot_core: Option<usize>,
     ) -> Self {
-        Self::Captured {
-            path: path.display().to_string(),
-            captured_utc: facts.captured_utc().to_owned(),
-            unavailable: facts.unavailable().into_iter().map(str::to_owned).collect(),
-            manual_rtt: facts.has_manual_rtt(),
-            warnings: facts.core_warnings(feeder_core, hot_core),
-        }
+        Self::captured_with_sqpoll(path, facts, feeder_core, hot_core, None)
     }
 
     /// [`Self::captured`], with warnings too about the core the
@@ -703,7 +782,12 @@ impl HostFactsNote {
         hot_core: Option<usize>,
         sqpoll_core: Option<usize>,
     ) -> Self {
-        let _ = sqpoll_core;
-        Self::captured(path, facts, feeder_core, hot_core)
+        Self::Captured {
+            path: path.display().to_string(),
+            captured_utc: facts.captured_utc().to_owned(),
+            unavailable: facts.unavailable().into_iter().map(str::to_owned).collect(),
+            manual_rtt: facts.has_manual_rtt(),
+            warnings: facts.core_warnings(feeder_core, hot_core, sqpoll_core),
+        }
     }
 }

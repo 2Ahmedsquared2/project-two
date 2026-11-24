@@ -1500,15 +1500,15 @@ fn a_polling_thread_on_a_sibling_of_the_hot_or_feeder_core_is_a_warning() {
     // siblings of each other and of the polling thread.
     let f = file_with_topology(
         &format!("isolcpus: 0-15\n{QUIET}"),
-        "active: 1\ncpu0 thread siblings: 0-2\ncpu1 thread siblings: 0-2\ncpu2 thread siblings: 0-2",
+        "active: 1\ncpu1 thread siblings: 1-3\ncpu2 thread siblings: 1-3\ncpu3 thread siblings: 1-3",
         "node0 cpus: 0-15",
     );
     assert_eq!(
-        sqpoll_warnings(&f, Some(0), Some(1), Some(2)),
+        sqpoll_warnings(&f, Some(1), Some(2), Some(3)),
         [
-            "hot core 1 shares its physical core with another thread (siblings 0-2)",
-            "sqpoll core 2 shares its physical core with feeder core 0 (siblings 0-2)",
-            "sqpoll core 2 shares its physical core with hot core 1 (siblings 0-2)",
+            "hot core 2 shares its physical core with another thread (siblings 1-3)",
+            "sqpoll core 3 shares its physical core with feeder core 1 (siblings 1-3)",
+            "sqpoll core 3 shares its physical core with hot core 2 (siblings 1-3)",
         ]
     );
     // An unpinned feeder or hot thread has no core to share.
