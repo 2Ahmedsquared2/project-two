@@ -17,6 +17,9 @@ fn bin() -> Command {
 /// The line `hl-capture node` writes to stderr once its first poll is done:
 /// a file that appears after it is read from its start.
 const READY: &str = "{\"ready\":true}";
+/// The stderr line the reader prints when it stops reading (deadline or error),
+/// before the writer drains the ring.
+const READER_STOPPED: &str = "{\"reader_stopped\":true}";
 
 /// Spawns `cmd` with stderr piped and blocks until it reports [`READY`], so
 /// a test never races the binary's startup (a slow `exec` on a loaded Mac
@@ -177,7 +180,7 @@ fn duration_bounds_the_run_under_a_busy_input() {
     fs::write(&staged, body).unwrap();
     let out = t.path().join("obs.jsonl");
     let start = std::time::Instant::now();
-    let (mut child, _err, _pre) = spawn_ready(
+    let (mut child, mut err, _pre) = spawn_ready(
         bin()
             .arg("node")
             .arg(&root)
@@ -189,10 +192,28 @@ fn duration_bounds_the_run_under_a_busy_input() {
             .args(["--ring-records", "1048576"]),
     );
     fs::rename(&staged, dir.join("8")).unwrap();
-    let status = child.wait().unwrap();
+    // The deadline bounds reading. What the ring already holds is still
+    // written afterwards, and that drain takes as long as its backlog needs,
+    // so the bound is measured at the reader's stop line, not at exit.
+    let mut line = String::new();
+    while err.read_line(&mut line).unwrap() > 0 && line.trim_end() != READER_STOPPED {
+        line.clear();
+    }
     let took = start.elapsed();
+    assert_eq!(
+        line.trim_end(),
+        READER_STOPPED,
+        "the reader reports its stop"
+    );
+    assert!(took < Duration::from_millis(1800), "read for {took:?}");
+    let mut rest = String::new();
+    err.read_to_string(&mut rest).unwrap();
+    let status = child.wait().unwrap();
     assert!(status.success());
-    assert!(took < Duration::from_millis(1800), "ran {took:?}");
+    // Everything read before the deadline is written: the drain is lossless.
+    let c = counters(rest.as_bytes());
+    assert_eq!(c["ring_dropped"], 0);
+    assert_eq!(c["written"], c["lines"]);
     let obs = read_observations(std::io::BufReader::new(fs::File::open(&out).unwrap())).unwrap();
     let heights: Vec<_> = obs.iter().map(|o| o.block_number.unwrap()).collect();
     assert!(!heights.is_empty(), "some of the burst was captured");

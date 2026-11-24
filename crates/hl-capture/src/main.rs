@@ -31,8 +31,10 @@
 //! printed on stderr as a `detect` line at start (and again if a later
 //! inotify failure forces `poll`).
 //!
-//! The run stops after `--duration-s` seconds (default: never; a sleep is
-//! cut short so the run ends on time). A newer hourly file is looked for every
+//! Reading stops after `--duration-s` seconds (default: never; a sleep is
+//! cut short so it ends on time) and `{"reader_stopped":true}` goes to
+//! stderr; the writer then writes what the ring still holds, so the process
+//! exits later by the time that backlog takes (nothing read is discarded). A newer hourly file is looked for every
 //! `--rescan-ms` milliseconds (default 1000) and, in `inotify` mode, as soon
 //! as a directory changes; never per poll. The look is a directory walk on
 //! the reader thread, which cannot read while it walks (measured 13 us with
@@ -210,6 +212,9 @@ fn run(args: &Args) -> std::io::Result<()> {
         }
     };
     let dropped = sink.dropped();
+    // Cold: once. Reading ends here, on time; the writer still has whatever
+    // the ring holds to write, and that takes as long as the backlog needs.
+    eprintln!("{{\"reader_stopped\":true}}");
     // Dropping the reader's end tells the writer to drain and stop.
     drop(sink);
     let written = writer

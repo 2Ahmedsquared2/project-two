@@ -88,8 +88,12 @@ file before switching at rotation, and stamps `CLOCK_REALTIME` once per `read`
 that returns data, before parsing; a line split across reads carries the stamp
 of the read that delivered its newline. Bad lines are counted, not fatal. Lines longer than `--max-line-bytes`
 (default 1 MiB) are dropped and counted (`oversized_lines`), so a stream
-without newlines holds at most that much. `--duration-s` is a hard deadline:
-a wait is cut short.
+without newlines holds at most that much. `--duration-s` is a hard deadline for reading:
+a wait is cut short, and `{"reader_stopped":true}` goes to stderr when reading
+ends. The writer thread then writes every record the ring still holds, so the
+process exits after the deadline by however long that backlog takes (measured
+0.5 to 0.95 s for 350k to 600k queued records, debug build, loaded shared
+machine); nothing already read is discarded.
 After its first poll it writes `{"ready":true}` to stderr (after the `detect`
 line); a harness that creates or renames in a file it expects read must wait
 for that line first, or a slow start can make the file count as history (read
