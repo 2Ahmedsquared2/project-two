@@ -1,0 +1,24 @@
+[package]
+name = "hl-exec"
+description = "Execution core: applies Hyperliquid order actions to preallocated L4 books with an incremental L2 view, zero allocation per block after warm-up."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+hl-book-ref = { workspace = true }
+hl-alloc-gate = { path = "../hl-alloc-gate" }
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "exec"
+harness = false
+
+[lints]
+workspace = true
