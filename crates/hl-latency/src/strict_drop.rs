@@ -117,6 +117,17 @@ impl StrictFailures {
         }
     }
 
+    /// RED STUB: the whole-block drop, whatever the observations carry.
+    ///
+    /// # Errors
+    /// None yet.
+    pub fn drop_from(
+        &self,
+        obs: Vec<Observation>,
+    ) -> Result<(Vec<Observation>, StrictDrop), StrictDropError> {
+        Ok(self.apply(obs))
+    }
+
     /// Removes every listed block from `obs`, keeping the order of the rest.
     #[must_use]
     pub fn apply(&self, obs: Vec<Observation>) -> (Vec<Observation>, StrictDrop) {
@@ -193,4 +204,82 @@ pub struct StrictDrop {
     /// `strict_failures_omitted > 0`: some torn stamps may still be in the
     /// distribution.
     pub strict_drop_incomplete: bool,
+    /// Whether the drop was by line (the observations carry their file and
+    /// offset) and not by whole block.
+    pub strict_drop_by_line: bool,
+    /// Blocks that lost their earliest node line to the drop and kept a
+    /// later one, so they pair on a later stamp. By-line drop only.
+    pub strict_shifted_first_arrival: u64,
+}
+
+/// Why observations and `hl-strict-pass` output cannot be matched by line.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StrictDropError {
+    /// Some node observations carry their file and offset and some do not.
+    #[error(
+        "{with} node observations carry file_date, file_hour and line_offset and {without} do not: a mixed observation file cannot be matched to the strict pass"
+    )]
+    Mixed {
+        /// Node observations with all three fields.
+        with: u64,
+        /// Node observations with none.
+        without: u64,
+    },
+    /// An observation with only some of the three fields.
+    #[error(
+        "an observation (block_time_ms {block_time_ms}, recv_ns {recv_ns}) has only some of file_date, file_hour and line_offset"
+    )]
+    PartialLocation {
+        /// Its block time.
+        block_time_ms: u64,
+        /// Its stamp.
+        recv_ns: u64,
+    },
+    /// Two node observations name the same line.
+    #[error("two node observations claim the same line: file {date}/{hour}, offset {offset}")]
+    DuplicateLine {
+        /// `file_date`.
+        date: u32,
+        /// `file_hour`.
+        hour: u8,
+        /// `line_offset`.
+        offset: u64,
+    },
+    /// A scan-accepted failure whose path does not end in a date and hour.
+    #[error(
+        "strict-pass failure in {path:?}: the path does not end in {{YYYYMMDD}}/{{hour}}, so its line cannot be matched to an observation"
+    )]
+    FailureWithoutFile {
+        /// The path as the strict pass printed it.
+        path: String,
+    },
+    /// Two different paths in the strict-pass output are the same date and
+    /// hour: more than one root, so an offset names more than one line.
+    #[error(
+        "strict-pass output covers {first:?} and {second:?}, the same date and hour: run it over one root"
+    )]
+    TwoPathsOneFile {
+        /// The path seen first.
+        first: String,
+        /// The other one.
+        second: String,
+    },
+    /// The observation at a listed line is not the block the failure names.
+    #[error(
+        "{path} offset {offset}: the strict pass lists block {listed_number} at {listed_time_ms} ms, but the observation of that line is block {observed_number:?} at {observed_time_ms} ms: wrong file or offset"
+    )]
+    KeyMismatch {
+        /// The failure's path.
+        path: String,
+        /// The failure's offset.
+        offset: u64,
+        /// The failure's `block_number`.
+        listed_number: u64,
+        /// The failure's `block_time_ms`.
+        listed_time_ms: u64,
+        /// The observation's `block_number`.
+        observed_number: Option<u64>,
+        /// The observation's `block_time_ms`.
+        observed_time_ms: u64,
+    },
 }
