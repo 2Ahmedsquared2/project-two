@@ -85,6 +85,9 @@ mod inotify {
         fs::write(&file, b"").unwrap();
         let mut w = waiter();
         assert_eq!(w.follow(t.path(), Some(&file)), None);
+        // The first wait on a newly followed file does not sleep (see
+        // `a_line_written_before_the_watch_existed_...`).
+        w.wait(Instant::now() + Duration::from_millis(50));
 
         // Nothing written: the wait runs to its deadline.
         let start = Instant::now();
@@ -109,6 +112,48 @@ mod inotify {
             "a write to the file is not a directory change"
         );
         writer.join().unwrap();
+    }
+
+    /// Issue #29: the node may write to a file between the reader's last
+    /// read of it and the watch being added. No event is raised for that
+    /// write, so the wait after a file is first followed must not sleep.
+    #[test]
+    fn a_line_written_before_the_watch_existed_does_not_wait_for_the_next_write() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("hourly").join("20261119");
+        fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("8");
+        // Written before the watch: raises no event.
+        fs::write(&first, b"x\n").unwrap();
+        let mut w = waiter();
+        assert_eq!(w.follow(t.path(), Some(&first)), None);
+        let start = Instant::now();
+        let wake = w.wait(start + Duration::from_secs(20));
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the first wait on a newly followed file slept {:?}",
+            start.elapsed()
+        );
+        assert!(!wake.rescan);
+
+        // Once only: with nothing written, the next wait runs to its end.
+        let start = Instant::now();
+        w.wait(start + Duration::from_millis(50));
+        assert!(start.elapsed() >= Duration::from_millis(50));
+        // Following the same file again changes nothing.
+        assert_eq!(w.follow(t.path(), Some(&first)), None);
+        let start = Instant::now();
+        w.wait(start + Duration::from_millis(50));
+        assert!(start.elapsed() >= Duration::from_millis(50));
+
+        // The same on a switch to the next file.
+        let second = dir.join("9");
+        fs::write(&second, b"y\n").unwrap();
+        assert_eq!(w.follow(t.path(), Some(&second)), None);
+        let start = Instant::now();
+        // The directory event for the new file is still reported.
+        assert!(w.wait(start + Duration::from_secs(20)).rescan);
+        assert!(start.elapsed() < Duration::from_secs(10));
     }
 
     #[test]

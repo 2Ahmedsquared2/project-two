@@ -135,8 +135,48 @@ a slow node; a counted drop is only a missing sample. **A run with
 The strict parser (`parse_node_line`) runs on the reader only for a line the
 header scan refuses (`scan_fallbacks`, expected 0 on hl-node output). Lines the
 scan accepts are not strict-validated by this tool: `height_breaks` counts
-block numbers that do not follow on, and an offline strict pass over the same
-hourly files is the planned check for writer-torn lines.
+block numbers that do not follow on, and the offline strict pass over the same
+hourly files (`hl-strict-pass`, below) is the check for writer-torn lines.
+
+### Offline strict pass (`crates/hl-strict-pass`)
+
+Run after a capture, never beside the reader:
+`hl-strict-pass [--max-failures N] [--max-line-bytes N]
+[--allow-unterminated-tail] [--fail-on-height-gap] <path>...`, where a path is
+an hourly file or a directory whose `{date}/{hour}` files are read oldest
+first. A record is a newline-terminated line, and it passes when it is valid
+UTF-8, `hl_latency::parse_node_line` accepts it (the whole line is one JSON
+object with a timestamp `block_time` and a u64 `block_number`), its top level
+has `local_time` (string) and `events` (array) with none of the four keys
+repeated, and the header scan, where it answers, agrees with the strict parse.
+What the events hold is not checked.
+
+stdout is JSON lines: a `failure` line per failed record (`path`, `line`,
+`offset`, `len`, `reason`, `scan_accepted`, and for a scan-accepted line the
+`block_number` and `block_time_ms` hl-capture recorded for it, so that
+observation can be dropped from the pairing); a `file` line per file with its
+counters and first/last `block_number` and `block_time_ms`; one `total` line.
+Counters: `records`, `failed`, `scan_accepted_failed` (failed lines the reader
+stamped), `unterminated_tail`, `height_breaks` split into `height_repeats`,
+`height_gaps` and `height_backwards`, `block_time_backwards`,
+`duplicate_block_numbers` (a height seen earlier in the pass, other than a
+repeat of the line before: an overlapping or rewritten file). At most
+`--max-failures` (default 100) failures are listed; the counts are never
+capped and `failures_omitted` says how many were left out. A line over
+`--max-line-bytes` (default 64 MiB) fails as `oversized` without being parsed.
+A last line with no newline fails as `unterminated`, unless
+`--allow-unterminated-tail`, which applies to the last file only (the hour
+still being written).
+
+Heights are compared with the last record that passed, across files; a failed
+record is not a reference. hl-capture's own `height_breaks` also counts from
+torn lines its scan accepted, so the two numbers can differ on a damaged file.
+Height breaks do not fail the run: with `--stream-with-block-info` a block can
+span several lines. `--fail-on-height-gap` makes gaps and backward steps (not
+repeats) fail it.
+
+Exit codes: 0 every record passed, 1 a record failed (or a gap, when asked),
+2 usage, 3 unreadable path or no hourly file found.
 
 A newer hourly file is looked for every `--rescan-ms` (default 1000) and, in
 `inotify` mode, when a directory changes; never per poll, and only once the
