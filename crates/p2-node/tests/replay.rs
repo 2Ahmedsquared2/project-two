@@ -1,0 +1,202 @@
+//! Replay driver: per-block comparison against native responses and book
+//! diffs, resync on mismatch, report grouped by cause.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use hl_block::decode_block;
+use hl_node_convert::node::{parse_batch, BookDiff};
+use p2_node::{
+    engine::{ActionResult, BlockOutcome, Engine, UserAction},
+    replay::{load_native_diffs, Cause, Replay, ReplayBlock},
+};
+use serde_json::Value;
+
+const BLOCKS: &str = include_str!("data/three_blocks.jsonl");
+const DIFFS: &str = include_str!("data/diffs_1000.jsonl");
+
+fn input() -> Vec<ReplayBlock> {
+    let diffs = load_native_diffs(DIFFS.as_bytes()).unwrap();
+    BLOCKS
+        .lines()
+        .enumerate()
+        .map(|(i, l)| {
+            let h = 1000 + u64::try_from(i).unwrap();
+            ReplayBlock::new(h, decode_block(l).unwrap(), diffs.get(&h).cloned()).unwrap()
+        })
+        .collect()
+}
+
+/// Answers from a script: per block, per action, either native's response
+/// (cheating on purpose, to test the comparator) or a mutation.
+struct Scripted {
+    native: Vec<(Vec<Value>, Vec<BookDiff>)>,
+    mutate: Option<(usize, Mutation)>,
+    block: usize,
+    resyncs: Vec<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum Mutation {
+    Response,
+    DropDiff,
+    Unsupported,
+    ExtraResponse,
+}
+
+impl Scripted {
+    fn new(input: &[ReplayBlock], mutate: Option<(usize, Mutation)>) -> Self {
+        let native = input
+            .iter()
+            .map(|b| (b.native_responses().to_vec(), b.native_diffs().to_vec()))
+            .collect();
+        Self {
+            native,
+            mutate,
+            block: 0,
+            resyncs: Vec::new(),
+        }
+    }
+}
+
+impl Engine for Scripted {
+    fn execute_block(&mut self, _block_time_ns: u64, actions: &[UserAction<'_>]) -> BlockOutcome {
+        let (resps, diffs) = self.native[self.block].clone();
+        assert_eq!(actions.len(), resps.len());
+        let mut out = BlockOutcome {
+            results: resps.into_iter().map(ActionResult::Response).collect(),
+            book_diffs: diffs,
+        };
+        if let Some((b, m)) = self.mutate {
+            if b == self.block {
+                match m {
+                    Mutation::Response => {
+                        out.results[0] = ActionResult::Response(
+                            serde_json::json!({"status":"err","response":"nope"}),
+                        );
+                    }
+                    Mutation::DropDiff => {
+                        out.book_diffs.pop();
+                    }
+                    Mutation::Unsupported => out.results[0] = ActionResult::Unsupported,
+                    Mutation::ExtraResponse => out.results.push(ActionResult::Unsupported),
+                }
+            }
+        }
+        self.block += 1;
+        out
+    }
+
+    fn resync(&mut self, height: u64, _native_diffs: &[BookDiff]) {
+        self.resyncs.push(height);
+    }
+}
+
+#[test]
+fn engine_never_sees_native_responses() {
+    // UserAction carries what a block carries, not what native answered.
+    let blocks = input();
+    let acts = blocks[0].user_actions();
+    assert_eq!(acts.len(), 2);
+    assert_eq!(acts[0].action_type, "order");
+    assert_eq!(acts[0].user, "0xecececececececececececececececececececec");
+    assert_eq!(
+        acts[1].vault_address,
+        Some("0x0101010101010101010101010101010101010101")
+    );
+}
+
+#[test]
+fn exact_engine_reproduces_every_block() {
+    let blocks = input();
+    let mut e = Scripted::new(&blocks, None);
+    let r = Replay::run(&mut e, &blocks);
+    assert_eq!((r.reproduced, r.blocks), (3, 3));
+    assert!(r.causes.is_empty());
+    assert_eq!(e.resyncs.len(), 0);
+    assert_eq!(r.reproduced_heights, vec![1000, 1001, 1002]);
+}
+
+#[test]
+fn response_mismatch_counts_and_resyncs() {
+    let blocks = input();
+    let mut e = Scripted::new(&blocks, Some((0, Mutation::Response)));
+    let r = Replay::run(&mut e, &blocks);
+    assert_eq!((r.reproduced, r.blocks), (2, 3));
+    assert_eq!(
+        r.causes.get(&Cause::Response {
+            action_type: "order".into(),
+            native_class: "ok:order:filled".into()
+        }),
+        Some(&1)
+    );
+    assert_eq!(e.resyncs, vec![1000]);
+    assert_eq!(r.first_mismatch.as_ref().unwrap().height, 1000);
+}
+
+#[test]
+fn book_diff_mismatch() {
+    let blocks = input();
+    let mut e = Scripted::new(&blocks, Some((0, Mutation::DropDiff)));
+    let r = Replay::run(&mut e, &blocks);
+    assert_eq!(r.reproduced, 2);
+    assert_eq!(r.causes.get(&Cause::BookDiffs), Some(&1));
+}
+
+#[test]
+fn unsupported_action_is_its_own_cause_and_coverage() {
+    let blocks = input();
+    let mut e = Scripted::new(&blocks, Some((2, Mutation::Unsupported)));
+    let r = Replay::run(&mut e, &blocks);
+    assert_eq!(r.reproduced, 2);
+    assert_eq!(
+        r.causes.get(&Cause::Unsupported {
+            action_type: "brandNewAction".into()
+        }),
+        Some(&1)
+    );
+    assert_eq!((r.actions_executed, r.actions), (2, 3));
+}
+
+#[test]
+fn result_count_mismatch() {
+    let blocks = input();
+    let mut e = Scripted::new(&blocks, Some((1, Mutation::ExtraResponse)));
+    let r = Replay::run(&mut e, &blocks);
+    assert_eq!(r.causes.get(&Cause::ResultCount), Some(&1));
+}
+
+#[test]
+fn missing_native_diffs_is_not_reproduced() {
+    let mut blocks = input();
+    let b = decode_block(BLOCKS.lines().nth(1).unwrap()).unwrap();
+    blocks[1] = ReplayBlock::new(1001, b, None).unwrap();
+    let mut e = Scripted::new(&blocks, None);
+    let r = Replay::run(&mut e, &blocks);
+    assert_eq!(r.reproduced, 2);
+    assert_eq!(r.causes.get(&Cause::NoNativeDiffs), Some(&1));
+}
+
+#[test]
+fn alignment_checked_by_block_time() {
+    // Height 1001's diffs carry block time ...58.070; block 0 is ...57.997.
+    let diffs = load_native_diffs(DIFFS.as_bytes()).unwrap();
+    let b0 = decode_block(BLOCKS.lines().next().unwrap()).unwrap();
+    let e = ReplayBlock::new(1001, b0, diffs.get(&1001).cloned()).unwrap_err();
+    assert!(e.to_string().contains("block time"), "{e}");
+}
+
+#[test]
+fn report_text() {
+    let blocks = input();
+    let mut e = Scripted::new(&blocks, Some((0, Mutation::Response)));
+    let r = Replay::run(&mut e, &blocks);
+    let t = r.to_text();
+    assert!(t.starts_with("blocks reproduced 2/3"), "{t}");
+    assert!(t.contains("response order / ok:order:filled"), "{t}");
+}
+
+#[test]
+fn native_diff_fixture_parses_with_converter_schema() {
+    let b = parse_batch::<BookDiff>(DIFFS.lines().next().unwrap()).unwrap();
+    assert_eq!(b.block_number, 1000);
+}

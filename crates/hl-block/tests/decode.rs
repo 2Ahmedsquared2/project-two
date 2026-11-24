@@ -149,3 +149,16 @@ fn reader_skips_blank_lines() {
     assert_eq!(got.len(), 1);
     assert!(got[0].is_ok());
 }
+
+#[test]
+fn outcome_round_trips_to_the_native_json() {
+    for l in lines() {
+        let raw: serde_json::Value = serde_json::from_str(l).unwrap();
+        let b = decode_block(l).unwrap();
+        for (bi, bundle) in b.bundles.iter().enumerate() {
+            for (ai, a) in bundle.actions.iter().enumerate() {
+                assert_eq!(a.outcome.to_json(), raw["resps"]["Full"][bi][1][ai]["res"]);
+            }
+        }
+    }
+}

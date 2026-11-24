@@ -116,6 +116,25 @@ pub enum Outcome {
     Err(String),
 }
 
+impl Outcome {
+    /// Re-renders the native `res` object exactly as decoded:
+    /// `{"status":"ok","response":{"type":..[,"data":..]}}` or
+    /// `{"status":"err","response":"<message>"}`. Lossless because decoding
+    /// rejects any other field.
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        match self {
+            Outcome::Err(m) => serde_json::json!({"status": "err", "response": m}),
+            Outcome::Ok { response_type, data: None } => {
+                serde_json::json!({"status": "ok", "response": {"type": response_type}})
+            }
+            Outcome::Ok { response_type, data: Some(d) } => {
+                serde_json::json!({"status": "ok", "response": {"type": response_type, "data": d}})
+            }
+        }
+    }
+}
+
 /// Why a block line was rejected.
 #[derive(Debug, thiserror::Error)]
 pub enum BlockError {
