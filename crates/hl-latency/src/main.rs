@@ -6,12 +6,17 @@
 //!
 //! Prints the [`hl_latency::Summary`] as JSON, with the
 //! [`hl_latency::StrictDrop`] fields beside it. `--strict-pass` takes the
-//! stdout of `hl-strict-pass` over the same hourly files and leaves every
-//! block it lists as a scan-accepted failure out of the pairing.
+//! stdout of `hl-strict-pass` over the same hourly files and leaves what it
+//! lists as scan-accepted failures out of the pairing: the one observation
+//! of each listed line when the observations carry their file and offset
+//! (`strict_drop_by_line`), else every observation of each listed block.
 //!
 //! Exit codes: 0 ok; 1 the summary was printed but the strict pass capped its
 //! failure list (`strict_drop_incomplete`), so torn stamps may remain; 2
-//! usage, or an unreadable or malformed file.
+//! usage, an unreadable or malformed file, or observations and strict-pass
+//! output that cannot be matched (some observations with offsets and some
+//! without, a listed path with no date and hour, two roots, or a listed line
+//! whose observation is another block).
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -66,16 +71,29 @@ fn main() -> ExitCode {
     };
     let (obs, strict) = match strict_path {
         None => (obs, StrictDrop::default()),
-        Some(p) => match File::open(&p)
-            .map_err(StrictReadError::from)
-            .and_then(|f| StrictFailures::read(BufReader::new(f)))
-        {
-            Ok(failures) => failures.apply(obs),
-            Err(e) => {
-                eprintln!("{}: {e}", Path::new(&p).display());
-                return ExitCode::from(2);
+        Some(p) => {
+            let failures = match File::open(&p)
+                .map_err(StrictReadError::from)
+                .and_then(|f| StrictFailures::read(BufReader::new(f)))
+            {
+                Ok(failures) => failures,
+                Err(e) => {
+                    eprintln!("{}: {e}", Path::new(&p).display());
+                    return ExitCode::from(2);
+                }
+            };
+            match failures.drop_from(obs) {
+                Ok(dropped) => dropped,
+                Err(e) => {
+                    eprintln!(
+                        "{} against {}: {e}",
+                        Path::new(&path).display(),
+                        Path::new(&p).display()
+                    );
+                    return ExitCode::from(2);
+                }
             }
-        },
+        }
     };
     let report = Report {
         summary: hl_latency::summarize(&hl_latency::pair(obs)),

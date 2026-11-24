@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 mod strict;
 mod strict_drop;
 
-pub use strict_drop::{StrictDrop, StrictFailures, StrictReadError};
+pub use strict_drop::{StrictDrop, StrictDropError, StrictFailures, StrictReadError};
 
 /// Where an arrival was observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -666,7 +666,9 @@ pub enum ReadError {
     },
 }
 
-/// Reads [`Observation`]s from JSON Lines (blank lines skipped).
+/// Reads [`Observation`]s from JSON Lines (blank lines skipped). A line with
+/// only some of `file_date`, `file_hour` and `line_offset` is refused:
+/// together they name one line of the node's output, apart they name none.
 pub fn read_observations<R: std::io::BufRead>(r: R) -> Result<Vec<Observation>, ReadError> {
     let mut out = Vec::new();
     for (i, line) in r.lines().enumerate() {
@@ -674,10 +676,18 @@ pub fn read_observations<R: std::io::BufRead>(r: R) -> Result<Vec<Observation>, 
         if line.trim().is_empty() {
             continue;
         }
-        let o = serde_json::from_str(&line).map_err(|e| ReadError::Bad {
-            line: i + 1,
-            msg: e.to_string(),
-        })?;
+        let bad = |msg: String| ReadError::Bad { line: i + 1, msg };
+        let o: Observation = serde_json::from_str(&line).map_err(|e| bad(e.to_string()))?;
+        let located = [
+            o.file_date.is_some(),
+            o.file_hour.is_some(),
+            o.line_offset.is_some(),
+        ];
+        if located != [located[0]; 3] {
+            return Err(bad(
+                "file_date, file_hour and line_offset must all be present or all absent".to_owned(),
+            ));
+        }
         out.push(o);
     }
     Ok(out)
