@@ -83,19 +83,38 @@ The report also prints `warning:` lines, which never stop a run:
   or one of those three not set at all. A core in `nohz_full` is not reported
   as missing from `rcu_nocbs`, because the kernel offloads RCU callbacks on
   every `nohz_full` CPU. `all` and stepped ranges (`0-7:2/4`) are read as CPU
-  lists. A list with any part the harness cannot read (the kernel's `N` for
-  the last CPU, as in `0,2-N`) is unreadable as a whole, never partly read,
-  and gets a line saying the pinned cores were not checked against it. So
-  does a list the kernel itself refuses: one naming a CPU number of 8192 or
-  more (past the widest CPU mask an x86-64 or arm64 kernel is built with), or
-  a stride using more than its group (`0-7:3/2`). A list the kernel accepts
-  that selects no CPU (`0-7:0/2`, or `isolcpus=domain` with no list) is read
-  as an empty list, so every pinned core is reported as not in it. Empty
-  parts are skipped as the kernel skips them (`2,,3`, `,2,3` and `2,3,` name
-  CPUs 2 and 3), and a key with nothing after it (`nohz_full=`) is set and
-  names no CPU (Linux v6.8 `lib/bitmap-str.c`, `bitmap_parselist`). The
-  `isolcpus` flags are read only before the list, where the kernel takes
-  them: `2,domain` is a list the kernel refuses;
+  lists. Each list is read the way the kernel reads it (Linux v6.8
+  `lib/bitmap-str.c`, `kernel/sched/isolation.c` and
+  `kernel/rcu/tree_nocb.h`; the lines relied on are the same in v5.15, v6.1
+  and v6.12). These readings come from the source and were not checked on a
+  booted host:
+  - a list with a part only the host can settle (the kernel's `N` for the
+    last CPU, as in `0,2-N`, or `all` with a stride) is unreadable as a
+    whole, never partly read, and gets a line saying the pinned cores were
+    not checked against it;
+  - a list the kernel refuses on any host (a part that is not a number or a
+    range, as in `2-x`; a descending range; a stride using more than its
+    group, `0-7:3/2`; a CPU number of 8192 or more, past the widest CPU mask
+    an x86-64 or arm64 kernel is built with) is reported as the kernel
+    treats it. A refused `rcu_nocbs=` offloads every CPU (`rcu_nocb_setup`:
+    "bad CPU range, all CPUs set"), and the report says so. A refused
+    `nohz_full=` or `isolcpus=` is ignored (`housekeeping_setup`: "incorrect
+    CPU range"), so the pinned cores are reported as not tickless or not
+    isolated, and a refused `nohz_full` offloads no core;
+  - a list the kernel accepts that selects no CPU (`0-7:0/2`, or
+    `isolcpus=domain,`) is read as an empty list, so every pinned core is
+    reported as not in it. Empty parts are skipped as the kernel skips them
+    (`2,,3`, `,2,3` and `2,3,` name CPUs 2 and 3), and a key with nothing
+    after it (`nohz_full=`) is set and names no CPU (`bitmap_parselist`);
+  - `isolcpus` flags are read only before the list, each with its comma, as
+    `housekeeping_isolcpus_setup` takes them: `2,domain` is a list the
+    kernel refuses. An unknown word of letters and underscores followed by a
+    comma is skipped, as the kernel skips it (`isolcpus=foo,2-3` isolates 2
+    and 3). A word with any other character is refused and `isolcpus` is
+    ignored. A last word with no comma after it (`isolcpus=domain`,
+    `isolcpus=all`) is unreadable: the kernel does not take it as a flag and
+    then reads past the end of the value, which the value alone does not
+    settle;
 - with `nohz_full` unreadable, a core outside `rcu_nocbs` (or `rcu_nocbs` not
   set) is reported as "whether it is offloaded from RCU callbacks is
   undetermined", not as not offloaded;

@@ -1028,7 +1028,7 @@ fn isolcpus_flags_are_read_only_where_the_kernel_reads_them() {
 }
 
 /// Lists the kernel refuses on any host (Linux v6.8 lib/bitmap-str.c,
-/// bitmap_parse_region and bitmap_check_region; the same code is in v5.15,
+/// `bitmap_parse_region` and `bitmap_check_region`; the same code is in v5.15,
 /// v6.1 and v6.12): a part that starts with no digit, `N` or `all`, a
 /// descending range, a group of 0, a number that does not fit 32 bits, a
 /// sign, a stride cut short.
