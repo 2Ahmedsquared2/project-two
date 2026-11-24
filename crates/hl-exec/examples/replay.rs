@@ -26,10 +26,22 @@
 //! agent) and, when it is not in the set, the action is a noop answered
 //! `User or API Wallet {signer} does not exist.` An `approveAgent` native
 //! accepted adds its agent to the set (acceptance read from native: input).
-//! User-signed actions (`signatureChainId`) and `multiSig` are not ruled.
+//! User-signed actions (`signatureChainId`), `multiSig` and `evmRawTx` (signed
+//! by its own EVM transaction; native answered none of 3,259 in the first
+//! 2,000 blocks with unknown-wallet) are not ruled.
 //! The set is the seed plus in-window accepted `approveAgent`s; users created
 //! in the window (deposits, transfers) are not added. `--wallet-log FILE`
 //! writes every action where the rule and native disagree.
+//!
+//! `--cancel-log FILE` (needs `--statuses`) writes one JSON line per
+//! `cancel`/`cancelByCloid` leg whose response differs from native's, in
+//! every block, past the block's first mismatch too: both responses, the
+//! target's book kind and whether the seed holds it, whether the target oid
+//! rests in the seed, earlier actions in the same block whose native response
+//! names the target, and native's order statuses for the target before, at and
+//! after that block (status and order type). `first` marks the leg of the
+//! action that is the block's first response mismatch. Counting only: it
+//! changes no verdict.
 #![allow(
     missing_docs,
     clippy::unwrap_used,
@@ -45,7 +57,7 @@
     clippy::similar_names
 )]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write as _};
 use std::time::Instant;
@@ -431,7 +443,8 @@ fn decode_block(meta: &Meta, line: &str, mut rule: Option<&mut WalletRule>) -> B
             let mut unknown = None;
             let mut ruled = None;
             if let (Some(r), Some(l1)) = (rule.as_deref_mut(), l1.as_ref()) {
-                let user_signed = a.get("signatureChainId").is_some() || t == "multiSig";
+                let user_signed =
+                    a.get("signatureChainId").is_some() || t == "multiSig" || t == "evmRawTx";
                 if !user_signed && !expired {
                     match l1[act_no].recover(&r.ctx, signers::MAINNET) {
                         Some(s) => {
@@ -933,6 +946,194 @@ fn end_state_check(e: &Engine, meta_dir: &str, path: &str, last_seen: u64) {
     }
 }
 
+/// Native order-status events by oid (`--cancel-log` only): (height, status,
+/// order type), with the strings interned; and oids per (user, cloid).
+#[derive(Default)]
+struct StatusIdx {
+    by_oid: HashMap<u64, Vec<(u64, u16, u16)>>,
+    by_cloid: HashMap<([u8; 20], u128), Vec<u64>>,
+    names: Vec<String>,
+    ids: HashMap<String, u16>,
+}
+
+impl StatusIdx {
+    fn intern(&mut self, s: String) -> u16 {
+        if let Some(&i) = self.ids.get(&s) {
+            return i;
+        }
+        let i = u16::try_from(self.names.len()).expect("< 65536 distinct names");
+        self.names.push(s.clone());
+        self.ids.insert(s, i);
+        i
+    }
+
+    fn add(&mut self, h: u64, s: &Value) {
+        let o = &s["order"];
+        let Some(oid) = o["oid"].as_u64() else {
+            return;
+        };
+        let f = |v: &Value| match v {
+            Value::Null => "?".to_string(),
+            Value::String(x) => x.clone(),
+            other => other.to_string(),
+        };
+        let typ = format!(
+            "{} tif={} trigger={} reduceOnly={} positionTpsl={} children={}",
+            f(&o["orderType"]),
+            f(&o["tif"]),
+            f(&o["isTrigger"]),
+            f(&o["reduceOnly"]),
+            f(&o["isPositionTpsl"]),
+            o["children"].as_array().map_or(0, Vec::len)
+        );
+        let st = self.intern(f(&s["status"]));
+        let ty = self.intern(typ);
+        let hist = self.by_oid.entry(oid).or_default();
+        let first_seen = hist.is_empty();
+        hist.push((h, st, ty));
+        if first_seen {
+            if let (Some(u), Some(c)) = (s["user"].as_str(), cloid(&o["cloid"])) {
+                self.by_cloid.entry((user(u).0, c.0)).or_default().push(oid);
+            }
+        }
+    }
+
+    fn event(&self, e: &(u64, u16, u16)) -> Value {
+        serde_json::json!({
+            "h": e.0,
+            "status": self.names[usize::from(e.1)],
+            "type": self.names[usize::from(e.2)],
+        })
+    }
+}
+
+/// Whether a native response names `oid` or `cloid` anywhere.
+fn names_target(v: &Value, oid: Option<u64>, cl: Option<&str>) -> bool {
+    match v {
+        Value::Object(m) => {
+            if oid.is_some() && m.get("oid").and_then(Value::as_u64) == oid {
+                return true;
+            }
+            if let (Some(c), Some(x)) = (cl, m.get("cloid").and_then(Value::as_str)) {
+                if x.eq_ignore_ascii_case(c) {
+                    return true;
+                }
+            }
+            m.values().any(|x| names_target(x, oid, cl))
+        }
+        Value::Array(a) => a.iter().any(|x| names_target(x, oid, cl)),
+        _ => false,
+    }
+}
+
+/// `--cancel-log`: one JSON line per cancel leg whose response differs from
+/// native's. Returns (legs written, legs of the block's first mismatch).
+#[allow(clippy::too_many_arguments)]
+fn log_cancels(
+    w: &mut impl std::io::Write,
+    meta: &Meta,
+    b: &Block,
+    out: &hl_exec::BlockOutcome,
+    seeded: &HashSet<Asset>,
+    seed_oids: &HashSet<u64>,
+    sidx: &StatusIdx,
+    first_bad_act: Option<usize>,
+) -> (usize, usize) {
+    let (mut legs, mut firsts) = (0usize, 0usize);
+    for i in 0..b.acts.len() {
+        let (kd, j) = b.acts[i];
+        let expired = out.responses[i].expired;
+        if kd != 1 || expired {
+            continue;
+        }
+        let st = out.statuses_of(i);
+        let ours = response_json(meta, b, i, st, expired);
+        let nat = &b.native[i];
+        let nat_legs = nat["response"]["data"]["statuses"].as_array();
+        for (l, c) in b.cancels[j].iter().enumerate() {
+            let o_leg = &ours["response"]["data"]["statuses"][l];
+            let n_leg = nat_legs.and_then(|v| v.get(l)).unwrap_or(nat);
+            if o_leg == n_leg {
+                continue;
+            }
+            let (target, oids, cl_hex) = match c.target {
+                OrderRef::Oid(o) => (format!("oid:{}", o.0), vec![o.0], None),
+                OrderRef::Cloid(cl) => {
+                    let hx = format!("0x{:032x}", cl.0);
+                    let v = sidx
+                        .by_cloid
+                        .get(&(b.users[i].0, cl.0))
+                        .cloned()
+                        .unwrap_or_default();
+                    (format!("cloid:{hx}"), v, Some(hx))
+                }
+            };
+            let first_oid = match c.target {
+                OrderRef::Oid(o) => Some(o.0),
+                OrderRef::Cloid(_) => None,
+            };
+            let earlier: Vec<Value> = (0..i)
+                .filter(|&p| b.users[p] == b.users[i])
+                .filter(|&p| {
+                    names_target(&b.native[p], first_oid, cl_hex.as_deref())
+                        || oids
+                            .iter()
+                            .any(|&o| names_target(&b.native[p], Some(o), None))
+                })
+                .map(|p| {
+                    serde_json::json!({
+                        "act": p,
+                        "type": b.types[p],
+                        "ours_unsupported": b.acts[p].0 == 4
+                            || out.statuses_of(p).contains(&OrderStatus::Unsupported),
+                    })
+                })
+                .collect();
+            let status: Vec<Value> = oids
+                .iter()
+                .map(|o| {
+                    let hist = sidx.by_oid.get(o).map_or(&[][..], Vec::as_slice);
+                    let prior = hist.iter().rev().find(|e| e.0 < b.height);
+                    let at: Vec<Value> = hist
+                        .iter()
+                        .filter(|e| e.0 == b.height)
+                        .map(|e| sidx.event(e))
+                        .collect();
+                    let after = hist.iter().find(|e| e.0 > b.height);
+                    serde_json::json!({
+                        "oid": o,
+                        "in_seed": seed_oids.contains(o),
+                        "prior": prior.map(|e| sidx.event(e)),
+                        "at": at,
+                        "after": after.map(|e| sidx.event(e)),
+                    })
+                })
+                .collect();
+            let first = first_bad_act == Some(i);
+            legs += 1;
+            firsts += usize::from(first);
+            let rec = serde_json::json!({
+                "h": b.height,
+                "act": i,
+                "leg": l,
+                "type": b.types[i],
+                "user": signers::addr_hex(&b.users[i].0),
+                "asset": c.asset,
+                "book": kind(c.asset),
+                "seeded": seeded.contains(&c.asset),
+                "target": target,
+                "ours": o_leg,
+                "native": n_leg,
+                "first": first,
+                "earlier_in_block": earlier,
+                "targets": status,
+            });
+            writeln!(w, "{rec}").unwrap();
+        }
+    }
+    (legs, firsts)
+}
+
 fn arg(name: &str) -> Option<String> {
     let a: Vec<String> = std::env::args().collect();
     a.iter()
@@ -959,6 +1160,12 @@ fn main() {
     );
     let assets: Vec<Asset> = meta.by_idx.keys().copied().collect();
     let max_oid = seed.iter().map(|o| o.oid.0).max().unwrap_or(0);
+    let cancel_log_path = arg("--cancel-log");
+    let seed_oids: HashSet<u64> = if cancel_log_path.is_some() {
+        seed.iter().map(|o| o.oid.0).collect()
+    } else {
+        HashSet::new()
+    };
     let mut e = Engine::from_l4_snapshot(
         &assets,
         seed,
@@ -1000,6 +1207,11 @@ fn main() {
     let mut status_max: HashMap<u64, u64> = HashMap::new();
     // Native cloid per oid from statuses (raw book diffs carry none).
     let mut status_cloids: HashMap<u64, Cloid> = HashMap::new();
+    // `--cancel-log` only: every status event per oid, and oids per (user, cloid).
+    let mut sidx = StatusIdx::default();
+    if cancel_log_path.is_some() {
+        assert!(arg("--statuses").is_some(), "--cancel-log needs --statuses");
+    }
     if let Some(p) = arg("--statuses") {
         for line in BufReader::new(File::open(p).unwrap()).lines() {
             let v: Value = serde_json::from_str(&line.unwrap()).unwrap();
@@ -1008,6 +1220,11 @@ fn main() {
                 continue;
             }
             let evs = v["events"].as_array().unwrap();
+            if cancel_log_path.is_some() {
+                for s in evs {
+                    sidx.add(h, s);
+                }
+            }
             for s in evs {
                 if let (Some(o), Some(c)) =
                     (s["order"]["oid"].as_u64(), cloid(&s["order"]["cloid"]))
@@ -1044,6 +1261,10 @@ fn main() {
         writeln!(w, "height\tact\ttype\tsigner\tours\tnative").unwrap();
         w
     });
+    let mut cancel_log = cancel_log_path
+        .as_ref()
+        .map(|p| std::io::BufWriter::new(File::create(p).unwrap()));
+    let (mut cl_legs, mut cl_first) = (0usize, 0usize);
     let mut k = 0usize;
     // (height, verdict): "reproduced" or the block's mismatch classes.
     let mut verdicts: Vec<(u64, String)> = Vec::new();
@@ -1096,6 +1317,7 @@ fn main() {
             why.push("oid-hint".into());
         }
         let mut resp_bad = None;
+        let mut first_bad_act: Option<usize> = None;
         let mut unknown_wallet = false;
         let mut uw_class: Option<&str> = None;
         for i in 0..b.acts.len() {
@@ -1168,6 +1390,7 @@ fn main() {
                 continue;
             }
             if ours != b.native[i] {
+                first_bad_act = Some(i);
                 resp_bad = Some(format!(
                     "h{} act{i} {}: ours {} native {}",
                     b.height, b.types[i], ours, b.native[i]
@@ -1177,6 +1400,11 @@ fn main() {
         }
         if unknown_wallet {
             why.push("resp:unknown-wallet".into());
+        }
+        if let Some(w) = cancel_log.as_mut() {
+            let (l, f) = log_cancels(w, &meta, b, out, &seeded, &seed_oids, &sidx, first_bad_act);
+            cl_legs += l;
+            cl_first += f;
         }
         if let Some(c) = uw_class {
             why.push(c.into());
@@ -1274,6 +1502,12 @@ fn main() {
         }
     }
     println!("blocks N={n} heights {first_seen}..={last_seen}  reproduced k={k}");
+    if let Some(mut w) = cancel_log {
+        w.flush().unwrap();
+        println!(
+            "cancel log: {cl_legs} mismatching cancel legs, {cl_first} of them in the block's first mismatching action"
+        );
+    }
     if let Some(r) = &wallet_rule {
         println!(
             "unknown-wallet rule (actions the comparison reached): both absent {uw_both}, native absent only {uw_missed}, ours absent only {uw_false}; L1 signatures not recovered {}; agents added {}; set now {}",
@@ -1375,5 +1609,39 @@ mod tests {
             out.iter().map(|d| (d.oid, d.kind)).collect::<Vec<_>>(),
             nd.iter().map(|d| (d.oid, d.kind)).collect::<Vec<_>>()
         );
+    }
+
+    /// `--cancel-log` lookups: a target named by oid or cloid anywhere in a
+    /// native response, and a status index keyed by oid and (user, cloid).
+    #[test]
+    fn cancel_log_lookups() {
+        let r: Value = serde_json::from_str(
+            r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"x"},{"resting":{"oid":42,"cloid":"0x000000000000000000000000000000AB"}}]}}}"#,
+        )
+        .unwrap();
+        assert!(names_target(&r, Some(42), None));
+        assert!(!names_target(&r, Some(43), None));
+        assert!(names_target(
+            &r,
+            None,
+            Some("0x000000000000000000000000000000ab")
+        ));
+        let mut ix = StatusIdx::default();
+        let ev = |st: &str| {
+            serde_json::json!({"status": st, "user": "0x0707070707070707070707070707070707070707",
+                "order": {"oid": 42, "cloid": "0x000000000000000000000000000000ab",
+                    "orderType": "Stop Market", "isTrigger": true, "reduceOnly": true,
+                    "isPositionTpsl": false, "tif": null, "children": []}})
+        };
+        ix.add(10, &ev("open"));
+        ix.add(12, &ev("canceled"));
+        let h = &ix.by_oid[&42];
+        assert_eq!(h.len(), 2);
+        assert_eq!(ix.event(&h[0])["status"], "open");
+        assert_eq!(
+            ix.event(&h[1])["type"],
+            "Stop Market tif=? trigger=true reduceOnly=true positionTpsl=false children=0"
+        );
+        assert_eq!(ix.by_cloid[&([7; 20], 0xab)], vec![42]);
     }
 }
