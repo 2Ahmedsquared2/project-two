@@ -631,6 +631,7 @@ fn meta(host_facts: HostFactsNote) -> RunMeta {
         host: HostInfo::default(),
         feeder_core: None,
         hot_core: None,
+        sqpoll_core: None,
         rounds: 1,
         measured_per_round: 1,
         warmup_per_round: 0,
@@ -1395,4 +1396,290 @@ fn a_refused_region_after_a_stride_refuses_the_list() {
             "{raw}"
         );
     }
+}
+
+// ---- the core of the compio-sqpoll arm's kernel polling thread (#64) ----
+
+/// Sixteen CPUs whose thread siblings are n and n+8, as on the Tokyo box.
+fn smt_pairs() -> String {
+    let mut s = String::from("active: 1");
+    for cpu in 0..16 {
+        let _ = write!(s, "\ncpu{cpu} thread siblings: {},{}", cpu % 8, cpu % 8 + 8);
+    }
+    s
+}
+
+/// A complete file with these kernel-cmdline, smt and numa sections.
+fn file_with_topology(cmdline: &str, smt: &str, numa: &str) -> HostFacts {
+    let text = file_with(None, "x")
+        .replace(
+            "== begin kernel-cmdline\nx\n",
+            &format!("== begin kernel-cmdline\n{cmdline}\n"),
+        )
+        .replace("== begin smt\nx\n", &format!("== begin smt\n{smt}\n"))
+        .replace("== begin numa\nx\n", &format!("== begin numa\n{numa}\n"));
+    HostFacts::parse(&text).unwrap()
+}
+
+fn sqpoll_warnings(
+    f: &HostFacts,
+    feeder: Option<usize>,
+    hot: Option<usize>,
+    sqpoll: Option<usize>,
+) -> Vec<String> {
+    match HostFactsNote::captured_with_sqpoll(Path::new("f"), f, feeder, hot, sqpoll) {
+        HostFactsNote::Captured { warnings, .. } => warnings,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Every core isolated, one NUMA node, siblings n and n+8.
+fn quiet_box() -> HostFacts {
+    file_with_topology(
+        &format!("isolcpus: 0-15\n{QUIET}"),
+        &smt_pairs(),
+        "node0 cpus: 0-15",
+    )
+}
+const HOT_15_SIBLING: &str =
+    "hot core 15 shares its physical core with another thread (siblings 7,15)";
+
+#[test]
+fn a_polling_thread_on_its_own_isolated_physical_core_adds_no_warning() {
+    // The Tokyo Step 2 choice: feeder 14, hot 15, polling thread 13.
+    assert_eq!(
+        sqpoll_warnings(&quiet_box(), Some(14), Some(15), Some(13)),
+        [HOT_15_SIBLING]
+    );
+    // No polling-thread core: exactly what `captured` says.
+    let f = quiet_box();
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), None),
+        warnings(&f, Some(14), Some(15))
+    );
+}
+
+#[test]
+fn a_polling_thread_on_the_feeder_or_hot_core_is_a_warning() {
+    let f = quiet_box();
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(14)),
+        [
+            HOT_15_SIBLING,
+            "sqpoll core 14 is the feeder core: the kernel polling thread spins there against the feeder and sink",
+        ]
+    );
+    // The binary refuses this one as a usage error; the note still says it.
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(15)),
+        [
+            HOT_15_SIBLING,
+            "sqpoll core 15 is the hot core: the kernel polling thread spins there against the hot thread",
+        ]
+    );
+}
+
+#[test]
+fn a_polling_thread_on_a_sibling_of_the_hot_or_feeder_core_is_a_warning() {
+    let f = quiet_box();
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(7)),
+        [
+            HOT_15_SIBLING,
+            "sqpoll core 7 shares its physical core with hot core 15 (siblings 7,15)",
+        ]
+    );
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(6)),
+        [
+            HOT_15_SIBLING,
+            "sqpoll core 6 shares its physical core with feeder core 14 (siblings 6,14)",
+        ]
+    );
+    // Siblings written as a range, and a feeder and hot thread that are
+    // siblings of each other and of the polling thread.
+    let f = file_with_topology(
+        &format!("isolcpus: 0-15\n{QUIET}"),
+        "active: 1\ncpu1 thread siblings: 1-3\ncpu2 thread siblings: 1-3\ncpu3 thread siblings: 1-3",
+        "node0 cpus: 0-15",
+    );
+    assert_eq!(
+        sqpoll_warnings(&f, Some(1), Some(2), Some(3)),
+        [
+            "hot core 2 shares its physical core with another thread (siblings 1-3)",
+            "sqpoll core 3 shares its physical core with feeder core 1 (siblings 1-3)",
+            "sqpoll core 3 shares its physical core with hot core 2 (siblings 1-3)",
+        ]
+    );
+    // An unpinned feeder or hot thread has no core to share.
+    assert_eq!(
+        sqpoll_warnings(&quiet_box(), None, None, Some(7)),
+        Vec::<String>::new()
+    );
+    // A capture without the polling thread's sibling line says nothing.
+    let f = file_with_topology(
+        &format!("isolcpus: 0-15\n{QUIET}"),
+        "active: unavailable (not readable)",
+        "node0 cpus: 0-15",
+    );
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(7)),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_polling_thread_outside_the_isolated_set_warns_as_the_other_cores_do() {
+    let numa = "node0 cpus: 0-15";
+    let f = file_with_topology(&format!("isolcpus: 14-15\n{QUIET}"), "active: 0", numa);
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(13)),
+        ["sqpoll core 13 is not in isolcpus (14-15)"]
+    );
+    // Tokyo: nothing is isolated.
+    let f = file_with_topology(&format!("isolcpus: not set\n{QUIET}"), "active: 0", numa);
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(13)),
+        ["isolcpus is not set: feeder core 14, hot core 15 and sqpoll core 13 are not isolated"]
+    );
+    assert_eq!(
+        sqpoll_warnings(&f, None, None, Some(13)),
+        ["isolcpus is not set: sqpoll core 13 is not isolated"]
+    );
+}
+
+/// Latency's rule: the polling thread spins and picks up submissions, so the
+/// tick and RCU callbacks on its core delay them as they delay the hot
+/// thread. All three pinned cores are judged by the same lists.
+#[test]
+fn a_polling_thread_outside_nohz_full_or_rcu_nocbs_warns_as_the_other_cores_do() {
+    let topo = |cmdline: &str| file_with_topology(cmdline, "active: 0", "node0 cpus: 0-15");
+    let f = topo("isolcpus: 13-15\nnohz_full: 14-15\nrcu_nocbs: 14-15");
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(13)),
+        [
+            "sqpoll core 13 is not in nohz_full (14-15)",
+            "sqpoll core 13 is not in rcu_nocbs (14-15)",
+        ]
+    );
+    // In nohz_full its RCU callbacks are offloaded already.
+    let f = topo("isolcpus: 13-15\nnohz_full: 13-15\nrcu_nocbs: 14-15");
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(13)),
+        Vec::<String>::new()
+    );
+    // Offloaded but not tickless.
+    let f = topo("isolcpus: 13-15\nnohz_full: 14-15\nrcu_nocbs: 13-15");
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(13)),
+        ["sqpoll core 13 is not in nohz_full (14-15)"]
+    );
+    // Tokyo: none of the three is set.
+    let f = topo("isolcpus: not set\nnohz_full: not set\nrcu_nocbs: not set");
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(13)),
+        [
+            "isolcpus is not set: feeder core 14, hot core 15 and sqpoll core 13 are not isolated",
+            "nohz_full is not set: feeder core 14, hot core 15 and sqpoll core 13 are not tickless",
+            "rcu_nocbs is not set: feeder core 14, hot core 15 and sqpoll core 13 are not offloaded from RCU callbacks",
+        ]
+    );
+    // A polling thread on CPU 0 that nohz_full names: the boot CPU keeps the tick.
+    let f = topo("isolcpus: 0-15\nnohz_full: 0-15\nrcu_nocbs: 0-15");
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(0)),
+        ["sqpoll core 0 is in nohz_full (0-15), but the kernel forces the boot CPU (normally CPU 0) outside nohz_full: it may still take the tick"]
+    );
+    // An unreadable nohz_full leaves its offload undetermined too.
+    let f = topo("isolcpus: 13-15\nnohz_full: 2-N\nrcu_nocbs: 14-15");
+    let got = sqpoll_warnings(&f, Some(14), Some(15), Some(13));
+    assert!(
+        got.contains(&"sqpoll core 13 is not in rcu_nocbs (14-15) and nohz_full (2-N) could not be parsed: whether it is offloaded from RCU callbacks is undetermined".to_owned()),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn a_polling_thread_on_another_numa_node_than_the_hot_core_is_a_warning() {
+    let cmdline = format!("isolcpus: 0-15\n{QUIET}");
+    let f = file_with_topology(
+        &cmdline,
+        "active: 0",
+        "node0 cpus: 0-7\nnode1 cpus: 8-11,12-15",
+    );
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(3)),
+        ["sqpoll core 3 is on NUMA node 0 and hot core 15 is on NUMA node 1"]
+    );
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(13)),
+        Vec::<String>::new()
+    );
+    // The feeder's node is not compared, and an unpinned hot thread has none.
+    assert_eq!(
+        sqpoll_warnings(&f, Some(3), Some(15), Some(13)),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), None, Some(3)),
+        Vec::<String>::new()
+    );
+    // A host that could not give its nodes is not called single-node or split.
+    let f = file_with_topology(
+        &cmdline,
+        "active: 0",
+        "unavailable (no /sys/devices/system/node/node*)",
+    );
+    assert_eq!(
+        sqpoll_warnings(&f, Some(14), Some(15), Some(3)),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn the_report_prints_the_polling_threads_warnings() {
+    let f = file_with_topology(
+        &format!("isolcpus: 14-15\n{QUIET}"),
+        &smt_pairs(),
+        "node0 cpus: 0-7\nnode1 cpus: 8-15",
+    );
+    let note = HostFactsNote::captured_with_sqpoll(Path::new("f"), &f, Some(14), Some(15), Some(7));
+    let report = render_report(&meta(note), &[]);
+    for want in [
+        "  warning: sqpoll core 7 is not in isolcpus (14-15)",
+        "  warning: sqpoll core 7 shares its physical core with hot core 15 (siblings 7,15)",
+        "  warning: sqpoll core 7 is on NUMA node 0 and hot core 15 is on NUMA node 1",
+    ] {
+        assert!(report.contains(want), "no {want:?} in:\n{report}");
+    }
+}
+
+/// The binary passes `--sqpoll-core` to the host-facts check.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_binary_warns_about_the_polling_threads_core() {
+    let dir = tmp("sqpoll-warn");
+    let kernel =
+        String::from_utf8(Command::new("uname").arg("-r").output().unwrap().stdout).unwrap();
+    let text = file_with(None, "x")
+        .replace("kernel: 6.8.0-test", &format!("kernel: {}", kernel.trim()))
+        .replace(
+            "== begin kernel-cmdline\nx\n",
+            &format!("== begin kernel-cmdline\nisolcpus: 0\n{QUIET}\n"),
+        );
+    let facts = dir.join("facts.txt");
+    std::fs::write(&facts, text).unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_hl-replay"))
+        .args(["--rounds", "1", "--lines", "100", "--warmup", "10"])
+        .args(["--interval-us", "30", "--arms", "busy-poll"])
+        .args(["--hot-core", "0", "--sqpoll-core", "1", "--host-facts"])
+        .arg(&facts)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let report = String::from_utf8(o.stdout).unwrap();
+    assert!(
+        report.contains("  warning: sqpoll core 1 is not in isolcpus (0)"),
+        "{report}"
+    );
 }

@@ -39,7 +39,7 @@ mkdir -p results
 ./scripts/capture-host.sh "$facts"       # read-only; second argument names the NIC if it is not the default route's
 ./target/release/hl-replay \
   --arms all --rounds 5 --lines 11000 --warmup 1000 --interval-us 1000 \
-  --feeder-core 2 --hot-core 3 \
+  --feeder-core 2 --hot-core 3 --sqpoll-core 4 \
   --host-facts "$facts" --out "$out"
 ```
 
@@ -79,6 +79,7 @@ sections that hold one, so read that list before trusting a run.
 
 The report also prints `warning:` lines, which never stop a run:
 
+- what the `compio-sqpoll` section below says about `--sqpoll-core`;
 - a pinned feeder or hot core outside `isolcpus`, `nohz_full` or `rcu_nocbs`,
   or one of those three not set at all. A core in `nohz_full` is not reported
   as missing from `rcu_nocbs`, because the kernel offloads RCU callbacks on
@@ -155,7 +156,8 @@ repository's development machines. The harness never requires or reads this
 section; the report only says `rtt-manual: present` or `absent`.
 
 Set `--feeder-core` and `--hot-core` to two different physical cores, the hot
-one isolated if the host has isolated cores. To replay recorded node output
+one isolated if the host has isolated cores, and `--sqpoll-core` to a third
+(see the `compio-sqpoll` arm below; without it that arm does not run). To replay recorded node output
 instead of generated lines, add `--input <file>` (one block-info JSON line per
 line; the file is cycled). Send Latency the whole `--out` directory, which
 includes `host-facts.txt`.
@@ -176,7 +178,50 @@ socket.
 | `tokio-current-thread` | tokio `current_thread`, pinned |
 | `tokio-multi-thread` | tokio multi-thread, 2 workers, task spawned, never pinned: the stock setup |
 | `compio` | compio 0.19.2 on `io_uring`, pinned |
-| `compio-sqpoll` | the same with a kernel submission-queue polling thread |
+| `compio-sqpoll` | the same with a kernel submission-queue polling thread; pinned, it needs `--sqpoll-core` (below) |
+
+`compio-sqpoll` has a second spinning thread, the kernel's `iou-sqp` polling
+thread, which the hot thread creates. Give it a core with `--sqpoll-core N`:
+not the hot core, and best a third isolated core (on the feeder's core it
+competes with the feeder, which shows up as feeder lateness in `feed-t2`). A
+pinned run without `--sqpoll-core` reports the arm `unavailable` and says so;
+`--sqpoll-core` equal to `--hot-core` is a usage error. With `--no-pin` the
+thread is left free unless the flag names a core. The report's `pinning:` line
+names the core asked for, and each `compio-sqpoll` row carries
+`sqpoll=cpus:<list>`: the thread's `Cpus_allowed_list` as the kernel reports
+it once the ring exists (`unknown` if it could not be read).
+
+If the kernel refuses the core (`EINVAL`: not a CPU of the host, offline, or
+outside the process's cpuset) the arm is `unavailable` and the reason names
+`--sqpoll-core N`. The harness tells that from a host with no polling thread
+at all by setting up one more ring with no core named: only if that one is
+accepted is the core blamed.
+
+With `--host-facts`, the report warns (never stops) when the polling thread's
+core is the feeder or hot core, shares a physical core with either (the
+capture's `thread siblings` line), or is on another NUMA node than the hot
+core (the two share the ring; the feeder's node is not compared). It is also
+checked against `isolcpus`, `nohz_full` and `rcu_nocbs` exactly as the feeder
+and hot cores are: the tick and RCU callbacks on its core delay submissions.
+A capture without that core's sibling line or without NUMA nodes gives no
+line for that check.
+
+Why: in the Tokyo runs of d7f9087 (hot core 15, kernel 7.0) this arm's t1-t0,
+the parser alone, was p50 9 ms against about 1 µs on every other arm, in whole
+milliseconds. The cause was the polling thread spinning on the hot core. Two
+one-round Tokyo runs on 2026-11-24 (issue #61; feeder 14, hot 15, generated
+lines, n=10000):
+
+| run | polling thread | t1-t0 p50 | t1-t0 p99 | t2-t0 p50 |
+|---|---|---|---|---|
+| d7f9087, no flag | core 15 in 6 of 6 samples, allowed list 15, 97% CPU | 9,019,391 ns | 19,005,439 ns | 10,018,815 ns |
+| 8327974, `--sqpoll-core 13` | core 13 in 6 of 6 samples, allowed list 13, 100% CPU | 1,619 ns | 276,991 ns | 34,303 ns |
+
+The first row is as the operator reported it; the second is also in that
+run's `report.txt`. Not explained: the second run's tail (t2-t0 p99 1.0 ms,
+max 4.0 ms). No core on that box is isolated and hl-node's threads ran on
+cores 13 to 15 during the run, which is a likely cause and not a measured
+one. On a 2-core Linux 6.1 machine the millisecond t1-t0 never reproduced.
 
 Detect arms (`--arms detect`): lines are appended to a file in `--tail-dir`
 (default `/dev/shm`) and the reader tails it, as the node's output is read.

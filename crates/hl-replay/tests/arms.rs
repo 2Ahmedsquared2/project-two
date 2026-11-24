@@ -25,6 +25,7 @@ fn cfg(name: &str, measured: u64, warmup: u64) -> RoundConfig {
         interval: Duration::from_micros(50),
         feeder_core: None,
         hot_core: None,
+        sqpoll_core: None,
         tail_dir: tmp(name),
         sink_bind: LoopbackAddr::ephemeral(),
     }

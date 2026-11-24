@@ -6,7 +6,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::arms::{ArmReport, Run};
+use crate::arms::{Arm, ArmReport, Run};
 use crate::stage::{active_parser_mode, stage_table, ParserMode};
 use crate::{HostFactsNote, LatencyHist, ReplayError};
 
@@ -60,6 +60,8 @@ pub struct RunMeta {
     pub feeder_core: Option<usize>,
     /// Core the hot thread was pinned to, if any.
     pub hot_core: Option<usize>,
+    /// Core the `compio-sqpoll` arm's kernel polling thread was given, if any.
+    pub sqpoll_core: Option<usize>,
     /// Rounds per arm.
     pub rounds: u32,
     /// Recorded lines per round.
@@ -141,14 +143,15 @@ pub fn render_report(meta: &RunMeta, arms: &[ArmReport]) -> String {
     let _ = writeln!(s, "cores: {}", meta.host.cores);
     render_host_facts(&mut s, &meta.host_facts);
     let core = |c: Option<usize>| c.map_or_else(|| "unpinned".to_owned(), |c| format!("core {c}"));
-    if meta.feeder_core.is_none() && meta.hot_core.is_none() {
+    if meta.feeder_core.is_none() && meta.hot_core.is_none() && meta.sqpoll_core.is_none() {
         let _ = writeln!(s, "pinning: none");
     } else {
         let _ = writeln!(
             s,
-            "pinning: feeder and sink {}, hot thread {} (tokio-multi-thread is never pinned)",
+            "pinning: feeder and sink {}, hot thread {}, sqpoll thread {} (tokio-multi-thread is never pinned; sqpoll thread = the kernel polling thread of compio-sqpoll)",
             core(meta.feeder_core),
-            core(meta.hot_core)
+            core(meta.hot_core),
+            core(meta.sqpoll_core)
         );
     }
     let parser = stage_table()[1];
@@ -227,6 +230,12 @@ fn render_rows(s: &mut String, arms: &[ArmReport]) {
             Some(true) => "hot=pinned",
             Some(false) => "hot=PIN-REFUSED",
             None => "hot=unpinned",
+        };
+        // What the kernel reports for the polling thread, not what was asked.
+        let pinned = match &a.sqpoll_cpus {
+            Some(cpus) => format!("{pinned} sqpoll=cpus:{cpus}"),
+            None if a.arm == Arm::CompioSqpoll => format!("{pinned} sqpoll=cpus:unknown"),
+            None => pinned.to_owned(),
         };
         for (metric, h) in metrics(a) {
             let m = h.summary();
