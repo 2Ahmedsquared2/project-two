@@ -2,6 +2,8 @@
 //! counted and what is listed.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::io::{BufRead, BufReader, ErrorKind, Read};
+
 use hl_latency::{scan_node_header, CompleteLine};
 use hl_strict_pass::{check_record, Counts, Options, StrictPass};
 use proptest::prelude::*;
@@ -188,6 +190,132 @@ fn duplicate_key_where_scan_and_strict_disagree_fails() {
         (1, 1)
     );
     assert_eq!(pass.failures()[0].block_number, Some(5));
+    // The reason is the disagreement itself, with both readings: what
+    // hl-capture stamped and what the line says. Only the scan-agreement
+    // check gives it; without that check the line would fail as a repeated
+    // key and this assertion would not hold.
+    assert_eq!(
+        pass.failures()[0].reason,
+        "header scan reads block 5 at 1753606210051 ms, strict parse block 6 at 1753606210051 ms"
+    );
+    // The same for a repeated block_time.
+    let dup = r#"{"local_time":"x","block_time":"2025-07-27T08:50:10.051000","block_number":5,"events":[],"block_time":"2025-07-27T08:50:10.052000"}"#;
+    assert_eq!(
+        check_record(dup.as_bytes()),
+        Err(
+            "header scan reads block 5 at 1753606210051 ms, strict parse block 5 at 1753606210052 ms"
+                .to_owned()
+        )
+    );
+}
+
+#[test]
+fn repeated_key_fails_even_when_both_values_agree() {
+    // Scan and strict parse read the same block here, so only the
+    // repeated-key refusal can fail these lines.
+    let t = r#""block_time":"2025-07-27T08:50:10.051000""#;
+    for (key, dup) in [
+        (
+            "local_time",
+            format!(r#"{{"local_time":"x",{t},"block_number":5,"events":[],"local_time":"x"}}"#),
+        ),
+        (
+            "block_time",
+            format!(r#"{{"local_time":"x",{t},"block_number":5,"events":[],{t}}}"#),
+        ),
+        (
+            "block_number",
+            format!(r#"{{"local_time":"x",{t},"block_number":5,"events":[],"block_number":5}}"#),
+        ),
+        (
+            "events",
+            format!(r#"{{"local_time":"x",{t},"block_number":5,"events":[],"events":[]}}"#),
+        ),
+    ] {
+        let strict = hl_latency::parse_node_line(&dup, 0).expect("premise: valid JSON");
+        assert_eq!(
+            scan(dup.as_bytes()),
+            Some((strict.block_time_ms, 5)),
+            "premise: scan and strict agree on {dup}"
+        );
+        assert_eq!(strict.block_number, Some(5));
+        let reason = check_record(dup.as_bytes()).expect_err(&dup);
+        assert!(
+            reason.starts_with("schema: duplicate field") && reason.contains(key),
+            "{key}: {reason}"
+        );
+    }
+    // A repeated key that is not one of the four is not looked at.
+    let extra = format!(r#"{{"local_time":"x",{t},"block_number":5,"events":[],"z":1,"z":2}}"#);
+    assert_eq!(check_record(extra.as_bytes()).map(|r| r.1), Ok(5));
+}
+
+/// A reader whose `fill_buf` is interrupted by a signal (`EINTR`) before
+/// every successful call.
+struct Interrupted<R> {
+    inner: R,
+    interrupt_next: bool,
+    interrupts: u32,
+}
+
+impl<R: BufRead> Read for Interrupted<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<R: BufRead> BufRead for Interrupted<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.interrupt_next = !self.interrupt_next;
+        if self.interrupt_next {
+            self.interrupts += 1;
+            return Err(ErrorKind::Interrupted.into());
+        }
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.inner.consume(n);
+    }
+}
+
+#[test]
+fn an_interrupted_read_is_retried() {
+    let bytes = file(&[line(1), line(2), line(3)]);
+    let (_, want) = pass_one(&bytes);
+    let mut reader = Interrupted {
+        // Small chunks, so lines span several reads.
+        inner: BufReader::with_capacity(16, &bytes[..]),
+        interrupt_next: false,
+        interrupts: 0,
+    };
+    let mut pass = StrictPass::new(Options::default());
+    let report = pass
+        .check_file("f", &mut reader, false)
+        .expect("EINTR is not an error");
+    assert!(reader.interrupts > 3, "premise: reads were interrupted");
+    assert_eq!(report, want);
+    assert_eq!((report.counts.records, report.counts.failed), (3, 0));
+}
+
+#[test]
+fn a_read_error_other_than_an_interrupt_is_returned() {
+    struct Broken;
+    impl Read for Broken {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(ErrorKind::PermissionDenied.into())
+        }
+    }
+    impl BufRead for Broken {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            Err(ErrorKind::PermissionDenied.into())
+        }
+        fn consume(&mut self, _: usize) {}
+    }
+    let err = StrictPass::new(Options::default())
+        .check_file("f", Broken, false)
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
 }
 
 #[test]
@@ -318,5 +446,48 @@ proptest! {
             prop_assert!(start == 0 || bytes[start - 1] == b'\n');
             prop_assert!(end == bytes.len() || bytes[end] == b'\n');
         }
+    }
+
+    /// Reading in chunks of any size (a line then spans several `fill_buf`
+    /// calls, and a chunk can end on either side of a newline) gives the
+    /// report, failures and offsets of reading the bytes in one piece. The
+    /// input mixes valid lines, cut lines, oversized lines and raw bytes.
+    #[test]
+    fn reading_in_chunks_of_any_size_gives_the_same_result(
+        parts in proptest::collection::vec(
+            prop_oneof![
+                (0u64..50).prop_map(|h| { let mut l = line(h).into_bytes(); l.push(b'\n'); l }),
+                (0u64..50, 0usize..10_000).prop_map(|(h, cut)| {
+                    let l = line(h);
+                    let mut l = l.as_bytes()[..cut % l.len()].to_vec();
+                    l.push(b'\n');
+                    l
+                }),
+                (0u64..50, 1usize..200).prop_map(|(h, pad)| {
+                    let mut l = line(h).into_bytes();
+                    l.extend(std::iter::repeat_n(b' ', pad));
+                    l.push(b'\n');
+                    l
+                }),
+                proptest::collection::vec(prop_oneof![Just(b'\n'), any::<u8>()], 0..40),
+            ],
+            0..12,
+        ),
+        capacity in 1usize..400,
+        max_line in prop_oneof![1usize..64, Just(line(0).len() + 100), Just(1 << 20)],
+        allow_tail in any::<bool>(),
+    ) {
+        let bytes = parts.concat();
+        let opts = Options { max_line, max_failures: 1000 };
+        let mut whole = StrictPass::new(opts);
+        let want = whole.check_file("f", &bytes[..], allow_tail).unwrap();
+        let mut chunked = StrictPass::new(opts);
+        let got = chunked
+            .check_file("f", BufReader::with_capacity(capacity, &bytes[..]), allow_tail)
+            .unwrap();
+        prop_assert_eq!(got, want);
+        prop_assert_eq!(chunked.failures(), whole.failures());
+        prop_assert_eq!(chunked.total(), whole.total());
+        prop_assert_eq!(chunked.failures_omitted(), whole.failures_omitted());
     }
 }

@@ -265,3 +265,27 @@ fn unreadable_input_and_nothing_to_check_exit_3() {
     assert_eq!(out.status.code(), Some(3), "{out:?}");
     assert_ne!(out.stderr, b"");
 }
+
+#[test]
+fn a_directory_with_no_hourly_file_exits_3_even_beside_one_that_has_some() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "good/20250727/9", &line(1));
+    write(dir.path(), "mistyped/20250727/readme", "x");
+    fs::create_dir_all(dir.path().join("empty")).unwrap();
+    let good = dir.path().join("good");
+    for bad in ["empty", "mistyped"] {
+        let bad = dir.path().join(bad);
+        // Either order: the other path's files do not hide the empty one.
+        for paths in [[&good, &bad], [&bad, &good]] {
+            let out = bin().args(paths).output().unwrap();
+            assert_eq!(out.status.code(), Some(3), "{out:?}");
+            // Nothing is reported for a run that was not what was asked for.
+            assert_eq!(out.stdout, b"", "{out:?}");
+            let err = String::from_utf8(out.stderr).unwrap();
+            assert!(err.contains(bad.to_str().unwrap()), "names the path: {err}");
+        }
+    }
+    // The same directory with only paths that have files still passes.
+    let out = bin().arg(&good).arg(&good).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+}
