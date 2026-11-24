@@ -207,8 +207,8 @@ Exit codes: 0 every record passed, 1 a record failed (or a gap, when asked),
 2 usage, 3 unreadable path or no hourly file found.
 
 Feed its stdout to the report: `hl-latency observations.jsonl --strict-pass
-strict-pass.jsonl` leaves what it lists as scan-accepted failures out of the
-pairing. How much goes depends on the observation file:
+strict-pass.jsonl` leaves what it lists as failures out of the pairing (scan-accepted failures
+first; the others are described below). How much goes depends on the observation file:
 
 - **By line** (`strict_drop_by_line` true): the node observations carry
   `file_date`, `file_hour` and `line_offset`. A failure names one line by the
@@ -233,8 +233,8 @@ The summary gains `strict_pass_applied`, `strict_drop_by_line`,
 `strict_dropped_observations` (node observations removed),
 `strict_dropped_blocks`, `strict_dropped_ws_arrivals`,
 `strict_shifted_first_arrival`, `strict_failures_listed`,
-`strict_failures_unmatched` (listed failures the capture has no observation
-for: distinct lines by line, distinct blocks by block),
+`strict_failures_unmatched` (scan-accepted failures the capture has no
+observation for: distinct lines by line, distinct blocks by block),
 `strict_failures_omitted` and `strict_drop_incomplete`. When the strict pass
 capped its list (`failures_omitted` above 0) the summary is still printed but
 `hl-latency` exits 1: torn stamps may remain, so rerun `hl-strict-pass` with a
@@ -248,17 +248,36 @@ false and nothing was dropped.
 - node observations with the three fields and without them in one file
   (two captures joined: split them and run each against its own strict pass);
 - two node observations that name the same line;
-- by line only: a scan-accepted failure whose path does not end in
+- by line only: a failure (scan-accepted or not) whose path does not end in
   `{YYYYMMDD}/{hour}` (run `hl-strict-pass` on the directory, or on files
   under their hourly names), two different paths for one date and hour (run
   it over one root), or a listed line whose observation has another
   `block_number` or `block_time_ms` (the wrong file or offset).
 
-Only scan-accepted failures are used. A line the scan refuses but the strict
-parse accepts is still stamped by `hl-capture` (`scan_fallbacks`), and if the
-strict pass fails it for another reason (no `events`, a repeated key) its
-observation stays in the pairing: such a failure carries no height or block
-time to check the match against.
+**Failures the scan did not accept** (`scan_accepted` false). A line the scan
+refuses but the strict parse accepts is still stamped by `hl-capture`
+(`scan_fallbacks`), and the strict pass can fail it for another reason (no
+`events`, a repeated key). The strict pass lists such a line like a line
+neither parser accepts, which `hl-capture` never stamped: no height, no block
+time. `strict_fallback_failures_listed` counts both kinds.
+
+- **By line:** the node observation at the failure's line, if there is one,
+  goes, under the block rules above (the block stays while it has a node line
+  left, a shifted first arrival is counted, a block that lost its only line
+  goes with its WebSocket arrivals). There is no height or block time to check
+  the match against. These are counted in `strict_dropped_fallback_lines`, not
+  in `strict_dropped_observations`. A failure with no observation at its line
+  is counted in `strict_fallback_failures_unmatched`, not in
+  `strict_failures_unmatched`: over the files the capture covered it is
+  expected to equal the lines `hl-capture` did not stamp (`bad_lines` plus
+  `oversized_lines` in its `stats` line). `hl-latency` does not read that
+  line: compare the two by hand, and treat a difference as something to look
+  at, not as an error, since the capture and the strict pass can cover
+  different spans.
+- **By block:** the stamped line cannot be found without its offset, so its
+  observation stays in the pairing, as before. `strict_fallback_lines_unchecked`
+  is then true and a `note:` on stderr says how many such failures were
+  listed; the exit code is unchanged.
 
 A newer hourly file is looked for every `--rescan-ms` (default 1000) and, in
 `inotify` mode, when a directory changes; never per poll, and only once the
