@@ -144,7 +144,14 @@ a slow node; a counted drop is only a missing sample. **A run with
 The strict parser (`parse_node_line`) runs on the reader only for a line the
 header scan refuses (`scan_fallbacks`, expected 0 on hl-node output). Lines the
 scan accepts are not strict-validated by this tool: `height_breaks` counts
-block numbers that do not follow on, and the offline strict pass over the same
+block numbers that do not follow on, split (with the definitions the strict
+pass uses) into `height_repeats` (same height as the line before),
+`height_gaps` (more than one above it) and `height_backwards` (below it);
+`height_breaks` is their sum. What a repeat means is **unconfirmed**: the
+node's README suggests `--stream-with-block-info` writes several lines per
+block, which would make repeats normal and leave gaps and backward steps as
+the lost-line signal, but nobody has checked a real file yet (Tokyo
+checklist). Until then read all three, and the offline strict pass over the same
 hourly files (`hl-strict-pass`, below) is the check for writer-torn lines.
 
 ### Offline strict pass (`crates/hl-strict-pass`)
@@ -239,7 +246,8 @@ it is reported as a `rotation` line on stderr (`late_lines`,
 `rescans` counter is the reader's one walk plus the scout's.
 
 Counters at exit (stderr, one JSON object): `lines`, `written`, `ring_dropped`,
-`bad_lines`, `oversized_lines`, `scan_fallbacks`, `height_breaks`, `rotations`,
+`bad_lines`, `oversized_lines`, `scan_fallbacks`, `height_breaks`,
+`height_repeats`, `height_gaps`, `height_backwards`, `rotations`,
 `post_rotation_lines`, `rescans`, `reads`, `stop_signal`.
 `WsFilter` drops the first `l2Book`/`trades` frame per coin after each
 (re)connect and counts malformed frames, including `l2Book`/`trades` frames
