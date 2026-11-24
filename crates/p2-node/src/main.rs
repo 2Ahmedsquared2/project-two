@@ -441,12 +441,46 @@ fn compare_only(
     print!("{report}");
     if let Some(out) = args.get("--out").map(PathBuf::from) {
         let w = std::fs::create_dir_all(&out)
-            .and_then(|()| std::fs::write(out.join("report.txt"), &report));
+            .and_then(|()| std::fs::write(out.join("report.txt"), &report))
+            .and_then(|()| std::fs::write(out.join("heights.tsv"), heights_tsv(&run, &unseeded)));
         if let Err(e) = w {
             return fail(format!("{}: {e}", out.display()));
         }
     }
     ExitCode::SUCCESS
+}
+
+/// One line per block: height, verdict (reproduced / mismatch class), and
+/// whether native's diff list was empty, for reconciling runs by height.
+fn heights_tsv(run: &Replay, unseeded: &std::collections::HashSet<u64>) -> String {
+    let mut rows: Vec<(u64, String)> = run
+        .reproduced_heights
+        .iter()
+        .map(|h| {
+            let zero = run.reproduced_zero_native_diffs.contains(h);
+            (
+                *h,
+                format!(
+                    "reproduced\t{}",
+                    if zero { "zero-native-diffs" } else { "-" }
+                ),
+            )
+        })
+        .collect();
+    for (h, cause) in &run.mismatches {
+        let class = if unseeded.contains(h) {
+            "unseeded-book".to_owned()
+        } else {
+            format!("{cause:?}")
+        };
+        rows.push((*h, format!("{class}\t-")));
+    }
+    rows.sort_by_key(|r| r.0);
+    let mut s = String::from("height\tverdict\tnative_diffs\n");
+    for (h, v) in rows {
+        let _ = writeln!(s, "{h}\t{v}");
+    }
+    s
 }
 
 /// Not-reproduced blocks by class; a block touching a book the seed does not

@@ -402,3 +402,29 @@ fn streaming_run_refuses_f1_f2_and_bad_input() {
         "{err}"
     );
 }
+
+#[test]
+fn empty_native_diffs_count_only_when_ours_are_empty_too() {
+    // Proof (PR #34): resync(&[]) reaches only the pre-block state, so a block
+    // with an empty native diff list must count only when our engine also
+    // wrote nothing; absent diffs refuse the run (F2). Heights 1001 and
+    // 1002 have empty native lists.
+    let blocks = input();
+    assert_eq!(blocks[1].native_diffs().len(), 0);
+    let mut e = Scripted::new(&blocks, None);
+    let r = Replay::run(&mut e, &blocks, 999).unwrap();
+    assert_eq!(r.reproduced_zero_native_diffs, vec![1001, 1002]);
+    assert!(
+        r.to_text().contains("reproduced with zero native diffs 2"),
+        "{}",
+        r.to_text()
+    );
+
+    // Our engine writes a diff where native wrote none: not reproduced.
+    let mut e = Scripted::new(&blocks, None);
+    e.native[1].1 = blocks[0].native_diffs().to_vec();
+    let r = Replay::run(&mut e, &blocks, 999).unwrap();
+    assert_eq!(r.reproduced_heights, vec![1000, 1002]);
+    assert_eq!(r.causes.get(&Cause::BookDiffs), Some(&1));
+    assert_eq!(r.reproduced_zero_native_diffs, vec![1002]);
+}

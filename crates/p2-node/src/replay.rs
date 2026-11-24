@@ -276,6 +276,9 @@ pub struct Replay {
     pub reproduced: u64,
     /// Heights reproduced exactly (timing is reported over these only).
     pub reproduced_heights: Vec<u64>,
+    /// Reproduced heights whose native diff list was empty: they count only
+    /// because our engine wrote no diffs either (absent diffs refuse, F2).
+    pub reproduced_zero_native_diffs: Vec<u64>,
     /// Actions seen.
     pub actions: u64,
     /// Actions the engine executed (did not return `Unsupported`).
@@ -448,6 +451,9 @@ impl Replay {
             None => {
                 self.reproduced += 1;
                 self.reproduced_heights.push(b.height);
+                if b.native_diffs().is_empty() {
+                    self.reproduced_zero_native_diffs.push(b.height);
+                }
             }
             Some(m) => {
                 *self.causes.entry(m.cause.clone()).or_insert(0) += 1;
@@ -484,6 +490,11 @@ impl Replay {
             s,
             "blocks with an unsupported action {}, mismatched and resynced {}",
             self.blocks_with_unsupported, self.resynced
+        );
+        let _ = writeln!(
+            s,
+            "reproduced with zero native diffs {} (empty native list matched only by an empty one; absent diffs refuse the run)",
+            self.reproduced_zero_native_diffs.len()
         );
         let _ = writeln!(
             s,
