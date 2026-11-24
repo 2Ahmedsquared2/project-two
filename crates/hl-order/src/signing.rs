@@ -6,15 +6,16 @@
 //! 2. Phantom agent `{source, connectionId}`; `source` is `"b"` off mainnet.
 //! 3. EIP-712 over type `Agent(string source,bytes32 connectionId)` in domain
 //!    `{name "Exchange", version "1", chainId 1337, verifyingContract 0x0}`.
-//! 4. secp256k1 ECDSA (RFC 6979, low-s), `v = 27 + recovery id`.
+//! 4. secp256k1 ECDSA (RFC 6979, low-s), `v = 27 + recovery id`, signed by
+//!    libsecp256k1 with one context per process.
 //!
 //! The action is msgpack-encoded straight into the Keccak hasher, so signing does
 //! not allocate.
 
-use k256::ecdsa::SigningKey;
 use sha3::{Digest, Keccak256};
 
 use crate::action::{Action, EncodeError};
+use crate::ecdsa::SecretKey;
 use crate::hex::{write_hex, write_minimal_hex};
 use crate::network::Network;
 
@@ -119,7 +120,7 @@ fn domain_separator() -> [u8; 32] {
 
 /// A secp256k1 signing key with the EIP-712 constants precomputed.
 pub struct Signer {
-    key: SigningKey,
+    key: SecretKey,
     address: [u8; 20],
     domain: [u8; 32],
     agent_typehash: [u8; 32],
@@ -137,9 +138,8 @@ impl std::fmt::Debug for Signer {
 impl Signer {
     /// Build from a 32-byte big-endian private key.
     pub fn from_bytes(key: &[u8; 32]) -> Result<Self, SignError> {
-        let key = SigningKey::from_slice(key).map_err(|_| SignError::InvalidKey)?;
-        let point = key.verifying_key().to_encoded_point(false);
-        let hash = keccak(&point.as_bytes()[1..]);
+        let key = SecretKey::from_bytes(key)?;
+        let hash = keccak(&key.public_key_uncompressed()[1..]);
         let mut address = [0u8; 20];
         address.copy_from_slice(&hash[12..]);
         Ok(Self {
@@ -191,18 +191,13 @@ impl Signer {
     ) -> Result<SignedAction, SignError> {
         let cid = connection_id(action, nonce, vault, expires_after)?;
         let digest = self.agent_digest(network, &cid);
-        let (sig, recid) = self
-            .key
-            .sign_prehash_recoverable(&digest)
-            .map_err(|e| SignError::Ecdsa(e.to_string()))?;
-        let (r, s) = sig.split_bytes();
+        let sig = self.key.sign_recoverable(&digest)?;
+        let (mut r, mut s) = ([0u8; 32], [0u8; 32]);
+        r.copy_from_slice(&sig[..32]);
+        s.copy_from_slice(&sig[32..64]);
         Ok(SignedAction {
             connection_id: cid,
-            signature: Signature {
-                r: r.into(),
-                s: s.into(),
-                v: 27 + recid.to_byte(),
-            },
+            signature: Signature { r, s, v: sig[64] },
         })
     }
 }
