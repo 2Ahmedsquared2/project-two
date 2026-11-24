@@ -1239,9 +1239,11 @@ fn order_status_json(
                 json!({ "resting": with_cloid(m) })
             } else {
                 let am = meta.get(leg.asset)?;
-                // Average in ticks, rounded half up (UNVERIFIED: native's rounding).
+                // Average in ticks, rounded DOWN to the price grid: native's
+                // avgPx is floor(VWAP) on 19,117 of 19,117 filled legs in
+                // 1232430001..1232440000 (lane 3, r2_filled_legs_0c97fb2.tsv).
                 let f = u128::from(filled.0);
-                let avg = u64::try_from((notional + f / 2) / f).ok()?;
+                let avg = u64::try_from(notional / f).ok()?;
                 let mut m = serde_json::Map::new();
                 m.insert(
                     "totalSz".into(),

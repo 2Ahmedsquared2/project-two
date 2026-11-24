@@ -747,3 +747,41 @@ fn price_decimals_beyond_the_grid_are_invalid_price_before_sig_figs() {
         assert!(out.book_diffs.is_empty(), "price {p}");
     }
 }
+
+/// `avgPx` is the exact VWAP rounded DOWN to the price grid, as native prints
+/// it (19,117 of 19,117 filled legs in 1232430001..1232440000; lane 3's
+/// `r2_filled_legs_0c97fb2.tsv`). An IOC buy of 3 takes 1 @ 10.0 and 2 @ 10.1:
+/// VWAP 10.06666.., grid 4 decimals -> "10.0666" (half-up would be 10.0667).
+#[test]
+fn avg_px_is_the_vwap_rounded_down_to_the_grid() {
+    let rest = |oid: u64, px: u64, sz: u64| RestingOrder {
+        asset: 7,
+        user: user(0x22),
+        oid: Oid(oid),
+        side: Side::Ask,
+        px: Px(px),
+        sz: Sz(sz),
+        cloid: None,
+        t_ms: 0,
+    };
+    let e = hl_exec::Engine::from_l4_snapshot(
+        &[7],
+        [rest(100, 100_000, 100), rest(101, 101_000, 200)],
+        Some(Oid(200)),
+        Capacity {
+            orders: 1024,
+            levels_per_side: 64,
+            actions_per_block: 64,
+            events_per_block: 256,
+        },
+        EngineConfig::default(),
+    )
+    .unwrap();
+    let mut e = HlExecEngine::new(e, meta());
+    let ioc = json!({"type":"order","orders":[{"a":7,"b":true,"p":"10.1","s":"3","r":false,"t":{"limit":{"tif":"Ioc"}}}],"grouping":"na"});
+    let out = e.execute_block(1_000_000_000_000, &[ua("order", &ioc, ALICE)]);
+    assert_eq!(
+        status(&out.results[0]),
+        &json!({"filled":{"totalSz":"3.0","avgPx":"10.0666","oid":200}})
+    );
+}
