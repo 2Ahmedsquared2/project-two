@@ -88,7 +88,9 @@ The report also prints `warning:` lines, which never stop a run:
   and gets a line saying the pinned cores were not checked against it. So
   does a list the kernel itself refuses: one naming a CPU number of 8192 or
   more (past the widest CPU mask an x86-64 or arm64 kernel is built with), or
-  a stride using more than its group (`0-7:3/2`);
+  a stride using more than its group (`0-7:3/2`). A list the kernel accepts
+  that selects no CPU (`0-7:0/2`, or `isolcpus=domain` with no list) is read
+  as an empty list, so every pinned core is reported as not in it;
 - with `nohz_full` unreadable, a core outside `rcu_nocbs` (or `rcu_nocbs` not
   set) is reported as "whether it is offloaded from RCU callbacks is
   undetermined", not as not offloaded;
