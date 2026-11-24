@@ -80,8 +80,20 @@ impl HlOrderSigner {
     ///
     /// When the price or size does not fit [`Decimal8`].
     pub fn action_for(intent: &OrderIntent) -> Result<Action, ReplayError> {
-        let _ = (intent, UNITS_PER_TICK, UNITS_PER_LOT);
-        Err(ReplayError::Signer("not implemented".to_owned()))
+        let units = |n: u64, per: u64, what: &'static str| {
+            n.checked_mul(per)
+                .map(Decimal8::from_units)
+                .ok_or_else(|| ReplayError::Signer(format!("{what} {n} does not fit 1e-8 units")))
+        };
+        Ok(Action::Order(LimitOrder {
+            asset: intent.asset,
+            is_buy: intent.is_buy,
+            px: units(intent.px_ticks, UNITS_PER_TICK, "price ticks")?,
+            sz: units(intent.sz_lots, UNITS_PER_LOT, "size lots")?,
+            reduce_only: false,
+            tif: Tif::Alo,
+            cloid: None,
+        }))
     }
 
     /// Signs `action` as the SDK's `sign_l1_action` does and appends the
@@ -99,16 +111,31 @@ impl HlOrderSigner {
         expires_after: Option<u64>,
         out: &mut Vec<u8>,
     ) -> Result<(), ReplayError> {
-        let _ = (action, nonce, vault, expires_after, out, &self.body);
-        let _ = (Network::Testnet, Tif::Alo, Decimal8::from_units(0));
-        let _: Option<LimitOrder> = None;
-        Err(ReplayError::Signer("not implemented".to_owned()))
+        let signed = self
+            .signer
+            .sign_l1(Network::Testnet, action, nonce, vault, expires_after)
+            .map_err(|e| ReplayError::Signer(e.to_string()))?;
+        self.body.clear();
+        hl_order::request_body(
+            &mut self.body,
+            action,
+            nonce,
+            &signed.signature,
+            vault,
+            expires_after,
+        );
+        out.extend_from_slice(self.body.as_bytes());
+        out.push(b'\n');
+        Ok(())
     }
 }
 
 impl Stage for HlOrderSigner {
-    const NAME: &'static str = "HlOrderSigner: skeleton, signs nothing yet";
-    const LABEL: StageLabel = StageLabel::Prototype;
+    const NAME: &'static str =
+        "HlOrderSigner: hl_order::Signer::sign_l1 (msgpack -> keccak256 connectionId, EIP-712 agent digest, k256 RFC 6979) + request_body; testnet source, matches the Python SDK golden vectors";
+    /// Real because `tests/real_signer.rs` signs every `hl-order` golden
+    /// vector through this type and compares the bytes with the SDK's.
+    const LABEL: StageLabel = StageLabel::Real;
 }
 
 impl Signer for HlOrderSigner {
