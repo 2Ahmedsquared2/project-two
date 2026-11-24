@@ -452,8 +452,17 @@ impl Engine {
         oid
     }
 
+    /// A leg that takes no oid. A `Some` hint means native spent an oid
+    /// here that the engine did not, so it counts as a mismatch too.
+    fn no_oid(&mut self, hint: Option<Oid>) {
+        if hint.is_some() {
+            self.out.oid_mismatches = self.out.oid_mismatches.saturating_add(1);
+        }
+    }
+
     fn place(&mut self, user: User, o: &OrderReq, now: u64) -> OrderStatus {
         if let Some(r) = o.pre_reject {
+            self.no_oid(o.oid_hint);
             return OrderStatus::Rejected(r);
         }
         // Native spends an oid on every leg past the static checks, whatever
@@ -470,9 +479,11 @@ impl Engine {
             return OrderStatus::Unsupported;
         };
         if o.sz.0 == 0 {
+            self.no_oid(o.oid_hint);
             return OrderStatus::Rejected(RejectReason::ZeroSize);
         }
         if o.px.0 == 0 {
+            self.no_oid(o.oid_hint);
             return OrderStatus::Rejected(RejectReason::ZeroPrice);
         }
         self.touch(b);
@@ -661,17 +672,17 @@ impl Engine {
 
     fn modify(&mut self, user: User, m: &ModifyReq, now: u64) -> OrderStatus {
         if !self.by_asset.contains_key(&m.order.asset) {
+            self.no_oid(m.order.oid_hint);
             return OrderStatus::Unsupported;
         }
         // A modify by cloid looks in the replacement's book.
         let asset = matches!(m.target, OrderRef::Cloid(_)).then_some(m.order.asset);
-        match self.resolve(user, asset, m.target) {
-            Some((b, slot)) => {
-                self.remove_resting(b, slot);
-                self.place(user, &m.order, now)
-            }
-            None => OrderStatus::Rejected(RejectReason::ModifyUnknownOrder),
-        }
+        let Some((b, slot)) = self.resolve(user, asset, m.target) else {
+            self.no_oid(m.order.oid_hint);
+            return OrderStatus::Rejected(RejectReason::ModifyUnknownOrder);
+        };
+        self.remove_resting(b, slot);
+        self.place(user, &m.order, now)
     }
 
     /// Undo the last block's book changes and apply `native` (the block's
