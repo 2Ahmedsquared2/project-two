@@ -298,14 +298,14 @@ impl HostFacts {
                 .filter(|(_, core)| !listed.contains(core))
                 .map(|(role, core)| {
                     format!(
-                        "{role} core {core} is not in rcu_nocbs ({raw}) and nohz_full ({tickless}) was not read: whether it is offloaded from RCU callbacks is undetermined"
+                        "{role} core {core} is not in rcu_nocbs ({raw}) and nohz_full ({tickless}) could not be parsed: whether it is offloaded from RCU callbacks is undetermined"
                     )
                 })
                 .collect(),
             None if !pinned.is_empty() => {
                 let (cores, verb) = name_cores(pinned);
                 vec![format!(
-                    "rcu_nocbs is not set and nohz_full ({tickless}) was not read: whether {cores} {verb} offloaded from RCU callbacks is undetermined"
+                    "rcu_nocbs is not set and nohz_full ({tickless}) could not be parsed: whether {cores} {verb} offloaded from RCU callbacks is undetermined"
                 )]
             }
             // `all` offloads every core; an unreadable rcu_nocbs gets its own line.
