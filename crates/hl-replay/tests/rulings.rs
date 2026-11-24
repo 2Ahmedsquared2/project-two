@@ -164,10 +164,15 @@ fn each_round_runs_the_arms_in_its_own_seeded_random_order() {
         let mut want: Vec<&str> = arms.iter().map(|a| a.name()).collect();
         want.sort_unstable();
         assert_eq!(sorted, want, "every round runs every arm exactly once");
-        // The machine's load is recorded as the kernel printed it.
+        // The machine's load is recorded as the kernel printed it. Only
+        // Linux has `/proc/loadavg`; elsewhere the field says so.
         for load in [&r.load_before, &r.load_after] {
-            assert!(load.split_whitespace().count() >= 4, "{load:?}");
-            assert!(load.contains('/'), "runnable/total field: {load:?}");
+            if cfg!(target_os = "linux") {
+                assert!(load.split_whitespace().count() >= 4, "{load:?}");
+                assert!(load.contains('/'), "runnable/total field: {load:?}");
+            } else {
+                assert_ne!(load, "");
+            }
         }
     }
     assert!(
