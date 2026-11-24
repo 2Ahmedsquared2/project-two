@@ -27,6 +27,9 @@
 //! `User or API Wallet {signer} does not exist.` An `approveAgent` native
 //! accepted adds its agent to the set (acceptance read from native: input).
 //! User-signed actions (`signatureChainId`) and `multiSig` are not ruled.
+//! The set is the seed plus in-window accepted `approveAgent`s; users created
+//! in the window (deposits, transfers) are not added. `--wallet-log FILE`
+//! writes every action where the rule and native disagree.
 #![allow(
     missing_docs,
     clippy::unwrap_used,
@@ -44,7 +47,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write as _};
 use std::time::Instant;
 
 use hl_exec::decimal::parse_fixed;
@@ -278,8 +281,8 @@ struct Block {
     /// Per action, the recovered signer the unknown-wallet rule found absent
     /// (kind 5; `None` for every other action).
     unknown_signer: Vec<Option<[u8; 20]>>,
-    /// Per action, whether the rule was applied (signer recovered and checked).
-    ruled: Vec<bool>,
+    /// Per action, the recovered L1 signer when the rule was applied.
+    signer: Vec<Option<[u8; 20]>>,
 }
 
 /// The unknown-wallet rule's state across blocks.
@@ -426,13 +429,13 @@ fn decode_block(meta: &Meta, line: &str, mut rule: Option<&mut WalletRule>) -> B
             // Unknown-wallet rule: a signer outside the set makes the whole
             // action a noop with native's error, whatever its type.
             let mut unknown = None;
-            let mut ruled = false;
+            let mut ruled = None;
             if let (Some(r), Some(l1)) = (rule.as_deref_mut(), l1.as_ref()) {
                 let user_signed = a.get("signatureChainId").is_some() || t == "multiSig";
                 if !user_signed && !expired {
                     match l1[act_no].recover(&r.ctx, signers::MAINNET) {
                         Some(s) => {
-                            ruled = true;
+                            ruled = Some(s);
                             if !r.set.exists(&s) {
                                 unknown = Some(s);
                             }
@@ -454,7 +457,7 @@ fn decode_block(meta: &Meta, line: &str, mut rule: Option<&mut WalletRule>) -> B
                 kind
             };
             b.unknown_signer.push(unknown);
-            b.ruled.push(ruled);
+            b.signer.push(ruled);
             b.act_assets.push((a0, b.assets.len()));
             b.acts.push((
                 kind,
@@ -987,6 +990,13 @@ fn main() {
     // Unknown-wallet rule tallies over counted blocks: (native says absent,
     // we said absent), native absent only, we absent only.
     let (mut uw_both, mut uw_missed, mut uw_false) = (0usize, 0usize, 0usize);
+    // `--wallet-log FILE`: every action where the rule and native disagree
+    // (height, action index, type, recovered signer or -, our verdict, native).
+    let mut wallet_log = arg("--wallet-log").map(|p| {
+        let mut w = std::io::BufWriter::new(File::create(p).unwrap());
+        writeln!(w, "height\tact\ttype\tsigner\tours\tnative").unwrap();
+        w
+    });
     let mut k = 0usize;
     // (height, verdict): "reproduced" or the block's mismatch classes.
     let mut verdicts: Vec<(u64, String)> = Vec::new();
@@ -1071,9 +1081,21 @@ fn main() {
                     (false, false) => {}
                 }
                 if ours != b.native[i] && (native_unknown || ours_unknown) {
+                    if let Some(w) = wallet_log.as_mut() {
+                        writeln!(
+                            w,
+                            "{}\t{i}\t{}\t{}\t{}\t{}",
+                            b.height,
+                            b.types[i],
+                            b.signer[i].map_or_else(|| "-".into(), |a| signers::addr_hex(&a)),
+                            if ours_unknown { "absent" } else { "present" },
+                            b.native[i]
+                        )
+                        .unwrap();
+                    }
                     // A rule miss gets its own class; keep comparing.
                     uw_class.get_or_insert(if !ours_unknown {
-                        if b.ruled[i] {
+                        if b.signer[i].is_some() {
                             "resp:unknown-wallet-missed"
                         } else {
                             "resp:unknown-wallet-unruled"
