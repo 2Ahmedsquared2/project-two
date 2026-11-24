@@ -2,6 +2,7 @@
 //! harness requires of it, and what the report says about it.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -11,6 +12,7 @@ use hl_replay::{render_report, HostFacts, HostFactsNote, HostInfo, ReplayError, 
 fn script() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/capture-host.sh")
 }
+#[cfg(target_os = "linux")]
 fn bash() -> &'static str {
     ["/bin/bash", "/usr/bin/bash"]
         .into_iter()
@@ -32,7 +34,7 @@ fn file_with(skip: Option<&str>, body: &str) -> String {
         if Some(name) == skip {
             continue;
         }
-        s.push_str(&format!("== begin {name}\n{body}\n== end {name}\n"));
+        let _ = writeln!(s, "== begin {name}\n{body}\n== end {name}");
     }
     s
 }
@@ -51,7 +53,7 @@ fn a_complete_file_parses_and_exposes_its_sections() {
     for name in HostFacts::REQUIRED {
         assert_eq!(f.section(name), Some("some fact\nanother"), "{name}");
     }
-    assert!(f.unavailable().is_empty());
+    assert_eq!(f.unavailable(), Vec::<&str>::new());
     assert!(!f.has_manual_rtt());
 }
 
@@ -149,6 +151,7 @@ fn facts_from_another_kernel_are_refused() {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn capture(dir: &str, path_env: Option<&str>) -> String {
     let out = tmp(dir).join("host-facts.txt");
     let mut c = Command::new(bash());
@@ -161,6 +164,8 @@ fn capture(dir: &str, path_env: Option<&str>) -> String {
     std::fs::read_to_string(out).unwrap()
 }
 
+// The capture script is for Linux hosts (/proc, /sys, bash 4.2+).
+#[cfg(target_os = "linux")]
 #[test]
 fn the_capture_script_writes_a_file_the_harness_accepts() {
     let text = capture("real", None);
@@ -169,6 +174,8 @@ fn the_capture_script_writes_a_file_the_harness_accepts() {
     assert!(!f.has_manual_rtt(), "the script must never write the RTT");
 }
 
+// The capture script is for Linux hosts (/proc, /sys, bash 4.2+).
+#[cfg(target_os = "linux")]
 #[test]
 fn with_no_tools_at_all_every_section_is_still_written() {
     // No `lscpu`, `ethtool`, `chronyc` or anything else on PATH: what cannot

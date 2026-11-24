@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hl_replay::{
-    generated_lines, load_lines, render_run, run_shuffled, write_artifacts, Arm, HostInfo,
-    LoopbackAddr, RoundConfig, RunMeta, GIT_SHA,
+    generated_lines, load_lines, render_run, run_shuffled, write_artifacts, Arm, HostFacts,
+    HostFactsNote, HostInfo, LoopbackAddr, ReplayError, RoundConfig, RunMeta, GIT_SHA,
 };
 
 const USAGE: &str = "\
@@ -36,7 +36,14 @@ loopback socket (t2), per arm, rounds interleaved.
   --no-pin           pin nothing
   --tail-dir DIR     where detect arms tail their file (default /dev/shm)
   --sink-bind ADDR   sink listen address; loopback only (default 127.0.0.1:0)
-  --out DIR          also write report.txt and raw histograms there
+  --out DIR          also write report.txt and raw histograms there; needs
+                     --host-facts
+  --host-facts FILE  host facts written by scripts/capture-host.sh on this
+                     host; checked before anything runs, named in the report
+                     and copied to DIR/host-facts.txt
+  --allow-missing-host-facts
+                     local runs only: let --out go ahead without host facts;
+                     the report says NOT CAPTURED
   --help             this text
 ";
 
@@ -54,6 +61,8 @@ struct Args {
     tail_dir: PathBuf,
     sink_bind: LoopbackAddr,
     out: Option<PathBuf>,
+    host_facts: Option<PathBuf>,
+    allow_missing_host_facts: bool,
     seed: u64,
 }
 
@@ -82,6 +91,36 @@ fn num<T: std::str::FromStr>(flag: &str, value: &str) -> Result<T, String> {
         .map_err(|_| format!("{flag}: {value:?} is not a valid number"))
 }
 
+/// Refuses option combinations that cannot give a meaningful run.
+fn validate(a: &Args) -> Result<(), String> {
+    if a.rounds == 0 {
+        return Err("--rounds must be at least 1".to_owned());
+    }
+    if a.lines <= a.warmup {
+        return Err(format!(
+            "--lines ({}) must exceed --warmup ({}): nothing would be recorded",
+            a.lines, a.warmup
+        ));
+    }
+    if a.host_facts.is_some() && a.allow_missing_host_facts {
+        return Err(
+            "--host-facts and --allow-missing-host-facts contradict each other: give one"
+                .to_owned(),
+        );
+    }
+    if a.out.is_some() && a.host_facts.is_none() && !a.allow_missing_host_facts {
+        return Err(
+            "--out needs --host-facts FILE: run scripts/capture-host.sh FILE on this host first \
+             (for a local run that is not a result, pass --allow-missing-host-facts)"
+                .to_owned(),
+        );
+    }
+    if a.distinct == 0 {
+        return Err("--distinct must be at least 1".to_owned());
+    }
+    Ok(())
+}
+
 /// `Ok(None)` means `--help`.
 fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
     let mut a = Args {
@@ -98,6 +137,8 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
         tail_dir: PathBuf::from("/dev/shm"),
         sink_bind: LoopbackAddr::ephemeral(),
         out: None,
+        host_facts: None,
+        allow_missing_host_facts: false,
         seed: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| u64::from(d.subsec_nanos())),
@@ -110,6 +151,10 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
             "--help" | "-h" => return Ok(None),
             "--no-pin" => {
                 no_pin = true;
+                continue;
+            }
+            "--allow-missing-host-facts" => {
+                a.allow_missing_host_facts = true;
                 continue;
             }
             _ => {}
@@ -128,6 +173,7 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
             "--tail-dir",
             "--sink-bind",
             "--out",
+            "--host-facts",
             "--seed",
         ];
         if !known.contains(&flag) {
@@ -147,6 +193,7 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
             "--feeder-core" => a.feeder_core = Some(num(flag, v)?),
             "--hot-core" => a.hot_core = Some(num(flag, v)?),
             "--tail-dir" => a.tail_dir = PathBuf::from(v),
+            "--host-facts" => a.host_facts = Some(PathBuf::from(v)),
             "--sink-bind" => a.sink_bind = v.parse().map_err(|e| format!("--sink-bind: {e}"))?,
             _ => a.out = Some(PathBuf::from(v)),
         }
@@ -155,19 +202,21 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
         a.feeder_core = None;
         a.hot_core = None;
     }
-    if a.rounds == 0 {
-        return Err("--rounds must be at least 1".to_owned());
-    }
-    if a.lines <= a.warmup {
-        return Err(format!(
-            "--lines ({}) must exceed --warmup ({}): nothing would be recorded",
-            a.lines, a.warmup
-        ));
-    }
-    if a.distinct == 0 {
-        return Err("--distinct must be at least 1".to_owned());
-    }
+    validate(&a)?;
     Ok(Some(a))
+}
+
+/// Checks the host-facts file, if one was given, before anything runs.
+fn host_facts_note(args: &Args, host: &HostInfo) -> Result<HostFactsNote, ReplayError> {
+    match &args.host_facts {
+        Some(path) => {
+            let facts = HostFacts::load(path)?;
+            facts.check_kernel(&host.kernel)?;
+            Ok(HostFactsNote::captured(path, &facts))
+        }
+        None if args.allow_missing_host_facts => Ok(HostFactsNote::Waived),
+        None => Ok(HostFactsNote::NotRequired),
+    }
 }
 
 fn main() -> ExitCode {
@@ -180,6 +229,14 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             eprintln!("hl-replay: {e}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let host = HostInfo::detect();
+    let host_facts = match host_facts_note(&args, &host) {
+        Ok(note) => note,
+        Err(e) => {
+            eprintln!("hl-replay: --host-facts: {e}");
             return ExitCode::from(2);
         }
     };
@@ -223,7 +280,7 @@ fn main() -> ExitCode {
     };
     let meta = RunMeta {
         commit: GIT_SHA.to_owned(),
-        host: HostInfo::detect(),
+        host,
         feeder_core: cfg.feeder_core,
         hot_core: cfg.hot_core,
         rounds: args.rounds,
@@ -231,7 +288,7 @@ fn main() -> ExitCode {
         warmup_per_round: cfg.warmup,
         interval: cfg.interval,
         input,
-        host_facts: hl_replay::HostFactsNote::NotRequired,
+        host_facts,
     };
     let report = render_run(&meta, &run);
     print!("{report}");
@@ -239,6 +296,12 @@ fn main() -> ExitCode {
         if let Err(e) = write_artifacts(dir, &report, &run.arms) {
             eprintln!("hl-replay: --out: {e}");
             return ExitCode::FAILURE;
+        }
+        if let Some(facts) = &args.host_facts {
+            if let Err(e) = std::fs::copy(facts, dir.join("host-facts.txt")) {
+                eprintln!("hl-replay: --out: host-facts.txt: {e}");
+                return ExitCode::FAILURE;
+            }
         }
     }
     ExitCode::SUCCESS

@@ -102,7 +102,8 @@ fn a_small_run_prints_the_report_and_writes_the_raw_histograms() {
     }
 }
 
-/// Runs `scripts/capture-host.sh` and returns the file it wrote.
+/// Runs `scripts/capture-host.sh` (Linux hosts only) and returns the file it wrote.
+#[cfg(target_os = "linux")]
 fn captured_facts(name: &str) -> PathBuf {
     let path = tmp(name).join("facts.txt");
     let script =
@@ -135,6 +136,7 @@ fn out_without_host_facts_is_refused_before_anything_runs() {
     assert!(!out.exists(), "nothing may be written");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_run_with_host_facts_reports_them_and_keeps_a_copy() {
     let facts = captured_facts("facts-ok");
@@ -161,6 +163,7 @@ fn a_run_with_host_facts_reports_them_and_keeps_a_copy() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_bad_host_facts_file_is_refused_before_anything_runs() {
     let good = std::fs::read_to_string(captured_facts("facts-src")).unwrap();
@@ -201,6 +204,7 @@ fn a_bad_host_facts_file_is_refused_before_anything_runs() {
     assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn host_facts_and_the_override_together_are_a_usage_error() {
     let facts = captured_facts("facts-both");

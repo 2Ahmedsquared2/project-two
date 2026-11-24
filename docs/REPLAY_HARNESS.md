@@ -33,18 +33,78 @@ no mean. Rounds are merged histograms, never averaged percentiles.
 ```bash
 git rev-parse HEAD                       # must match the report's `commit:` line, with no -dirty
 cargo build --release -p hl-replay
+out=results/replay-$(date -u +%Y%m%dT%H%M%SZ)
+facts=$out.host-facts.txt
+mkdir -p results
+./scripts/capture-host.sh "$facts"       # read-only; second argument names the NIC if it is not the default route's
 ./target/release/hl-replay \
   --arms all --rounds 5 --lines 11000 --warmup 1000 --interval-us 1000 \
   --feeder-core 2 --hot-core 3 \
-  --out results/replay-$(date -u +%Y%m%dT%H%M%SZ)
+  --host-facts "$facts" --out "$out"
 ```
+
+### Host facts
+
+`--out` is refused (exit 2, nothing run, nothing written) unless
+`--host-facts FILE` names a file written by `scripts/capture-host.sh` on the
+same host. The harness checks, before anything runs, that the file has the
+header and all 16 sections, each terminated and not empty, and that it was
+captured on the running kernel. The report then carries
+`host facts: FILE, captured <UTC>, 16 sections checked, unavailable in: ...`
+and the file is copied to `DIR/host-facts.txt`.
+
+| Section | What the script reads |
+|---|---|
+| `kernel-cmdline` | `/proc/cmdline` |
+| `lscpu` | `lscpu` |
+| `numa` | `/sys/devices/system/node/node*/cpulist` |
+| `cstates` | cpu0's cpuidle states (name, disable, latency), the cpuidle driver, `intel_idle` `max_cstate` |
+| `governor` | every CPU's `scaling_governor` |
+| `clocksource` | current and available clocksource |
+| `tsc` | the TSC flags in `/proc/cpuinfo` |
+| `ena-irq-affinity` | `smp_affinity_list` of every interrupt named for ENA or the NIC |
+| `irqbalance` | whether a process named `irqbalance` runs |
+| `busy-poll-sysctls` | `net.core.busy_poll`, `net.core.busy_read` |
+| `ethtool-c`, `ethtool-k`, `ethtool-l` | `ethtool -c/-k/-l` on the NIC (queries only) |
+| `thp` | transparent hugepage `enabled` and `defrag` |
+| `swappiness` | `vm.swappiness` |
+| `chrony` | `chronyc tracking` |
+
+The script sets nothing and contacts no remote host. A fact the host cannot
+give is written as `unavailable (why)`, never left out; the report lists the
+sections that hold one, so read that list before trusting a run.
+
+For a local run that is not a result, `--allow-missing-host-facts` lets
+`--out` go ahead; the report then says
+`host facts: NOT CAPTURED (--allow-missing-host-facts): local run, not a result for a write-up`.
+
+### RTT to the exchange: a manual step, not part of the harness
+
+Nothing in this repository connects to a Hyperliquid host: not the harness,
+not the capture script, not a test, not a default. Latency's write-up still
+wants the round-trip time from the Tokyo host (n=100), so the operator runs it
+by hand, once, after the capture and before the replay, and appends the output
+to the host-facts file under its own marked section:
+
+```bash
+{ echo "== begin rtt-manual"
+  ping -c 100 -q api.hyperliquid.xyz
+  echo "== end rtt-manual"; } >> "$facts"
+```
+
+If ICMP gets no answers, record TCP connect times in the same section instead
+(`curl -o /dev/null -s -w '%{time_connect}\n' https://api.hyperliquid.xyz`,
+100 times) and say which was used. Neither command has been run from this
+repository's development machines. The harness never requires or reads this
+section; the report only says `rtt-manual: present` or `absent`.
 
 Set `--feeder-core` and `--hot-core` to two different physical cores, the hot
 one isolated if the host has isolated cores. To replay recorded node output
 instead of generated lines, add `--input <file>` (one block-info JSON line per
-line; the file is cycled). Send Latency the whole `--out` directory.
+line; the file is cycled). Send Latency the whole `--out` directory, which
+includes `host-facts.txt`.
 
-`--out` holds `report.txt` and, per arm and metric, `<arm>.<metric>.hdr` (HDR
+`--out` holds `report.txt`, `host-facts.txt` and, per arm and metric, `<arm>.<metric>.hdr` (HDR
 V2 binary: mergeable, readable by any HdrHistogram library and by
 `LatencyHist::read_v2`) and `<arm>.<metric>.buckets.txt` (`value_ns count` per
 line, ending with a comment naming arm, metric, parser mode and commit).
