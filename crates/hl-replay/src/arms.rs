@@ -461,6 +461,30 @@ fn sqpoll_ring_without_cpu() -> bool {
         .is_ok_and(|rt| rt.driver_type() == DriverType::IoUring)
 }
 
+/// Why setting up the ring failed, as the arm's "unavailable" reason.
+///
+/// The kernel answers `EINVAL` both to a host without a polling thread and
+/// to a polling-thread CPU it will not use (not possible, offline, or
+/// outside the task's cpuset: v6.1 `io_sq_offload_create`).
+/// `ring_without_cpu` says whether a ring that polls with no CPU named is
+/// accepted, which tells the two apart; it builds a ring, so it is asked
+/// only when a core was named and the error is `EINVAL`.
+#[cfg(any(feature = "compio", test))]
+fn ring_setup_refusal(
+    core: Option<usize>,
+    e: &std::io::Error,
+    ring_without_cpu: impl FnOnce() -> bool,
+) -> String {
+    match core {
+        Some(core) if e.kind() == std::io::ErrorKind::InvalidInput && ring_without_cpu() => {
+            format!(
+                "io_uring refused --sqpoll-core {core} ({e}): the core is offline, not a CPU of this host, or outside this process's cpuset; a polling thread with no core named was accepted"
+            )
+        }
+        _ => format!("io_uring could not be set up on this host: {e}"),
+    }
+}
+
 #[cfg(feature = "compio")]
 fn compio_arm(
     sqpoll: Option<SqPoll>,
@@ -499,20 +523,11 @@ fn compio_arm(
     {
         Ok(rt) => rt,
         Err(e) => {
-            // The kernel answers EINVAL both to a host without a polling
-            // thread and to a polling-thread CPU it will not use (not
-            // possible, offline, or outside the task's cpuset: v6.1
-            // `io_sq_offload_create`). A ring that polls with no CPU named
-            // tells the two apart.
-            let core = sqpoll.and_then(|sq| sq.core);
-            let its_core =
-                e.kind() == std::io::ErrorKind::InvalidInput && sqpoll_ring_without_cpu();
-            return unavailable(match core {
-                Some(core) if its_core => format!(
-                    "io_uring refused --sqpoll-core {core} ({e}): the core is offline, not a CPU of this host, or outside this process's cpuset; a polling thread with no core named was accepted"
-                ),
-                _ => format!("io_uring could not be set up on this host: {e}"),
-            });
+            return unavailable(ring_setup_refusal(
+                sqpoll.and_then(|sq| sq.core),
+                &e,
+                sqpoll_ring_without_cpu,
+            ));
         }
     };
     if rt.driver_type() != DriverType::IoUring {
@@ -1047,4 +1062,89 @@ fn run_rounds(
         arms: reports,
         rounds: logs,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ring_setup_refusal;
+    use std::cell::Cell;
+    use std::io::{Error, ErrorKind};
+
+    const EINVAL: i32 = 22;
+    const ENOMEM: i32 = 12;
+
+    /// The message, and how many times the probe ring was asked for.
+    fn refusal(core: Option<usize>, errno: i32, ring_without_cpu: bool) -> (String, u32) {
+        let asked = Cell::new(0);
+        let e = Error::from_raw_os_error(errno);
+        let why = ring_setup_refusal(core, &e, || {
+            asked.set(asked.get() + 1);
+            ring_without_cpu
+        });
+        (why, asked.get())
+    }
+
+    #[test]
+    fn einval_is_the_kernels_invalid_input() {
+        assert_eq!(
+            Error::from_raw_os_error(EINVAL).kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_ne!(
+            Error::from_raw_os_error(ENOMEM).kind(),
+            ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn a_named_core_is_blamed_when_a_ring_without_it_is_accepted() {
+        let (why, asked) = refusal(Some(99), EINVAL, true);
+        assert!(
+            why.starts_with("io_uring refused --sqpoll-core 99 ("),
+            "{why}"
+        );
+        assert!(why.contains("os error 22"), "{why}");
+        assert!(
+            why.ends_with("a polling thread with no core named was accepted"),
+            "{why}"
+        );
+        assert_eq!(asked, 1);
+    }
+
+    #[test]
+    fn a_host_with_no_polling_thread_is_not_blamed_on_the_core() {
+        let (why, asked) = refusal(Some(99), EINVAL, false);
+        assert!(
+            why.starts_with("io_uring could not be set up on this host: "),
+            "{why}"
+        );
+        assert!(why.contains("os error 22"), "{why}");
+        assert!(!why.contains("--sqpoll-core"), "{why}");
+        assert_eq!(asked, 1, "only the probe ring tells the two EINVALs apart");
+    }
+
+    #[test]
+    fn an_error_other_than_einval_is_not_blamed_on_the_core_and_asks_for_no_ring() {
+        let (why, asked) = refusal(Some(99), ENOMEM, true);
+        assert!(
+            why.starts_with("io_uring could not be set up on this host: "),
+            "{why}"
+        );
+        assert!(why.contains("os error 12"), "{why}");
+        assert!(!why.contains("--sqpoll-core"), "{why}");
+        assert_eq!(asked, 0);
+    }
+
+    #[test]
+    fn with_no_core_named_the_host_is_the_reason_and_no_ring_is_asked_for() {
+        for errno in [EINVAL, ENOMEM] {
+            let (why, asked) = refusal(None, errno, true);
+            assert!(
+                why.starts_with("io_uring could not be set up on this host: "),
+                "{why}"
+            );
+            assert!(!why.contains("--sqpoll-core"), "{why}");
+            assert_eq!(asked, 0, "errno {errno}");
+        }
+    }
 }
