@@ -1,40 +1,99 @@
 //! `hl-latency`: summarise same-block arrival times from an observation file.
 //!
 //! ```text
-//! hl-latency <observations.jsonl>
+//! hl-latency <observations.jsonl> [--strict-pass <strict-pass.jsonl>]
 //! ```
 //!
-//! Prints the [`hl_latency::Summary`] as JSON. Exit codes: 0 ok, 2 usage or
-//! unreadable file.
+//! Prints the [`hl_latency::Summary`] as JSON, with the
+//! [`hl_latency::StrictDrop`] fields beside it. `--strict-pass` takes the
+//! stdout of `hl-strict-pass` over the same hourly files and leaves every
+//! block it lists as a scan-accepted failure out of the pairing.
+//!
+//! Exit codes: 0 ok; 1 the summary was printed but the strict pass capped its
+//! failure list (`strict_drop_incomplete`), so torn stamps may remain; 2
+//! usage, or an unreadable or malformed file.
 
+use std::ffi::OsString;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::Path;
 use std::process::ExitCode;
+
+use hl_latency::{StrictDrop, StrictFailures, StrictReadError, Summary};
+
+const USAGE: &str = "usage: hl-latency <observations.jsonl> [--strict-pass <strict-pass.jsonl>]";
+
+#[derive(serde::Serialize)]
+struct Report {
+    #[serde(flatten)]
+    summary: Summary,
+    #[serde(flatten)]
+    strict: StrictDrop,
+}
+
+/// The observation file and the strict-pass file, when the arguments are one
+/// path and at most one `--strict-pass FILE`, in either order.
+fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> Option<(OsString, Option<OsString>)> {
+    let (mut obs, mut strict) = (None, None);
+    while let Some(arg) = args.next() {
+        let slot = if arg == "--strict-pass" {
+            (&mut strict, args.next()?)
+        } else {
+            (&mut obs, arg)
+        };
+        if slot.0.replace(slot.1).is_some() {
+            return None;
+        }
+    }
+    Some((obs?, strict))
+}
 
 fn main() -> ExitCode {
     // `args_os`: a non-UTF-8 path must be an error, not a panic.
-    let mut args = std::env::args_os().skip(1);
-    let (Some(path), None) = (args.next(), args.next()) else {
-        eprintln!("usage: hl-latency <observations.jsonl>");
+    let Some((path, strict_path)) = parse_args(std::env::args_os().skip(1)) else {
+        eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    let obs = match std::fs::File::open(&path)
+    let obs = match File::open(&path)
         .map_err(hl_latency::ReadError::from)
-        .and_then(|f| hl_latency::read_observations(std::io::BufReader::new(f)))
+        .and_then(|f| hl_latency::read_observations(BufReader::new(f)))
     {
         Ok(obs) => obs,
         Err(e) => {
-            eprintln!("{}: {e}", std::path::Path::new(&path).display());
+            eprintln!("{}: {e}", Path::new(&path).display());
             return ExitCode::from(2);
         }
     };
-    let summary = hl_latency::summarize(&hl_latency::pair(obs));
-    match serde_json::to_string_pretty(&summary) {
-        Ok(s) => {
-            println!("{s}");
-            ExitCode::SUCCESS
-        }
+    let (obs, strict) = match strict_path {
+        None => (obs, StrictDrop::default()),
+        Some(p) => match File::open(&p)
+            .map_err(StrictReadError::from)
+            .and_then(|f| StrictFailures::read(BufReader::new(f)))
+        {
+            Ok(failures) => failures.apply(obs),
+            Err(e) => {
+                eprintln!("{}: {e}", Path::new(&p).display());
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let report = Report {
+        summary: hl_latency::summarize(&hl_latency::pair(obs)),
+        strict,
+    };
+    match serde_json::to_string_pretty(&report) {
+        Ok(s) => println!("{s}"),
         Err(e) => {
             eprintln!("serialise: {e}");
-            ExitCode::from(2)
+            return ExitCode::from(2);
         }
     }
+    if strict.strict_drop_incomplete {
+        eprintln!(
+            "warning: hl-strict-pass left {} failures out of its list, so torn stamps may remain in this summary; rerun it with a larger --max-failures",
+            strict.strict_failures_omitted
+        );
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
 }
