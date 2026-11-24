@@ -410,3 +410,22 @@ fn the_report_says_when_host_facts_were_waived() {
         "{report}"
     );
 }
+
+#[test]
+fn the_checked_bytes_are_what_gets_written_beside_the_report() {
+    let text = file_with(None, "x");
+    let f = HostFacts::parse(&text).unwrap();
+    assert_eq!(f.raw(), text);
+    let dir = tmp("write");
+    let path = f.write_to(&dir).unwrap();
+    assert_eq!(path, dir.join("host-facts.txt"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    // Writing over an existing copy replaces it whole and leaves nothing else.
+    let again = f.write_to(&dir).unwrap();
+    assert_eq!(std::fs::read_to_string(again).unwrap(), text);
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["host-facts.txt"]);
+}

@@ -163,6 +163,37 @@ fn a_run_with_host_facts_reports_them_and_keeps_a_copy() {
     );
 }
 
+/// Regression: `--host-facts DIR/host-facts.txt --out DIR` copied the file
+/// onto itself, which truncated the evidence to 0 bytes and still exited 0.
+#[cfg(target_os = "linux")]
+#[test]
+fn host_facts_already_in_the_out_directory_survive_the_run() {
+    let out = tmp("samepath");
+    let facts = out.join("host-facts.txt");
+    std::fs::copy(captured_facts("facts-same"), &facts).unwrap();
+    let before = std::fs::read(&facts).unwrap();
+    assert!(!before.is_empty());
+    let o = tiny_run()
+        .arg("--host-facts")
+        .arg(&facts)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(std::fs::read(&facts).unwrap(), before);
+    let left: Vec<String> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("host-facts") && n != "host-facts.txt")
+        .collect();
+    assert_eq!(
+        left,
+        Vec::<String>::new(),
+        "no temporary file is left behind"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn a_bad_host_facts_file_is_refused_before_anything_runs() {

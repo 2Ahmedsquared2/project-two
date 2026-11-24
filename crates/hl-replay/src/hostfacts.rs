@@ -132,6 +132,17 @@ impl HostFacts {
         })
     }
 
+    /// The file's text exactly as it was checked.
+    #[must_use]
+    pub fn raw(&self) -> &str {
+        ""
+    }
+
+    /// Writes the checked text to `dir/host-facts.txt`.
+    pub fn write_to(&self, _dir: &Path) -> Result<std::path::PathBuf, ReplayError> {
+        Err(bad("not implemented".to_owned()))
+    }
+
     /// When the facts were captured (UTC), as the script wrote it.
     #[must_use]
     pub fn captured_utc(&self) -> &str {
