@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crate::arms::{ArmReport, Run};
 use crate::stage::{active_parser_mode, stage_table, ParserMode};
-use crate::{LatencyHist, ReplayError};
+use crate::{HostFactsNote, LatencyHist, ReplayError};
 
 /// The commit this harness was built from (`git rev-parse HEAD` at build
 /// time, with `-dirty` appended when tracked files had uncommitted changes).
@@ -70,6 +70,8 @@ pub struct RunMeta {
     pub interval: Duration,
     /// What was replayed, in words.
     pub input: String,
+    /// The host-facts capture this run carries, if any.
+    pub host_facts: HostFactsNote,
 }
 
 /// The five metrics of an arm, headline first: file-name-safe label and histogram.

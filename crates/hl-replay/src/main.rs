@@ -231,6 +231,7 @@ fn main() -> ExitCode {
         warmup_per_round: cfg.warmup,
         interval: cfg.interval,
         input,
+        host_facts: hl_replay::HostFactsNote::NotRequired,
     };
     let report = render_run(&meta, &run);
     print!("{report}");

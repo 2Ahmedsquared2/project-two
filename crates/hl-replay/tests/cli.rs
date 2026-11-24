@@ -49,12 +49,14 @@ fn a_small_run_prints_the_report_and_writes_the_raw_histograms() {
         .arg(tmp("tail"))
         .arg("--out")
         .arg(&out)
+        .arg("--allow-missing-host-facts")
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", stderr(&o));
     let text = stdout(&o);
     for want in [
         &format!("commit: {GIT_SHA}"),
+        "host facts: NOT CAPTURED (--allow-missing-host-facts)",
         "kernel: ",
         "cpu: ",
         "cores: ",
@@ -98,6 +100,128 @@ fn a_small_run_prints_the_report_and_writes_the_raw_histograms() {
             assert!(dump.starts_with("# value_ns count"));
         }
     }
+}
+
+/// Runs `scripts/capture-host.sh` and returns the file it wrote.
+fn captured_facts(name: &str) -> PathBuf {
+    let path = tmp(name).join("facts.txt");
+    let script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/capture-host.sh");
+    let o = Command::new("bash")
+        .arg(script)
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    path
+}
+fn tiny_run() -> Command {
+    let mut c = bin();
+    c.args(["--arms", "busy-poll", "--rounds", "1", "--lines", "60"])
+        .args(["--warmup", "10", "--interval-us", "30", "--no-pin"]);
+    c
+}
+
+#[test]
+fn out_without_host_facts_is_refused_before_anything_runs() {
+    let out = tmp("nofacts").join("results");
+    let o = tiny_run().arg("--out").arg(&out).output().unwrap();
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("--out needs --host-facts"), "{err}");
+    assert!(err.contains("scripts/capture-host.sh"), "{err}");
+    assert!(err.contains("--allow-missing-host-facts"), "{err}");
+    assert_eq!(stdout(&o), "");
+    assert!(!out.exists(), "nothing may be written");
+}
+
+#[test]
+fn a_run_with_host_facts_reports_them_and_keeps_a_copy() {
+    let facts = captured_facts("facts-ok");
+    let out = tmp("withfacts");
+    let o = tiny_run()
+        .arg("--out")
+        .arg(&out)
+        .arg("--host-facts")
+        .arg(&facts)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    let text = stdout(&o);
+    assert!(
+        text.contains(&format!("host facts: {}, captured ", facts.display())),
+        "{text}"
+    );
+    assert!(text.contains("16 sections checked"), "{text}");
+    assert!(text.contains("rtt-manual: absent"), "{text}");
+    assert!(!text.contains("NOT CAPTURED"), "{text}");
+    assert_eq!(
+        std::fs::read(out.join("host-facts.txt")).unwrap(),
+        std::fs::read(&facts).unwrap()
+    );
+}
+
+#[test]
+fn a_bad_host_facts_file_is_refused_before_anything_runs() {
+    let good = std::fs::read_to_string(captured_facts("facts-src")).unwrap();
+    let dir = tmp("facts-bad");
+    let missing_section = {
+        let start = good.find("== begin thp").unwrap();
+        let end = good.find("== end thp\n").unwrap() + "== end thp\n".len();
+        format!("{}{}", &good[..start], &good[end..])
+    };
+    let other_kernel = {
+        let line = good.lines().find(|l| l.starts_with("kernel: ")).unwrap();
+        good.replace(line, "kernel: 0.0.0-not-this-host")
+    };
+    for (name, text, want) in [
+        ("missing.txt", missing_section.as_str(), "thp"),
+        ("kernel.txt", other_kernel.as_str(), "0.0.0-not-this-host"),
+        ("empty.txt", "", "hl-host-facts v1"),
+    ] {
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        let out = dir.join(format!("out-{name}"));
+        let o = tiny_run()
+            .arg("--host-facts")
+            .arg(&path)
+            .arg("--out")
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(2), "{name}: {}", stderr(&o));
+        assert!(stderr(&o).contains(want), "{name}: {}", stderr(&o));
+        assert_eq!(stdout(&o), "", "{name}");
+        assert!(!out.exists(), "{name}: nothing may be written");
+    }
+    let o = tiny_run()
+        .args(["--host-facts", "/nonexistent/hl-replay-facts.txt"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+}
+
+#[test]
+fn host_facts_and_the_override_together_are_a_usage_error() {
+    let facts = captured_facts("facts-both");
+    let o = tiny_run()
+        .arg("--host-facts")
+        .arg(&facts)
+        .arg("--allow-missing-host-facts")
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+}
+
+#[test]
+fn a_run_that_writes_nothing_needs_no_host_facts() {
+    let o = tiny_run().output().unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("host facts: not captured (nothing written to disk)"),
+        "{}",
+        stdout(&o)
+    );
 }
 
 #[test]
