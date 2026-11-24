@@ -52,8 +52,8 @@ reports a failed line by the same file and offset, so a torn line can be
 matched to its one observation. The offset is the real file position: for the
 file that already exists at start, which is read from its end, it counts from
 that end position, and dropped lines (oversized, bad, empty) still advance
-it. (Dropping only the matched observation in `hl-latency` is a follow-up;
-today it drops the whole block.)
+it. `hl-latency --strict-pass` uses this to leave out only the
+observation of a failed line (below).
 
 ## Host prep (before every run; done with/through the AWS Reason)
 
@@ -207,21 +207,58 @@ Exit codes: 0 every record passed, 1 a record failed (or a gap, when asked),
 2 usage, 3 unreadable path or no hourly file found.
 
 Feed its stdout to the report: `hl-latency observations.jsonl --strict-pass
-strict-pass.jsonl` leaves every block listed as a scan-accepted failure out of
-the pairing. An observation carries no file offset, so a torn line's stamp
-cannot be told from a good line of the same block: the whole block goes (every
-node observation with that `block_number` and `block_time_ms`, and the
-public-WebSocket observations with that block time), and it counts as neither
-matched, node-only nor ws-only. The summary gains `strict_pass_applied`,
-`strict_dropped_observations`, `strict_dropped_blocks`,
-`strict_dropped_ws_arrivals`, `strict_failures_listed`,
-`strict_failures_unmatched` (listed blocks the capture never observed),
+strict-pass.jsonl` leaves what it lists as scan-accepted failures out of the
+pairing. How much goes depends on the observation file:
+
+- **By line** (`strict_drop_by_line` true): the node observations carry
+  `file_date`, `file_hour` and `line_offset`. A failure names one line by the
+  `{date}/{hour}` its `path` ends in (the hour compared as a number, so `8`
+  and `08` are the same file) and its `offset`, and only the observation of
+  that line goes. A block that still has a node line keeps its public-WebSocket
+  arrivals and pairs on its earliest line left; when the line that went was
+  the block's earliest, the block is counted in `strict_shifted_first_arrival`,
+  so a move in the percentiles has a visible cause. A block that lost its only
+  node line goes with its WebSocket arrivals and counts as neither matched,
+  node-only nor ws-only (`strict_dropped_blocks`,
+  `strict_dropped_ws_arrivals`), so the lines we chose to drop do not look
+  like blocks the node missed.
+- **By block** (`strict_drop_by_line` false): a capture made before those
+  fields existed. A torn line's stamp cannot be told from a good line of the
+  same block, so the whole block goes (every node observation with that
+  `block_number` and `block_time_ms`, and the public-WebSocket observations
+  with that block time), and it counts as neither matched, node-only nor
+  ws-only.
+
+The summary gains `strict_pass_applied`, `strict_drop_by_line`,
+`strict_dropped_observations` (node observations removed),
+`strict_dropped_blocks`, `strict_dropped_ws_arrivals`,
+`strict_shifted_first_arrival`, `strict_failures_listed`,
+`strict_failures_unmatched` (listed failures the capture has no observation
+for: distinct lines by line, distinct blocks by block),
 `strict_failures_omitted` and `strict_drop_incomplete`. When the strict pass
 capped its list (`failures_omitted` above 0) the summary is still printed but
 `hl-latency` exits 1: torn stamps may remain, so rerun `hl-strict-pass` with a
-larger `--max-failures`. Strict-pass output that is malformed or has no
-`total` line (cut short) exits 2 with no summary. Without `--strict-pass`,
-`strict_pass_applied` is false and nothing was dropped.
+larger `--max-failures`. Without `--strict-pass`, `strict_pass_applied` is
+false and nothing was dropped.
+
+`hl-latency` exits 2 with no summary when the two files cannot be matched:
+
+- strict-pass output that is malformed or has no `total` line (cut short);
+- an observation with only some of `file_date`, `file_hour` and `line_offset`;
+- node observations with the three fields and without them in one file
+  (two captures joined: split them and run each against its own strict pass);
+- two node observations that name the same line;
+- by line only: a scan-accepted failure whose path does not end in
+  `{YYYYMMDD}/{hour}` (run `hl-strict-pass` on the directory, or on files
+  under their hourly names), two different paths for one date and hour (run
+  it over one root), or a listed line whose observation has another
+  `block_number` or `block_time_ms` (the wrong file or offset).
+
+Only scan-accepted failures are used. A line the scan refuses but the strict
+parse accepts is still stamped by `hl-capture` (`scan_fallbacks`), and if the
+strict pass fails it for another reason (no `events`, a repeated key) its
+observation stays in the pairing: such a failure carries no height or block
+time to check the match against.
 
 A newer hourly file is looked for every `--rescan-ms` (default 1000) and, in
 `inotify` mode, when a directory changes; never per poll, and only once the

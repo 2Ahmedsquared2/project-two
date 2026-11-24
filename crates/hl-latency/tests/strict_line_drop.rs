@@ -453,7 +453,9 @@ proptest! {
             .collect();
         let (kept, report) = drop_from(&lines, &obs).unwrap();
 
-        let torn = |i: usize| listed.contains(&i) && obs[i].source == Source::Node;
+        let torn = |i: usize| {
+            listed.contains(&i) && obs.get(i).is_some_and(|o| o.source == Source::Node)
+        };
         let left = |time: u64| {
             (0..obs.len()).any(|i| obs[i].source == Source::Node && obs[i].block_time_ms == time && !torn(i))
         };
