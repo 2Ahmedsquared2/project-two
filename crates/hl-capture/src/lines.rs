@@ -11,11 +11,37 @@ pub struct StampedLine {
     pub recv_ns: u64,
 }
 
+/// Receives each complete line a [`LineSplitter`] finds. The bytes are
+/// borrowed from the splitter (or from the chunk being pushed) and are only
+/// valid for the call, so a sink that keeps a line copies it.
+pub trait LineSink {
+    /// One complete, non-empty line without its `\n` or trailing `\r`, and
+    /// the stamp of the read that completed it.
+    fn line(&mut self, bytes: &[u8], recv_ns: u64);
+}
+
+/// Collects owned lines: one heap allocation per line. For tests and cold
+/// callers; the capture path uses a sink that parses the borrowed bytes.
+impl LineSink for Vec<StampedLine> {
+    fn line(&mut self, bytes: &[u8], recv_ns: u64) {
+        self.push(StampedLine {
+            bytes: bytes.to_vec(),
+            recv_ns,
+        });
+    }
+}
+
 /// Default longest line kept, in bytes (1 MiB). A longer line is dropped and
 /// counted, so a stream without newlines cannot grow memory without bound.
 pub const DEFAULT_MAX_LINE: usize = 1024 * 1024;
 
 /// Accumulates partial lines across reads, holding at most `max_line` bytes.
+///
+/// The buffer for a line split across reads is reserved once, at
+/// construction, at its full `max_line` size, so [`Self::push`] never
+/// allocates: a line that lies wholly inside one chunk is handed to the sink
+/// straight from that chunk, and a split line is assembled in the reserved
+/// buffer and handed out from there.
 #[derive(Debug)]
 pub struct LineSplitter {
     partial: Vec<u8>,
@@ -39,23 +65,30 @@ impl LineSplitter {
     }
 
     /// Creates an empty splitter that drops lines longer than `max_line`
-    /// bytes (counting a trailing `\r`, not the `\n`). A `max_line` of 0 is treated as 1.
+    /// bytes (counting a trailing `\r`, not the `\n`). A `max_line` of 0 is
+    /// treated as 1. Reserves `max_line` bytes now; if that reservation is
+    /// refused (an absurd cap), the buffer grows on demand instead.
     #[must_use]
     pub fn with_max_line(max_line: usize) -> Self {
+        let max_line = max_line.max(1);
+        let mut partial = Vec::new();
+        // Refused only for a cap no machine can hold; growing later is then
+        // the best that can be done.
+        let _ = partial.try_reserve_exact(max_line);
         Self {
-            partial: Vec::new(),
-            max_line: max_line.max(1),
+            partial,
+            max_line,
             discarding: false,
             oversized: 0,
         }
     }
 
-    /// Feeds the bytes of one read, stamped `recv_ns`, and appends every line
+    /// Feeds the bytes of one read, stamped `recv_ns`, and hands every line
     /// it completes to `out`. Lines longer than the cap are dropped and
     /// counted in [`Self::oversized`]; at most the cap is ever held back.
-    pub fn push(&mut self, chunk: &[u8], recv_ns: u64, out: &mut Vec<StampedLine>) {
+    pub fn push<S: LineSink + ?Sized>(&mut self, chunk: &[u8], recv_ns: u64, out: &mut S) {
         let mut rest = chunk;
-        while let Some(i) = rest.iter().position(|&b| b == b'\n') {
+        while let Some(i) = memchr::memchr(b'\n', rest) {
             let (head, tail) = rest.split_at(i);
             rest = tail.get(1..).unwrap_or_default();
             if std::mem::take(&mut self.discarding) {
@@ -66,14 +99,18 @@ impl LineSplitter {
                 self.oversized += 1;
                 continue;
             }
-            let mut bytes = std::mem::take(&mut self.partial);
-            bytes.extend_from_slice(head);
-            if bytes.last() == Some(&b'\r') {
-                bytes.pop();
+            let line = if self.partial.is_empty() {
+                head
+            } else {
+                // Within the reserved capacity: the cap was checked above.
+                self.partial.extend_from_slice(head);
+                self.partial.as_slice()
+            };
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if !line.is_empty() {
+                out.line(line, recv_ns);
             }
-            if !bytes.is_empty() {
-                out.push(StampedLine { bytes, recv_ns });
-            }
+            self.partial.clear();
         }
         if self.discarding {
             return;

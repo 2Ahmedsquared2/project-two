@@ -80,19 +80,64 @@ target (`fuzz/`, `cargo +nightly fuzz run hl_latency_parsers`), tests
 including real captured WS frames.
 
 Done (capture, `crates/hl-capture`): node arm. `hl-capture node <dir> --out
-obs.jsonl [--poll-us N] [--duration-s N] [--max-line-bytes N]` follows the newest hourly file
+obs.jsonl [--detect busy-poll|poll|inotify] [--poll-us N] [--duration-s N]
+[--max-line-bytes N] [--ring-records N] [--rescan-ms N]` follows the newest hourly file
 (numeric `{date}/{hour}` order, so hour 10 is newer than 9), reads a file that
 exists at start from its end and every later file from byte 0, drains the old
 file before switching at rotation, and stamps `CLOCK_REALTIME` once per `read`
 that returns data, before parsing; a line split across reads carries the stamp
 of the read that delivered its newline. Bad lines are counted, not fatal. Lines longer than `--max-line-bytes`
 (default 1 MiB) are dropped and counted (`oversized_lines`), so a stream
-without newlines holds at most that much. `--duration-s` is a hard deadline:
-the last poll sleep is cut short.
-After its first poll it writes `{"ready":true}` to stderr; a harness that
-creates or renames in a file it expects read must wait for that line first,
-or a slow start can make the file count as history (read from its end).
-Polling (default 100 us, on a pinned core) rather than inotify for now.
+without newlines holds at most that much. `--duration-s` is a hard deadline for reading:
+a wait is cut short, and `{"reader_stopped":true}` goes to stderr when reading
+ends. The writer thread then writes every record the ring still holds, so the
+process exits after the deadline by however long that backlog takes (measured
+0.5 to 0.95 s for 350k to 600k queued records, debug build, loaded shared
+machine); nothing already read is discarded.
+After its first poll it writes `{"ready":true}` to stderr (after the `detect`
+line); a harness that creates or renames in a file it expects read must wait
+for that line first, or a slow start can make the file count as history (read
+from its end).
+
+How it waits for the node to write (`--detect`; the live mode and the reason
+for any fallback are printed on stderr as a `detect` line):
+
+- `busy-poll` (default): spins on `read`, one core at 100%; give it its own
+  core. Falls back to `poll` when only one CPU is usable.
+- `poll`: sleeps `--poll-us` (default 100) between reads.
+- `inotify`: sleeps until the kernel reports a write. Linux only; off Linux,
+  or when inotify cannot be set up, it falls back to `poll`.
+
+Reader and writer are separate threads. The reader's tick is read, split,
+stamp, header scan (`hl_latency::scan_node_header`) and a push of a 32-byte
+record into a bounded SPSC ring (`rtrb`, `--ring-records`, default 65536); it
+does not allocate (gated by `tests/alloc.rs` with `hl-alloc-gate`), serialise
+or touch the disk. The writer thread serialises and flushes. **Full ring: the
+newest record is dropped and counted (`ring_dropped`); the reader never
+blocks.** A blocked reader would stamp every later line late, which looks like
+a slow node; a counted drop is only a missing sample. **A run with
+`ring_dropped` above 0 is invalid: discard it.**
+
+The strict parser (`parse_node_line`) runs on the reader only for a line the
+header scan refuses (`scan_fallbacks`, expected 0 on hl-node output). Lines the
+scan accepts are not strict-validated by this tool: `height_breaks` counts
+block numbers that do not follow on, and an offline strict pass over the same
+hourly files is the planned check for writer-torn lines.
+
+A newer hourly file is looked for every `--rescan-ms` (default 1000) and, in
+`inotify` mode, when a directory changes; never per poll, and only once the
+current file is read to its end. The look is a directory walk on the reader
+thread (13 us with one date directory, 262 us with thirty, shared machine):
+keep the interval coarse and **prune old date directories**. What the
+switching poll reads from a new file may be stamped up to `--rescan-ms` late:
+it is reported as a `rotation` line on stderr (`late_lines`,
+`first_block_number`, `last_block_number`) and counted in
+`post_rotation_lines`; leave those block numbers out of percentiles. Moving
+the walk to the writer thread is the follow-up.
+
+Counters at exit (stderr, one JSON object): `lines`, `written`, `ring_dropped`,
+`bad_lines`, `oversized_lines`, `scan_fallbacks`, `height_breaks`, `rotations`,
+`post_rotation_lines`, `rescans`, `reads`.
 `WsFilter` drops the first `l2Book`/`trades` frame per coin after each
 (re)connect and counts malformed frames, including `l2Book`/`trades` frames
 whose coin is missing, null, empty, not a string or (for `trades`) not the
