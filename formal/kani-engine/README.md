@@ -7,7 +7,16 @@ A passing check holds for every input inside its stated bounds, on this
 engine's code. It says nothing about speed and nothing about equivalence to
 the native node.
 
-## Status (base: lane 1 `4154560`, which contains `01f058e`)
+## Status (run on lane 1 `4154560`)
+
+**Coverage:** Kani proves only `Book::resize` on a book of at most 1 resting
+order. Kani does NOT prove matching, quantity conservation, price-time
+priority, rollback, L2, resync or no-panic; those rest on exhaustive tests
+(evidence, not proof) or on nothing, as listed below.
+
+The `hl-exec` library (`src/` and its non-dev dependencies) is identical
+in `01f058e`, `1674f86` and `4154560`; those commits differ only in the
+replay example, tests, tools and dev-dependencies.
 
 `crates/hl-book` and `crates/hl-exec` are identical between `feae97a` and
 `d4c3981`. `01f058e` changed `hl-exec` (F3(b): a hint on a leg that takes no
@@ -17,7 +26,7 @@ oid now counts), so both exhaustive tests were rerun on `4154560`.
 
 | Harness | Bounds | Result |
 |---|---|---|
-| `book_resize_keeps_book_sound_{b,a}` | <= 1 resting order (price 1..=2, size 1..=2, 2 users), ONE `resize` at slot 0 or 1 (live, free or never used) to size 0..=2; side fixed per instance, the two instances cover both sides | **VERIFIED** (Kani 0.68.0 built by `scripts/build-kani.sh`): book sound (not crossed, no zero size, level total = sum, no empty level) and `check_invariants`. 114k-126k steps, peak 4.2 GiB, ~55 s each; cover 1/1 ("a live order resized"). Mutant M4 makes it FAIL (`assertion failed: book_sound(&b)`). Correctness only, nothing about speed |
+| `book_resize_keeps_book_sound_{b,a}` | <= 1 resting order (price 1..=2, size 1..=2, 2 users), ONE `resize` at slot 0 or 1 (live, free or never used) to size 0..=2; side fixed per instance, the two instances cover both sides | **VERIFIED** (Kani 0.68.0 built by `scripts/build-kani.sh`). Real content at this bound: no zero size after any resize (a size-0 resize is refused), plus `check_invariants` (links, counts, totals, ladder). With at most 1 order, "not crossed" and "level total = sum" are close to trivial. 114k-126k steps, peak 4.2 GiB, ~55 s each; cover 1/1 ("a live order resized"). Mutant M4 makes it FAIL (`assertion failed: book_sound(&b)`). Correctness only, nothing about speed |
 
 ### Descoped Kani harnesses (tool limit, no counterexample)
 
@@ -64,7 +73,9 @@ usage figures.
    ladder `Vec`; one symbolic `rest` on an empty book then needs >8 GiB
    (50k steps). With the side fixed it verifies in 5 s (333 MiB). Harnesses
    therefore fix sides per instance (`per_sides!`).
-3. Any `Vec` push or insert at a symbolic length or index pulls in Kani's
+3. Diagnosis from step counts and OOMs, NOT confirmed (no run with
+   reallocation removed; follow-up issue #75): any `Vec` push or insert at
+   a symbolic length or index appears to pull in Kani's
    model of `Vec` reallocation and copying, even when capacity suffices. Inside `hl-exec`
    these are `match_taker`'s diff pushes (one `match_taker` against one
    maker: 566k steps, OOM), the ladder insert of a second level, and the
