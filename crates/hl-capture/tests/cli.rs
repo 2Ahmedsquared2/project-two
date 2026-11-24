@@ -499,7 +499,7 @@ mod signals {
     /// Kills the child with SIGKILL if the test has not finished with it in
     /// 60 s, so a run that ignores its signal fails the test instead of
     /// hanging it. Dropping the guard calls the watchdog off.
-    struct Watchdog(std::sync::mpsc::Sender<()>);
+    pub(super) struct Watchdog(std::sync::mpsc::Sender<()>);
 
     impl Drop for Watchdog {
         fn drop(&mut self) {
@@ -507,7 +507,7 @@ mod signals {
         }
     }
 
-    fn watchdog(child: &Child) -> Watchdog {
+    pub(super) fn watchdog(child: &Child) -> Watchdog {
         let (tx, rx) = std::sync::mpsc::channel();
         let pid = child.id().to_string();
         std::thread::spawn(move || {
@@ -729,5 +729,74 @@ mod signals {
         err.read_to_string(&mut rest).unwrap();
         assert!(!rest.contains("\"lines\""), "no counters line: {rest}");
         drop(pipe);
+    }
+}
+
+// ---- a walk error on the writer thread (issue #57, item 1) --------------------
+
+#[cfg(unix)]
+mod walk_error {
+    use super::*;
+
+    /// The look for a newer hourly file runs on the writer thread. When its
+    /// directory walk fails there, the run ends with exit 1 and says why,
+    /// after the stop line and the counters.
+    ///
+    /// The root does not exist at start, so the reader's own first walk finds
+    /// nothing and the run reports ready. Then the root appears as a regular
+    /// file: every later walk is the writer thread's, and `read_dir` on a
+    /// file fails with "not a directory" for any user, root included. The run
+    /// has no `--duration-s`, so only that error can end it (the watchdog
+    /// kills a run that ignores it, which is not exit 1). The same holds in
+    /// every detect mode.
+    fn a_walk_error_ends_the_run(detect: &str) {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("node_raw_book_diffs");
+        let out = t.path().join("obs.jsonl");
+        let (child, err, pre) =
+            spawn_ready(bin().arg("node").arg(&root).arg("--out").arg(&out).args([
+                "--detect",
+                detect,
+                "--poll-us",
+                "1000",
+            ]));
+        let _guard = signals::watchdog(&child);
+        fs::write(&root, b"not a directory").unwrap();
+        // What a walk of the root now fails with, in this platform's words.
+        let why = fs::read_dir(&root).unwrap_err();
+        assert_ne!(why.kind(), std::io::ErrorKind::NotFound, "{why}");
+
+        let (status, stderr) = finish(child, err, pre);
+        let text = String::from_utf8(stderr.clone()).unwrap();
+        assert_eq!(status.code(), Some(1), "{detect}: {status}: {text}");
+        let lines: Vec<&str> = text.lines().collect();
+        // The error is the last thing said, after the stop line and the
+        // counters, which a failed run still prints.
+        assert_eq!(
+            lines.last(),
+            Some(&format!("hl-capture: {why}").as_str()),
+            "{detect}: {text}"
+        );
+        assert!(lines.contains(&READER_STOPPED), "{detect}: {text}");
+        let c = counters(&stderr);
+        assert_eq!(c["lines"], 0, "{detect}: {c}");
+        assert_eq!(c["written"], 0, "{detect}: {c}");
+        assert_eq!(c["stop_signal"], serde_json::Value::Null, "{detect}: {c}");
+    }
+
+    #[test]
+    fn a_walk_error_ends_a_busy_poll_mode_run_with_exit_1() {
+        a_walk_error_ends_the_run("busy-poll");
+    }
+
+    #[test]
+    fn a_walk_error_ends_a_poll_mode_run_with_exit_1() {
+        a_walk_error_ends_the_run("poll");
+    }
+
+    /// Off Linux this mode falls back to poll.
+    #[test]
+    fn a_walk_error_ends_an_inotify_mode_run_with_exit_1() {
+        a_walk_error_ends_the_run("inotify");
     }
 }
