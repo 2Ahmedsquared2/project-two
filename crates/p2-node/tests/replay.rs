@@ -7,7 +7,7 @@ use hl_block::decode_block;
 use hl_node_convert::node::{parse_batch, BookDiff};
 use p2_node::{
     engine::{ActionResult, BlockOutcome, Engine, UserAction},
-    replay::{load_native_diffs, Cause, Replay, ReplayBlock},
+    replay::{load_native_diffs, Cause, Replay, ReplayBlock, ReplayError},
 };
 use serde_json::Value;
 
@@ -109,7 +109,7 @@ fn engine_never_sees_native_responses() {
 fn exact_engine_reproduces_every_block() {
     let blocks = input();
     let mut e = Scripted::new(&blocks, None);
-    let r = Replay::run(&mut e, &blocks);
+    let r = Replay::run(&mut e, &blocks, 999).unwrap();
     assert_eq!((r.reproduced, r.blocks), (3, 3));
     assert!(r.causes.is_empty());
     assert_eq!(e.resyncs.len(), 0);
@@ -120,7 +120,7 @@ fn exact_engine_reproduces_every_block() {
 fn response_mismatch_counts_and_resyncs() {
     let blocks = input();
     let mut e = Scripted::new(&blocks, Some((0, Mutation::Response)));
-    let r = Replay::run(&mut e, &blocks);
+    let r = Replay::run(&mut e, &blocks, 999).unwrap();
     assert_eq!((r.reproduced, r.blocks), (2, 3));
     assert_eq!(
         r.causes.get(&Cause::Response {
@@ -137,7 +137,7 @@ fn response_mismatch_counts_and_resyncs() {
 fn book_diff_mismatch() {
     let blocks = input();
     let mut e = Scripted::new(&blocks, Some((0, Mutation::DropDiff)));
-    let r = Replay::run(&mut e, &blocks);
+    let r = Replay::run(&mut e, &blocks, 999).unwrap();
     assert_eq!(r.reproduced, 2);
     assert_eq!(r.causes.get(&Cause::BookDiffs), Some(&1));
 }
@@ -146,7 +146,7 @@ fn book_diff_mismatch() {
 fn unsupported_action_is_its_own_cause_and_coverage() {
     let blocks = input();
     let mut e = Scripted::new(&blocks, Some((2, Mutation::Unsupported)));
-    let r = Replay::run(&mut e, &blocks);
+    let r = Replay::run(&mut e, &blocks, 999).unwrap();
     assert_eq!(r.reproduced, 2);
     assert_eq!(
         r.causes.get(&Cause::Unsupported {
@@ -161,19 +161,80 @@ fn unsupported_action_is_its_own_cause_and_coverage() {
 fn result_count_mismatch() {
     let blocks = input();
     let mut e = Scripted::new(&blocks, Some((1, Mutation::ExtraResponse)));
-    let r = Replay::run(&mut e, &blocks);
+    let r = Replay::run(&mut e, &blocks, 999).unwrap();
     assert_eq!(r.causes.get(&Cause::ResultCount), Some(&1));
 }
 
 #[test]
-fn missing_native_diffs_is_not_reproduced() {
+fn f2_missing_native_diffs_stops_the_run() {
+    // Absent is not empty: with no native diffs the block cannot be compared
+    // or resynced, so the run stops there and nothing after it counts.
     let mut blocks = input();
     let b = decode_block(BLOCKS.lines().nth(1).unwrap()).unwrap();
     blocks[1] = ReplayBlock::new(1001, b, None).unwrap();
     let mut e = Scripted::new(&blocks, None);
-    let r = Replay::run(&mut e, &blocks);
-    assert_eq!(r.reproduced, 2);
-    assert_eq!(r.causes.get(&Cause::NoNativeDiffs), Some(&1));
+    let err = Replay::run(&mut e, &blocks, 999).unwrap_err();
+    assert!(
+        matches!(err, ReplayError::NoNativeDiffs { height: 1001 }),
+        "{err}"
+    );
+    assert_eq!(e.block, 0, "engine must not run when the input is refused");
+}
+
+#[test]
+fn f1_gap_repeat_swap_or_at_snapshot_is_refused() {
+    let base = input();
+    let mk = |order: &[usize], heights: &[u64]| -> Vec<ReplayBlock> {
+        order
+            .iter()
+            .zip(heights)
+            .map(|(&i, &h)| {
+                let mut v: serde_json::Value =
+                    serde_json::from_str(BLOCKS.lines().nth(i).unwrap()).unwrap();
+                let _ = &mut v;
+                let diffs = load_native_diffs(DIFFS.as_bytes()).unwrap();
+                let d = diffs
+                    .get(&(1000 + u64::try_from(i).unwrap()))
+                    .cloned()
+                    .map(|(_, d)| (base[i].block().time_ns / 1_000_000, d));
+                ReplayBlock::new(h, decode_block(BLOCKS.lines().nth(i).unwrap()).unwrap(), d)
+                    .unwrap()
+            })
+            .collect()
+    };
+    let cases: [(&[usize], &[u64], u64); 4] = [
+        (&[0, 2], &[1000, 1002], 999),  // gap
+        (&[0, 0], &[1000, 1000], 999),  // repeat
+        (&[1, 0], &[1001, 1000], 999),  // swap
+        (&[0, 1], &[1000, 1001], 1000), // first block at the snapshot height
+    ];
+    for (order, heights, snap) in cases {
+        let blocks = mk(order, heights);
+        let mut e = Scripted::new(&blocks, None);
+        let err = Replay::run(&mut e, &blocks, snap).unwrap_err();
+        assert!(
+            matches!(err, ReplayError::Height { .. }),
+            "{order:?} {heights:?}: {err}"
+        );
+        assert_eq!(e.block, 0, "engine must not run when the input is refused");
+    }
+}
+
+#[test]
+fn report_carries_audit_fields() {
+    let blocks = input();
+    let mut e = Scripted::new(&blocks, Some((2, Mutation::Unsupported)));
+    let r = Replay::run(&mut e, &blocks, 999).unwrap();
+    assert_eq!(
+        (r.snapshot_height, r.first_height, r.last_height),
+        (999, Some(1000), Some(1002))
+    );
+    assert_eq!(r.blocks_with_unsupported, 1);
+    assert_eq!(r.resynced, 1);
+    let t = r.to_text();
+    assert!(t.contains("snapshot 999, heights 1000..=1002"), "{t}");
+    assert!(t.contains("end-state check: not run"), "{t}");
+    assert!(t.contains("per-block outputs matched 2/3"), "{t}");
 }
 
 #[test]
@@ -189,9 +250,9 @@ fn alignment_checked_by_block_time() {
 fn report_text() {
     let blocks = input();
     let mut e = Scripted::new(&blocks, Some((0, Mutation::Response)));
-    let r = Replay::run(&mut e, &blocks);
+    let r = Replay::run(&mut e, &blocks, 999).unwrap();
     let t = r.to_text();
-    assert!(t.starts_with("blocks reproduced 2/3"), "{t}");
+    assert!(t.contains("per-block outputs matched 2/3"), "{t}");
     assert!(t.contains("response order / ok:order:filled"), "{t}");
 }
 

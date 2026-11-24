@@ -30,8 +30,8 @@ fn replay_null_engine_reports_coverage_and_writes_outputs() {
             &data("diffs_1000.jsonl"),
         ])
         .args([
-            "--first-height",
-            "1000",
+            "--snapshot-height",
+            "999",
             "--passes",
             "5",
             "--prewarm-passes",
@@ -49,7 +49,7 @@ fn replay_null_engine_reports_coverage_and_writes_outputs() {
         String::from_utf8_lossy(&o.stderr)
     );
     // The null engine executes nothing: only the empty block reproduces.
-    assert!(so.contains("blocks reproduced 1/3"), "{so}");
+    assert!(so.contains("per-block outputs matched 1/3"), "{so}");
     assert!(so.contains("actions executed 0/3"), "{so}");
     assert!(so.contains("engine null"), "{so}");
     assert!(so.contains("NOT a like-for-like"), "{so}");
@@ -72,7 +72,7 @@ fn too_few_passes_exit_2() {
             "--diffs",
             &data("diffs_1000.jsonl"),
         ])
-        .args(["--first-height", "1000", "--passes", "3"])
+        .args(["--snapshot-height", "999", "--passes", "3"])
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(2));
@@ -109,13 +109,20 @@ fn gen_then_replay_synthetic() {
             "--diffs",
             diffs.to_str().unwrap(),
         ])
-        .args(["--first-height", "1", "--passes", "5", "--engine", "echo"])
+        .args([
+            "--snapshot-height",
+            "0",
+            "--passes",
+            "5",
+            "--engine",
+            "echo",
+        ])
         .output()
         .unwrap();
     let so = String::from_utf8_lossy(&o.stdout);
     assert!(o.status.success(), "{so}");
     // The echo engine answers native's response (test oracle, not an engine).
-    assert!(so.contains("blocks reproduced 200/200"), "{so}");
+    assert!(so.contains("per-block outputs matched 200/200"), "{so}");
     assert!(so.contains("engine echo"), "{so}");
     std::fs::remove_dir_all(d).unwrap();
 }

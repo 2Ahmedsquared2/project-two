@@ -13,7 +13,7 @@ use p2_node::replay::{load_native_diffs, ReplayBlock};
 use p2_node::timing::{run_passes, Timed, TimingConfig};
 
 const USAGE: &str = "usage:
-  p2-node replay --blocks <replica_cmds file> --diffs <node_raw_book_diffs batch file> --first-height <H>
+  p2-node replay --blocks <replica_cmds file> --diffs <node_raw_book_diffs batch file> --snapshot-height <H>
                  [--engine null|echo] [--passes N>=5] [--prewarm-passes N] [--window-blocks N]
                  [--core C] [--require-mlock] [--out DIR]
   p2-node gen --blocks N --actions K --seed S --out-blocks F --out-diffs F
@@ -91,7 +91,7 @@ fn replay(a: &Args) -> ExitCode {
     };
     let parsed = (|| -> Result<_, String> {
         Ok((
-            a.num("--first-height", None)?,
+            a.num("--snapshot-height", None)?,
             a.num("--passes", Some(10))?,
             a.num("--prewarm-passes", Some(2))?,
             a.num("--window-blocks", Some(0))?,
@@ -101,7 +101,7 @@ fn replay(a: &Args) -> ExitCode {
                 .map_err(|e| format!("--core: {e}"))?,
         ))
     })();
-    let (first, passes, prewarm, window, core) = match parsed {
+    let (snapshot, passes, prewarm, window, core) = match parsed {
         Ok(v) => v,
         Err(e) => return usage(&e),
     };
@@ -162,7 +162,7 @@ fn replay(a: &Args) -> ExitCode {
     };
     let mut blocks = Vec::with_capacity(lines.len());
     for (i, l) in lines.iter().enumerate() {
-        let h = first + u64::try_from(i).unwrap_or(u64::MAX);
+        let h = snapshot + 1 + u64::try_from(i).unwrap_or(u64::MAX);
         let b = match hl_block::decode_block(l) {
             Ok(b) => b,
             Err(e) => {
@@ -208,9 +208,10 @@ fn replay(a: &Args) -> ExitCode {
             &mut || EchoEngine::new(native.clone()),
             &lines,
             &blocks,
+            snapshot,
             &cfg,
         ),
-        _ => run_passes(&mut || NullEngine, &lines, &blocks, &cfg),
+        _ => run_passes(&mut || NullEngine, &lines, &blocks, snapshot, &cfg),
     };
     let timed = match timed {
         Ok(t) => t,

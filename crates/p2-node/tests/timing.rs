@@ -103,6 +103,7 @@ fn passes_time_only_reproduced_blocks_and_exclude_warmup() {
         &mut factory(&blocks, Duration::from_micros(200), Some(2)),
         &lines,
         &blocks,
+        999,
         &cfg,
     )
     .unwrap();
@@ -134,6 +135,7 @@ fn fewer_than_five_passes_rejected() {
         &mut factory(&blocks, Duration::ZERO, None),
         &lines,
         &blocks,
+        999,
         &cfg
     )
     .is_err());
@@ -152,6 +154,7 @@ fn line_count_must_match_blocks() {
         &mut factory(&blocks, Duration::ZERO, None),
         &lines,
         &blocks,
+        999,
         &cfg
     )
     .is_err());
@@ -171,6 +174,7 @@ fn state_identical_reports_worst_pass() {
         &mut factory(&blocks, Duration::ZERO, None),
         &lines,
         &blocks,
+        999,
         &cfg,
     )
     .unwrap();
@@ -193,6 +197,7 @@ fn csv_has_one_row_per_timed_block() {
         &mut factory(&blocks, Duration::ZERO, None),
         &lines,
         &blocks,
+        999,
         &cfg,
     )
     .unwrap();
@@ -203,4 +208,45 @@ fn csv_has_one_row_per_timed_block() {
         Some("pass,height,phase,reproduced,actions,exec_ns,parse_exec_ns")
     );
     assert_eq!(it.count(), 15);
+}
+
+#[test]
+fn f1_timed_line_must_be_the_compared_block() {
+    // Proof's side note: the line executed must be the block compared, not
+    // just the same count. Swap two raw lines: same length, wrong block.
+    let (mut lines, blocks) = input();
+    lines.swap(0, 1);
+    let cfg = TimingConfig {
+        passes: 5,
+        prewarm_passes: 0,
+        window_blocks: 0,
+    };
+    let e = run_passes(
+        &mut factory(&blocks, Duration::ZERO, None),
+        &lines,
+        &blocks,
+        999,
+        &cfg,
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("not the block compared"), "{e}");
+}
+
+#[test]
+fn f1_f2_apply_to_timed_passes() {
+    let (lines, blocks) = input();
+    let cfg = TimingConfig {
+        passes: 5,
+        prewarm_passes: 0,
+        window_blocks: 0,
+    };
+    // snapshot at 1000: first block 1000 is at the snapshot height
+    assert!(run_passes(
+        &mut factory(&blocks, Duration::ZERO, None),
+        &lines,
+        &blocks,
+        1000,
+        &cfg
+    )
+    .is_err());
 }

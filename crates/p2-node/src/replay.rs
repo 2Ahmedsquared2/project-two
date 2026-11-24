@@ -118,11 +118,56 @@ impl ReplayBlock {
     }
 }
 
+/// Input the driver refuses before running anything (lead planner's release
+/// gates F1 and F2, from Proof's TLA+ model of this driver).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ReplayError {
+    /// F1: blocks must be exactly `snapshot+1, snapshot+2, ...` in order.
+    #[error("height: block {index} is height {got}, expected {expected} (snapshot {snapshot}); gap, repeat, swap or at/below snapshot")]
+    Height {
+        /// Index in the input.
+        index: usize,
+        /// Height found.
+        got: u64,
+        /// Height required.
+        expected: u64,
+        /// Snapshot height.
+        snapshot: u64,
+    },
+    /// F2: no native diffs for this height. Absent is not empty: the block can
+    /// be neither compared nor resynced, so the run stops before it. Replay a
+    /// range that ends at the last height with native diffs.
+    #[error(
+        "no native book diffs for height {height}: refusing to run past the last block with diffs"
+    )]
+    NoNativeDiffs {
+        /// Height.
+        height: u64,
+    },
+}
+
+/// Checks F1 and F2 for the whole input before anything runs.
+pub fn validate(blocks: &[ReplayBlock], snapshot: u64) -> Result<(), ReplayError> {
+    for (index, b) in blocks.iter().enumerate() {
+        let expected = snapshot + 1 + u64::try_from(index).unwrap_or(u64::MAX);
+        if b.height != expected {
+            return Err(ReplayError::Height {
+                index,
+                got: b.height,
+                expected,
+                snapshot,
+            });
+        }
+        if b.native_diffs.is_none() {
+            return Err(ReplayError::NoNativeDiffs { height: b.height });
+        }
+    }
+    Ok(())
+}
+
 /// Why a block was not reproduced. A block counts once, under its first cause.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Cause {
-    /// Native diffs for this height were not provided.
-    NoNativeDiffs,
     /// The engine returned a different number of results than actions.
     ResultCount,
     /// The engine does not execute this action type.
@@ -157,7 +202,21 @@ pub struct FirstMismatch {
 /// Result of one replay pass.
 #[derive(Clone, Debug, Default)]
 pub struct Replay {
-    /// Blocks replayed.
+    /// Snapshot height the engine started from.
+    pub snapshot_height: u64,
+    /// First and last height replayed.
+    pub first_height: Option<u64>,
+    /// Last height replayed.
+    pub last_height: Option<u64>,
+    /// Blocks containing an action the engine returned `Unsupported` for.
+    pub blocks_with_unsupported: u64,
+    /// Blocks mismatched and resynced from native diffs.
+    pub resynced: u64,
+    /// Whether the end-state check against native's translated snapshot ran
+    /// (set by the caller; without it the verdict is "per-block outputs
+    /// matched", never "state identical").
+    pub end_state: Option<bool>,
+    /// N: blocks attempted.
     pub blocks: u64,
     /// Blocks reproduced exactly.
     pub reproduced: u64,
@@ -216,14 +275,8 @@ pub fn compare(b: &ReplayBlock, out: &BlockOutcome) -> Option<FirstMismatch> {
             ActionResult::Response(_) => {}
         }
     }
-    let Some(nd) = &b.native_diffs else {
-        return mk(
-            Cause::NoNativeDiffs,
-            "absent".into(),
-            format!("{} diffs", out.book_diffs.len()),
-        );
-    };
-    if *nd != out.book_diffs {
+    let nd = b.native_diffs();
+    if nd != out.book_diffs.as_slice() {
         let i = nd
             .iter()
             .zip(&out.book_diffs)
@@ -239,20 +292,44 @@ pub fn compare(b: &ReplayBlock, out: &BlockOutcome) -> Option<FirstMismatch> {
 }
 
 impl Replay {
-    /// Replays `blocks` in order through `engine`, resyncing after a mismatch.
-    pub fn run<E: Engine>(engine: &mut E, blocks: &[ReplayBlock]) -> Self {
-        let mut r = Replay::default();
+    /// Replays `blocks` (heights `snapshot+1..`) in order through `engine`,
+    /// resyncing after a mismatch. Refuses the input up front on F1/F2.
+    pub fn run<E: Engine>(
+        engine: &mut E,
+        blocks: &[ReplayBlock],
+        snapshot: u64,
+    ) -> Result<Self, ReplayError> {
+        validate(blocks, snapshot)?;
+        let mut r = Replay::starting_at(snapshot);
         for b in blocks {
             let acts = b.user_actions();
             let out = engine.execute_block(b.block.time_ns, &acts);
             r.record(b, &out, engine);
         }
-        r
+        Ok(r)
+    }
+
+    /// An empty report for a run from `snapshot`.
+    #[must_use]
+    pub fn starting_at(snapshot: u64) -> Self {
+        Replay {
+            snapshot_height: snapshot,
+            ..Replay::default()
+        }
     }
 
     /// Records one block's outcome (used by the timed runner too).
     pub fn record<E: Engine>(&mut self, b: &ReplayBlock, out: &BlockOutcome, engine: &mut E) {
         self.blocks += 1;
+        self.first_height.get_or_insert(b.height);
+        self.last_height = Some(b.height);
+        if out
+            .results
+            .iter()
+            .any(|x| matches!(x, ActionResult::Unsupported))
+        {
+            self.blocks_with_unsupported += 1;
+        }
         self.actions += u64::try_from(b.native_responses.len()).unwrap_or(u64::MAX);
         self.actions_executed += u64::try_from(
             out.results
@@ -271,6 +348,7 @@ impl Replay {
                 if self.first_mismatch.is_none() {
                     self.first_mismatch = Some(m);
                 }
+                self.resynced += 1;
                 engine.resync(b.height, b.native_diffs());
             }
         }
@@ -280,7 +358,32 @@ impl Replay {
     #[must_use]
     pub fn to_text(&self) -> String {
         let mut s = String::new();
-        let _ = writeln!(s, "blocks reproduced {}/{}", self.reproduced, self.blocks);
+        let verdict = match self.end_state {
+            Some(true) if self.reproduced == self.blocks => "state identical",
+            _ => "per-block outputs matched",
+        };
+        let _ = writeln!(s, "{verdict} {}/{}", self.reproduced, self.blocks);
+        let _ = writeln!(
+            s,
+            "snapshot {}, heights {}..={}",
+            self.snapshot_height,
+            self.first_height.map_or("-".into(), |h| h.to_string()),
+            self.last_height.map_or("-".into(), |h| h.to_string())
+        );
+        let _ = writeln!(
+            s,
+            "blocks with an unsupported action {}, mismatched and resynced {}",
+            self.blocks_with_unsupported, self.resynced
+        );
+        let _ = writeln!(
+            s,
+            "end-state check: {}",
+            match self.end_state {
+                None => "not run",
+                Some(true) => "final book equals native's",
+                Some(false) => "final book DIFFERS from native's",
+            }
+        );
         let _ = writeln!(
             s,
             "actions executed {}/{}",
@@ -290,7 +393,6 @@ impl Replay {
         causes.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
         for (c, n) in causes {
             let label = match c {
-                Cause::NoNativeDiffs => "no native diffs".to_owned(),
                 Cause::ResultCount => "result count".to_owned(),
                 Cause::Unsupported { action_type } => format!("unsupported {action_type}"),
                 Cause::Response {

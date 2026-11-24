@@ -19,7 +19,7 @@ use std::time::Instant;
 use hl_warm::{GateConfig, Phase, WarmGate};
 
 use crate::engine::{Engine, UserAction};
-use crate::replay::{Replay, ReplayBlock};
+use crate::replay::{validate, Replay, ReplayBlock, ReplayError};
 
 /// Pass settings.
 #[derive(Clone, Copy, Debug)]
@@ -45,6 +45,21 @@ pub enum TimingError {
         lines: usize,
         /// Blocks.
         blocks: usize,
+    },
+    /// F1/F2 refusal of the input.
+    #[error(transparent)]
+    Input(#[from] ReplayError),
+    /// F1: the raw line executed is not the block compared against.
+    #[error("line {index}: block time {line_ns} ns is not the block compared (height {height}, block time {block_ns} ns)")]
+    Mismatch {
+        /// Index.
+        index: usize,
+        /// Height compared.
+        height: u64,
+        /// Block time of the executed line.
+        line_ns: u64,
+        /// Block time of the compared block.
+        block_ns: u64,
     },
     /// A line failed to decode during a timed pass.
     #[error("line {0} failed to decode in a timed pass: {1}")]
@@ -104,6 +119,7 @@ pub fn run_passes<E: Engine>(
     new_engine: &mut impl FnMut() -> E,
     lines: &[String],
     blocks: &[ReplayBlock],
+    snapshot: u64,
     cfg: &TimingConfig,
 ) -> Result<Timed, TimingError> {
     if cfg.passes < 5 {
@@ -115,12 +131,19 @@ pub fn run_passes<E: Engine>(
             blocks: blocks.len(),
         });
     }
+    validate(blocks, snapshot)?;
     for _ in 0..cfg.prewarm_passes {
-        one_pass(new_engine(), lines, blocks, cfg.window_blocks)?;
+        one_pass(new_engine(), lines, blocks, snapshot, cfg.window_blocks)?;
     }
     let mut passes = Vec::new();
     for _ in 0..cfg.passes {
-        passes.push(one_pass(new_engine(), lines, blocks, cfg.window_blocks)?);
+        passes.push(one_pass(
+            new_engine(),
+            lines,
+            blocks,
+            snapshot,
+            cfg.window_blocks,
+        )?);
     }
     let min = passes.iter().map(|p| p.reproduced).min().unwrap_or(0);
     Ok(Timed {
@@ -133,6 +156,7 @@ fn one_pass<E: Engine>(
     mut engine: E,
     lines: &[String],
     blocks: &[ReplayBlock],
+    snapshot: u64,
     window: u64,
 ) -> Result<Pass, TimingError> {
     let mut gate = WarmGate::new(GateConfig {
@@ -141,11 +165,22 @@ fn one_pass<E: Engine>(
         min_window_events: window,
     });
     let _ = gate.pass("fresh-engine", 0);
-    let mut pass = Pass::default();
+    let mut pass = Pass {
+        replay: Replay::starting_at(snapshot),
+        ..Pass::default()
+    };
     for (i, (line, rb)) in lines.iter().zip(blocks).enumerate() {
         let t_parse = Instant::now();
         let block =
             hl_block::decode_block(line).map_err(|e| TimingError::Decode(i + 1, e.to_string()))?;
+        if block.time_ns != rb.block().time_ns || block.round != rb.block().round {
+            return Err(TimingError::Mismatch {
+                index: i,
+                height: rb.height(),
+                line_ns: block.time_ns,
+                block_ns: rb.block().time_ns,
+            });
+        }
         let acts: Vec<UserAction<'_>> = block
             .actions()
             .map(|a| UserAction {
