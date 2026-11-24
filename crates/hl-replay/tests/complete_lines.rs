@@ -159,6 +159,7 @@ fn the_report_says_what_was_checked_and_what_is_still_unmeasured() {
         warmup_per_round: 0,
         interval: Duration::from_micros(1),
         input: "none".to_owned(),
+        host_facts: hl_replay::HostFactsNote::default(),
     };
     let text = render_report(&meta, &[]);
     assert!(

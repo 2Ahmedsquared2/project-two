@@ -44,7 +44,11 @@
 //! poll reads from a new file may be stamped up to that much late, so it is
 //! reported on stderr as a `rotation` line and counted in
 //! `post_rotation_lines`. Lines longer than `--max-line-bytes` (default
-//! 1 MiB) are dropped and counted. Counters go to stderr at exit.
+//! 1 MiB) are dropped and counted. After its first poll it writes
+//! `{"ready":true}` to stderr: a file that appears from then on is read from
+//! its start (one already there at the first poll is history and is read from
+//! its end), and in `inotify` mode the watches are in place. Counters go to
+//! stderr at exit.
 //! Exit codes: 0 ok, 1 I/O error, 2 usage.
 //!
 //! The public `WebSocket` arm (`hl_capture::WsFilter`) gets its socket
@@ -150,6 +154,7 @@ fn run(args: &Args) -> std::io::Result<()> {
         .spawn(move || source.run(std::io::BufWriter::new(file), WRITER_IDLE))?;
     let mut tail = NodeTailer::with_max_line(&args.root, args.max_line);
     let mut clock = realtime_ns;
+    let mut ready = false;
     let mut next_rescan = Instant::now();
     let deadline = args.duration.and_then(|d| next_rescan.checked_add(d));
     let read = loop {
@@ -177,6 +182,12 @@ fn run(args: &Args) -> std::io::Result<()> {
         }
         if let Some(why) = waiter.follow(&args.root, tail.current_file()) {
             announce(args.detect, waiter.mode(), Some(&why));
+        }
+        if !ready {
+            // Cold: once. Callers wait for this before creating files they
+            // expect read; it follows the first poll and the first watch.
+            eprintln!("{{\"ready\":true}}");
+            ready = true;
         }
         if let Some(sw) = tail.take_switch() {
             // Cold: once per new file.
