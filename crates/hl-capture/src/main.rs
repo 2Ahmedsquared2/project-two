@@ -33,8 +33,14 @@
 //!
 //! The run stops after `--duration-s` seconds (default: never; a sleep is
 //! cut short so the run ends on time). A newer hourly file is looked for every
-//! `--rescan-ms` milliseconds (default 10) and, in `inotify` mode, as soon as
-//! a directory changes; never per poll. What the switching
+//! `--rescan-ms` milliseconds (default 1000) and, in `inotify` mode, as soon
+//! as a directory changes; never per poll. The look is a directory walk on
+//! the reader thread, which cannot read while it walks (measured 13 us with
+//! one date directory, 262 us with thirty, on a shared machine), so a line
+//! that lands during a walk is stamped that much late without any flag: keep
+//! the interval coarse and prune old date directories. While no file is
+//! followed yet there is nothing to read, so the look happens every 10 ms at
+//! most. What the switching
 //! poll reads from a new file may be stamped up to that much late, so it is
 //! reported on stderr as a `rotation` line and counted in
 //! `post_rotation_lines`. Lines longer than `--max-line-bytes` (default
@@ -52,6 +58,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use hl_capture::{ring, Detect, NodeTailer, Waiter};
 
 const USAGE: &str = "usage: hl-capture node <dir> --out <obs.jsonl> [--detect busy-poll|poll|inotify] [--poll-us N] [--duration-s N] [--max-line-bytes N] [--ring-records N] [--rescan-ms N]";
+
+/// Longest gap between looks for a first file, while none is followed: with
+/// nothing to read, the walk costs no stamp accuracy.
+const RESCAN_NO_FILE: Duration = Duration::from_millis(10);
 
 /// How long the writer thread sleeps when the ring is empty.
 const WRITER_IDLE: Duration = Duration::from_millis(1);
@@ -75,7 +85,7 @@ fn parse_args(mut it: impl Iterator<Item = OsString>) -> Option<Args> {
     let (mut out, mut poll, mut duration) = (None, Duration::from_micros(100), None);
     let mut max_line = hl_capture::DEFAULT_MAX_LINE;
     let mut ring_records = hl_capture::DEFAULT_RING_RECORDS;
-    let mut rescan = Duration::from_millis(10);
+    let mut rescan = Duration::from_millis(1000);
     let mut detect = Detect::BusyPoll;
     while let Some(flag) = it.next() {
         let value = it.next()?;
@@ -151,7 +161,12 @@ fn run(args: &Args) -> std::io::Result<()> {
             // Coarse timer: the directory walk happens at most this often,
             // and only once the current file is at its end.
             tail.request_rescan();
-            next_rescan = now.checked_add(args.rescan).unwrap_or(now);
+            let every = if tail.current_file().is_some() {
+                args.rescan
+            } else {
+                args.rescan.min(RESCAN_NO_FILE)
+            };
+            next_rescan = now.checked_add(every).unwrap_or(now);
         }
         if let Err(e) = tail.poll_into(&mut clock, &mut sink) {
             break Err(e);

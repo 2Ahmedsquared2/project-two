@@ -297,7 +297,7 @@ fn run_detect(mode: Option<&str>) -> Vec<u8> {
     let out = t.path().join("obs.jsonl");
     let mut cmd = bin();
     cmd.arg("node").arg(&root).arg("--out").arg(&out);
-    cmd.args(["--duration-s", "1"]);
+    cmd.args(["--duration-s", "1", "--rescan-ms", "50"]);
     if let Some(mode) = mode {
         cmd.args(["--detect", mode]);
     }
@@ -381,4 +381,38 @@ fn an_unknown_detect_mode_is_a_usage_error() {
         .unwrap()
         .status;
     assert_eq!(status.code(), Some(2));
+}
+
+/// The default rescan interval is coarse (1 s), but a run that follows no
+/// file yet looks for one every 10 ms: a file that appears is picked up
+/// long before the first coarse rescan.
+#[test]
+fn the_first_file_is_found_quickly_whatever_the_rescan_interval() {
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("node_raw_book_diffs");
+    let out = t.path().join("obs.jsonl");
+    let child = bin()
+        .arg("node")
+        .arg(&root)
+        .arg("--out")
+        .arg(&out)
+        .args([
+            "--duration-s",
+            "1",
+            "--detect",
+            "poll",
+            "--rescan-ms",
+            "60000",
+        ])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let dir = root.join("hourly").join("20261119");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("8"), burst(2)).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let c = counters(&output.stderr);
+    assert_eq!(c["written"], 2, "{c}");
 }

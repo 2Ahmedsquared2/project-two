@@ -25,5 +25,18 @@ hl-alloc-gate = { path = "../hl-alloc-gate" }
 proptest = { workspace = true }
 tempfile = "3"
 
+# Plain timing harnesses (percentiles on stdout), not criterion:
+#   cargo bench -p hl-capture --bench capture
+#   cargo bench -p hl-capture --bench legacy
+# `legacy` uses only the API of main at 3a197dc, so the same file measures
+# the code from before this change in a checkout of that commit.
+[[bench]]
+name = "capture"
+harness = false
+
+[[bench]]
+name = "legacy"
+harness = false
+
 [lints]
 workspace = true
