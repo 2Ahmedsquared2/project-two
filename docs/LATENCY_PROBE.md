@@ -89,6 +89,9 @@ of the read that delivered its newline. Bad lines are counted, not fatal. Lines 
 (default 1 MiB) are dropped and counted (`oversized_lines`), so a stream
 without newlines holds at most that much. `--duration-s` is a hard deadline:
 the last poll sleep is cut short.
+After its first poll it writes `{"ready":true}` to stderr; a harness that
+creates or renames in a file it expects read must wait for that line first,
+or a slow start can make the file count as history (read from its end).
 Polling (default 100 us, on a pinned core) rather than inotify for now.
 `WsFilter` drops the first `l2Book`/`trades` frame per coin after each
 (re)connect and counts malformed frames, including `l2Book`/`trades` frames
