@@ -281,6 +281,10 @@ impl NodeTailer {
     /// only by a poll that rescans; [`Self::poll_into`] passes
     /// [`newest_hourly_file`]. Tests use it to act at the exact point of the
     /// look.
+    ///
+    /// Not a stable part of the API: it is public only so the integration
+    /// tests can reach it, and may change or go without notice.
+    #[doc(hidden)]
     pub fn poll_into_with<S, F>(
         &mut self,
         clock: &mut dyn FnMut() -> u64,

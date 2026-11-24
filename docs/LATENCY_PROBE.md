@@ -108,6 +108,12 @@ ends the process at once** with status 128 + the signal number (143, 130), no
 counters and possibly a cut-off last record: that run is invalid. Use it only
 when the writer cannot finish (a disk that stopped accepting writes).
 `SIGKILL` and `SIGHUP` are not handled: they lose the ring and the counters.
+A signal counts as the first one whenever it arrives. If the reader has
+already stopped (the `--duration-s` deadline passed and the writer is still
+writing the ring), the first signal changes nothing: the writer carries on,
+no `signal` line is printed and `stop_signal` stays `null`. A second signal
+then ends the process as above. (From reading the code; no test covers a
+signal during the final write.)
 After its first poll it writes `{"ready":true}` to stderr (after the `detect`
 line); a harness that creates or renames in a file it expects read must wait
 for that line first, or a slow start can make the file count as history (read
@@ -120,7 +126,10 @@ for any fallback are printed on stderr as a `detect` line):
   core. Falls back to `poll` when only one CPU is usable.
 - `poll`: sleeps `--poll-us` (default 100) between reads.
 - `inotify`: sleeps until the kernel reports a write. Linux only; off Linux,
-  or when inotify cannot be set up, it falls back to `poll`.
+  or when inotify cannot be set up, it falls back to `poll`. The watch on a
+  file is added after that file's first read, so the wait that follows does
+  not sleep and the file is read once more: a line written before the watch
+  existed is stamped then, not at the next write.
 
 Reader and writer are separate threads. The reader's tick is read, split,
 stamp, header scan (`hl_latency::scan_node_header`) and a push of a 32-byte

@@ -44,7 +44,11 @@
 //! the reader had not read yet are not captured. A second signal ends the
 //! process at once with status 128 + the signal number and no counters:
 //! that run is invalid; it is the way out when the writer cannot finish.
-//! `SIGKILL` and `SIGHUP` are not handled.
+//! `SIGKILL` and `SIGHUP` are not handled. A signal that arrives after the
+//! reader has already stopped at the `--duration-s` deadline, while the
+//! writer is still writing the ring, counts as the first one and changes
+//! nothing: the writer carries on, `stop_signal` stays `null`, and only a
+//! second signal ends the process.
 //!
 //! A newer hourly file is looked for every
 //! `--rescan-ms` milliseconds (default 1000) and, in `inotify` mode, as soon
