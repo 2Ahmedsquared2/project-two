@@ -1353,7 +1353,9 @@ fn a_stride_using_nothing_before_an_n_is_still_for_the_host_to_settle() {
 fn a_group_of_zero_is_refused_whatever_it_uses() {
     // bitmap_check_region: `group_len == 0` is -EINVAL on its own, also when
     // `off` is 0 and so not above it.
-    for raw in ["0-7:0/0", "2,0-7:0/0"] {
+    // The last CPU's number does not come into it: the kernel has put a
+    // number in place of `N` by then, and no number makes a group of 0 pass.
+    for raw in ["0-7:0/0", "2,0-7:0/0", "0-N:1/0", "all:0/0", "0-7:N/0"] {
         assert_eq!(
             list_warnings(
                 &format!("isolcpus: 2-3\nnohz_full: {raw}\nrcu_nocbs: all"),
@@ -1682,4 +1684,154 @@ fn the_binary_warns_about_the_polling_threads_core() {
         report.contains("  warning: sqpoll core 1 is not in isolcpus (0)"),
         "{report}"
     );
+}
+
+/// Kernel CPU lists for the property tests: mostly text built from the
+/// list grammar, so a case reaches the range and stride checks instead of
+/// being refused at its first byte, and some text of any kind.
+mod cpu_list_text {
+    use proptest::prelude::*;
+
+    /// A number as a list may hold one: small ones (0 above all, for a group
+    /// or a count of 0), the edges of the CPU mask and of 32 and 64 bits,
+    /// `N`, and nothing at all.
+    fn number() -> impl Strategy<Value = String> {
+        prop_oneof![
+            4 => (0_u32..10).prop_map(|n| n.to_string()),
+            2 => Just("0".to_owned()),
+            2 => prop::sample::select(vec![
+                "8191",
+                "8192",
+                "8193",
+                "4294967295",
+                "4294967296",
+                "18446744073709551615",
+                "18446744073709551616",
+                "99999999999999999999999999",
+                "007",
+                "N",
+                "",
+            ])
+            .prop_map(str::to_owned),
+            1 => any::<u64>().prop_map(|n| n.to_string()),
+        ]
+    }
+
+    /// One region, usually well formed: `a`, `a-b`, `a-b:c/d`, `all` or
+    /// `all:c/d`, sometimes with a piece left out.
+    fn region() -> impl Strategy<Value = String> {
+        let head = prop_oneof![
+            3 => number(),
+            5 => (number(), number()).prop_map(|(a, b)| format!("{a}-{b}")),
+            1 => prop::sample::select(vec!["all", "ALL", "aLl", "al"]).prop_map(str::to_owned),
+        ];
+        let stride = prop_oneof![
+            3 => Just(String::new()),
+            6 => (number(), number()).prop_map(|(used, group)| format!(":{used}/{group}")),
+            1 => number().prop_map(|used| format!(":{used}")),
+            1 => number().prop_map(|group| format!("/{group}")),
+        ];
+        (head, stride).prop_map(|(head, stride)| head + &stride)
+    }
+
+    /// A piece of text the grammar gives a meaning to, or that sits next to
+    /// one that has it.
+    fn token() -> impl Strategy<Value = String> {
+        prop_oneof![
+            8 => region(),
+            3 => number(),
+            4 => prop::sample::select(vec![
+                ",", ",,", "-", ":", "/", " ", "\t", "N", "x", "_", "+", "-1", "é", "\u{a0}",
+                "domain,", "nohz,", "managed_irq,", "domain", "bogus,", "not set",
+            ])
+            .prop_map(str::to_owned),
+        ]
+    }
+
+    /// The value of one kernel command-line key.
+    pub(crate) fn value() -> impl Strategy<Value = String> {
+        prop_oneof![
+            // Regions with commas between them, as an operator writes a list.
+            4 => prop::collection::vec(region(), 0..6).prop_map(|parts| parts.join(",")),
+            // The same pieces in any order, with or without their commas.
+            4 => prop::collection::vec(token(), 0..12).prop_map(|parts| parts.concat()),
+            // Any text that fits on one line.
+            1 => "\\PC{0,40}",
+        ]
+    }
+
+    /// A core a run may be told to pin to: none, a CPU a list can name, or
+    /// any number at all.
+    pub(crate) fn core() -> impl Strategy<Value = Option<usize>> {
+        prop_oneof![
+            1 => Just(None),
+            4 => (0_usize..16).prop_map(Some),
+            2 => prop::sample::select(vec![8191, 8192, usize::MAX]).prop_map(Some),
+            1 => any::<usize>().prop_map(Some),
+        ]
+    }
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2048))]
+
+    /// Whatever the kernel command line holds for the three CPU lists, the
+    /// file is read and every question the harness asks of the lists is
+    /// answered: none panics, for any core a run pins to. `isolated_cpus`
+    /// asks each accepted range about every CPU a list can name.
+    #[test]
+    fn no_cpu_list_makes_the_harness_panic(
+        isolcpus in cpu_list_text::value(),
+        nohz_full in cpu_list_text::value(),
+        rcu_nocbs in cpu_list_text::value(),
+        feeder in cpu_list_text::core(),
+        hot in cpu_list_text::core(),
+        sqpoll in cpu_list_text::core(),
+    ) {
+        let text = file_with(None, "x").replace(
+            "== begin kernel-cmdline\nx\n",
+            &format!(
+                "== begin kernel-cmdline\nisolcpus: {isolcpus}\nnohz_full: {nohz_full}\nrcu_nocbs: {rcu_nocbs}\n"
+            ),
+        );
+        let facts = HostFacts::parse(&text).unwrap();
+        if let Some(isolated) = facts.isolated_cpus() {
+            proptest::prop_assert!(isolated.windows(2).all(|pair| pair[0] < pair[1]));
+            proptest::prop_assert!(isolated.last().is_none_or(|last| *last < 8192));
+        }
+        let note = HostFactsNote::captured_with_sqpoll(Path::new("f"), &facts, feeder, hot, sqpoll);
+        let captured = matches!(note, HostFactsNote::Captured { .. });
+        proptest::prop_assert!(captured);
+    }
+}
+
+#[test]
+fn a_list_of_any_length_is_read_without_running_out_of_stack() {
+    // Regions that follow a stride need no comma, so one part of a list can
+    // hold any number of them. A booted kernel's command line stops at 2048
+    // bytes (v6.8 COMMAND_LINE_SIZE, x86-64 and arm64); a file that was
+    // edited or damaged does not, and it must be read or refused, not abort
+    // the process.
+    let long = "all:1/1".repeat(100_000);
+    for (raw, line) in [
+        (long.clone(), unread("nohz_full", &long)),
+        // A refused region at the very end still refuses the whole list.
+        (
+            format!("{long}x"),
+            ignored(
+                "nohz_full",
+                &format!("{long}x"),
+                "feeder core 2 and hot core 3 are not tickless",
+            ),
+        ),
+    ] {
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: 2-3\nnohz_full: {raw}\nrcu_nocbs: all"),
+                Some(2),
+                Some(3)
+            ),
+            [line]
+        );
+    }
 }
