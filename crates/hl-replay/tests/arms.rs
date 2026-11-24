@@ -55,7 +55,10 @@ fn check(arm: Arm) {
             assert_eq!(r.hot_pinned, None, "{arm:?}: no pinning was requested");
         }
         RoundOutcome::Unavailable(why) => {
-            assert!(arm.is_io_uring(), "{arm:?} may not be unavailable: {why}");
+            assert!(
+                arm.is_io_uring() || arm.unsupported_here().is_some(),
+                "{arm:?} may not be unavailable: {why}"
+            );
             assert_ne!(why, "");
             eprintln!("{}: unavailable: {why}", arm.name());
         }
@@ -187,7 +190,13 @@ fn pinning_is_reported_when_requested() {
     let RoundOutcome::Ran(r) = run_round(Arm::BusyPoll, &c).unwrap() else {
         panic!("busy-poll is always available");
     };
-    assert_eq!(r.hot_pinned, Some(true));
+    if cfg!(target_os = "linux") {
+        assert_eq!(r.hot_pinned, Some(true));
+    } else {
+        // Whether the kernel honours the request is its business (Apple
+        // Silicon refuses thread affinity); that it was asked is reported.
+        assert!(r.hot_pinned.is_some());
+    }
     // The multi-thread runtime is the unpinned baseline by design.
     let RoundOutcome::Ran(r) = run_round(Arm::TokioMultiThread, &c).unwrap() else {
         panic!("tokio is always available");

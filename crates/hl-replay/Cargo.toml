@@ -31,9 +31,13 @@ rmp-serde = "1.3"
 sha3 = "0.10"
 secp256k1 = { version = "0.29", features = ["recovery"] }
 core_affinity = "0.8"
-inotify = { version = "0.11", default-features = false }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util"] }
 compio = { version = "=0.19.2", features = ["net", "runtime", "io-uring"], optional = true }
+
+# inotify is a Linux kernel interface and the crate does not build elsewhere.
+# Off Linux the file-inotify arm reports "unavailable" (`Arm::unsupported_on`).
+[target.'cfg(target_os = "linux")'.dependencies]
+inotify = { version = "0.11", default-features = false }
 
 [dev-dependencies]
 hl-alloc-gate = { path = "../hl-alloc-gate" }
