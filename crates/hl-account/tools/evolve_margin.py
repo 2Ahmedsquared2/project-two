@@ -23,8 +23,17 @@ Flagged, not dropped: isolated margin, users touched by an unmodelled transfer
 Output: one JSON line per main-dex perp leg:
   [height, user, action type, asset, is_buy, tif, kind, native, ours(spot counted),
    ours(spot not counted), not-modelled reason, user seeded, free-minus-need micro-USDC,
-   abstraction (state ust field a: u = unified, i, p; null = no entry)]
+   abstraction (state ust field a: u = unified, i, p; null = no entry),
+   --- diagnostics (state BEFORE the leg) ---
+   szi (signed lots on the leg's asset), resting [bid ntl, ask ntl, bid lots, ask lots] on the
+   leg's asset, leverage used, assets where the user rests orders on both sides,
+   untracked main-perp modifies by this user so far (any asset), on this asset, height of the
+   last one (null if none),
+   slack micro-USDC under charge variants V0 (larger side, shrinking side pro rata beyond
+   2|szi|: the fitted rule), V1 (both sides summed, same discount), V2 (larger side, no
+   discount); spot USDC counted only when abstraction is u]
 """
+VARIANTS = (0, 1, 2)
 import argparse, collections, gzip, json, sys
 from fractions import Fraction as F
 
@@ -56,10 +65,15 @@ def side_charge(ntl, lots, free):
     return ntl * (lots - free) // lots
 
 
-def asset_om(g, szi, lev):
+def asset_om(g, szi, lev, v=0):
+    """Resting-order charge of one asset. v=0 is the fitted rule (stored `e`); 1 and 2 are
+    the alternatives tested against class 4 (both sides summed; no shrinking discount)."""
+    if v == 2:
+        return max(g[0], g[1]) // max(lev, 1)
     bf = 2 * -szi if szi < 0 else 0
     af = 2 * szi if szi > 0 else 0
-    return max(side_charge(g[0], g[2], bf), side_charge(g[1], g[3], af)) // max(lev, 1)
+    b, s = side_charge(g[0], g[2], bf), side_charge(g[1], g[3], af)
+    return (b + s if v == 1 else max(b, s)) // max(lev, 1)
 
 
 def exec_class(act):
@@ -200,19 +214,21 @@ def main():
         g = A[u].agg.get(k, [0, 0, 0, 0])
         agg_chk['equal' if g == [v['n'][0], v['n'][1], v['s'][0], v['s'][1]] else 'differ'] += 1
 
-    def check(u, a, is_buy, pt, lots, use_spot):
+    def check(u, a, is_buy, pt, lots, use_spot, v=0):
         acc = A[u]; lev = levof(acc, a); szi = acc.pos.get(a, 0)
         before = acc.agg.get(a, [0, 0, 0, 0]); after = list(before)
         if is_buy: after[0] += pt * lots; after[2] += lots
         else: after[1] += pt * lots; after[3] += lots
-        need = asset_om(after, szi, lev) - asset_om(before, szi, acc.olev.get(a, lev))
+        need = asset_om(after, szi, lev, v) - asset_om(before, szi, acc.olev.get(a, lev), v)
         if need <= 0: return 'accept', 0
         value = acc.u; im = 0
         for k, s in acc.pos.items():
             ntl = s * mark[k]; value += ntl; im += abs(ntl) // levof(acc, k)
-        om = sum(asset_om(g, acc.pos.get(k, 0), acc.olev.get(k, levof(acc, k))) for k, g in acc.agg.items())
+        om = sum(asset_om(g, acc.pos.get(k, 0), acc.olev.get(k, levof(acc, k)), v) for k, g in acc.agg.items())
         free = (value - im - om) * SPOT_PER_MICRO + (acc.spot if use_spot else 0)
         return ('accept' if free >= need * SPOT_PER_MICRO else 'margin'), free - need * SPOT_PER_MICRO
+
+    UT = collections.Counter(); UTA = collections.Counter(); UTH = {}
 
     cnt = collections.Counter(); posbad = []
 
@@ -323,8 +339,12 @@ def main():
                             v1, m1 = check(u, a, buy, pt, lots, True)
                             v0, _ = check(u, a, buy, pt, lots, False)
                             tif = o['t']['limit'].get('tif') if 'limit' in o['t'] else 'trig'
+                            diag = [acc.pos.get(a, 0), list(acc.agg.get(a, [0, 0, 0, 0])), levof(acc, a),
+                                    sum(1 for g in acc.agg.values() if g[2] and g[3]),
+                                    UT[u], UTA[(u, a)], UTH.get(u)]
+                            diag += [int(check(u, a, buy, pt, lots, acc.abs == 'u', vv)[1] // SPOT_PER_MICRO) for vv in VARIANTS]
                             out.write(orjson.dumps([H, u, t, a, buy, tif, kind, nat, v1, v0, nm, acc.seeded,
-                                                    int(m1 // SPOT_PER_MICRO), acc.abs]).decode() + '\n')
+                                                    int(m1 // SPOT_PER_MICRO), acc.abs] + diag).decode() + '\n')
                         oid = None
                         if isinstance(s, dict):
                             if 'resting' in s: oid = s['resting']['oid']
@@ -334,6 +354,8 @@ def main():
                             cands = st_open.get((u, coin, buy, o['p'])) if (ob and coin) else None
                             if cands: oid = cands.pop(0)
                             else:
+                                if a < 10000:
+                                    UT[u] += 1; UTA[(u, a)] += 1; UTH[u] = H
                                 cnt['modify: new oid unresolved, ' + ('main perp' if a < 10000 else ('spot' if a < 100000 else 'HIP-3')) + ('' if ob else ' (no status stream)')] += 1
                         if oid is None: continue
                         nf = fills_for(oid)
