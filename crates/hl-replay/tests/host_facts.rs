@@ -285,16 +285,36 @@ fn a_running_irqbalance_is_reported_with_its_pid() {
         .arg(&out)
         .output()
         .unwrap();
+    // Read before the child is ended, so the pid the script names can be
+    // looked up while its process is still there.
+    let text = std::fs::read_to_string(out);
+    let body = text
+        .as_deref()
+        .ok()
+        .and_then(|t| HostFacts::parse(t).ok())
+        .and_then(|f| f.section("irqbalance").map(str::to_owned));
+    let named = body.as_deref().and_then(|b| {
+        b.trim_end()
+            .strip_prefix("running (pid ")?
+            .strip_suffix(')')?
+            .parse::<u32>()
+            .ok()
+    });
+    // The script reports the first irqbalance it meets, so on a host that
+    // runs a real one the pid may be that one's and not this child's: either
+    // way the pid must be of a process named irqbalance.
+    let comm =
+        named.map(|pid| std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default());
     child.kill().unwrap();
     child.wait().unwrap();
     assert!(o.status.success(), "{:?}", o.status);
-    let f = HostFacts::parse(&std::fs::read_to_string(out).unwrap()).unwrap();
-    let body = f.section("irqbalance").unwrap();
+    let body = body.expect("an irqbalance section in a file the harness accepts");
+    assert_eq!(body.lines().count(), 1, "{body:?}");
+    let pid = named.unwrap_or_else(|| panic!("not `running (pid N)`: {body:?}"));
     assert!(
-        body.lines()
-            .all(|l| l.starts_with("running (pid ") && l.ends_with(')'))
-            && body.lines().count() == 1,
-        "{body:?}"
+        pid == child.id() || comm.as_deref().map(str::trim_end) == Some("irqbalance"),
+        "pid {pid} is neither the child ({}) nor a process named irqbalance (comm {comm:?}): {body:?}",
+        child.id()
     );
 }
 
