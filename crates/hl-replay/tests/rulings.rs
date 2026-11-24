@@ -206,6 +206,7 @@ fn the_cli_reports_seed_round_orders_load_and_the_headline_first() {
         .arg(tmp("cli-tail"))
         .arg("--out")
         .arg(&out)
+        .arg("--allow-missing-host-facts")
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
