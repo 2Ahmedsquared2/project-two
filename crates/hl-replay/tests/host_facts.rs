@@ -855,3 +855,153 @@ fn isolcpus_flags_without_a_list_isolate_no_cpu() {
         ]
     );
 }
+
+/// The line written when a list is set and a part of it is not read.
+fn unread(key: &str, raw: &str) -> String {
+    format!("{key} ({raw}) is not a CPU list this harness can read: pinned cores not checked against it")
+}
+
+#[test]
+fn empty_parts_of_a_cpu_list_are_skipped_as_the_kernel_skips_them() {
+    // Linux v6.8 lib/bitmap-str.c: bitmap_parselist calls bitmap_find_region
+    // before every region, which steps over any run of commas ("The format
+    // allows commas and whitespaces at the beginning of the region") and ends
+    // the list, with success, at the terminator. So `2,,3`, `,2,3` and `2,3,`
+    // all name CPUs 2 and 3.
+    let none = Vec::<String>::new();
+    for raw in ["2,,3", ",2,3", "2,3,", ",,2,,,3,,", "2-3,", ",2-3"] {
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: {raw}\nnohz_full: {raw}\nrcu_nocbs: {raw}"),
+                Some(2),
+                Some(3)
+            ),
+            none,
+            "{raw}"
+        );
+        // The cores that are not there are still reported, each list by name.
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: {raw}\nnohz_full: {raw}\nrcu_nocbs: {raw}"),
+                Some(2),
+                Some(4)
+            ),
+            [
+                format!("hot core 4 is not in isolcpus ({raw})"),
+                format!("hot core 4 is not in nohz_full ({raw})"),
+                format!("hot core 4 is not in rcu_nocbs ({raw})"),
+            ],
+            "{raw}"
+        );
+        let f = file_with_cores(&format!("isolcpus: {raw}\n{QUIET}"), "active: 0");
+        assert_eq!(f.isolated_cpus(), Some(vec![2, 3]), "{raw}");
+    }
+    // An empty part does not hide a part the harness cannot read.
+    assert_eq!(
+        list_warnings(&format!("isolcpus: 2,,3-N\n{QUIET}"), Some(2), Some(3)),
+        [unread("isolcpus", "2,,3-N")]
+    );
+    // `all` beside an empty part is still every CPU.
+    assert_eq!(
+        list_warnings(
+            "isolcpus: 0-7\nnohz_full: all,\nrcu_nocbs: ,all",
+            Some(2),
+            Some(3)
+        ),
+        none
+    );
+}
+
+#[test]
+fn a_key_with_nothing_after_it_is_set_and_names_no_cpu() {
+    // Linux v6.8: `nohz_full=` and `isolcpus=` hand the empty string to
+    // housekeeping_setup (kernel/sched/isolation.c), and `rcu_nocbs=` to
+    // rcu_nocb_setup (kernel/rcu/tree_nocb.h). Each calls cpulist_parse,
+    // which is bitmap_parselist (include/linux/cpumask.h); that returns 0
+    // with no bit set for an empty string (lib/bitmap-str.c). The parameter
+    // is accepted and names no CPU: it is not "not set" and not unreadable.
+    //
+    // The capture script writes such a key as `key: ` and the body of a
+    // section loses its trailing whitespace, so the line is tried in the
+    // middle of the section, at its end, and with the space already gone.
+    for (isolcpus, nohz_full) in [
+        ("isolcpus: ", "nohz_full: "),
+        ("isolcpus:", "nohz_full:"),
+        ("isolcpus: ,", "nohz_full: ,,"),
+    ] {
+        for lines in [
+            format!("{isolcpus}\n{nohz_full}\nrcu_nocbs: all"),
+            format!("rcu_nocbs: all\n{isolcpus}\n{nohz_full}"),
+            format!("rcu_nocbs: all\n{nohz_full}\n{isolcpus}"),
+        ] {
+            let shown = |line: &str| line.split_once(':').unwrap().1.trim().to_owned();
+            assert_eq!(
+                list_warnings(&lines, Some(2), Some(3)),
+                [
+                    format!("feeder core 2 is not in isolcpus ({})", shown(isolcpus)),
+                    format!("hot core 3 is not in isolcpus ({})", shown(isolcpus)),
+                    format!("feeder core 2 is not in nohz_full ({})", shown(nohz_full)),
+                    format!("hot core 3 is not in nohz_full ({})", shown(nohz_full)),
+                ],
+                "{lines:?}"
+            );
+            let f = file_with_cores(&lines, "active: 0");
+            assert_eq!(f.isolated_cpus(), Some(Vec::new()), "{lines:?}");
+        }
+    }
+    // An empty nohz_full offloads no core (rcu_init_nohz takes the nohz_full
+    // mask only when it is not empty), so rcu_nocbs alone decides.
+    assert_eq!(
+        list_warnings(
+            "isolcpus: 2-3\nnohz_full: \nrcu_nocbs: not set",
+            Some(2),
+            Some(3)
+        ),
+        [
+            "feeder core 2 is not in nohz_full ()",
+            "hot core 3 is not in nohz_full ()",
+            "rcu_nocbs is not set: feeder core 2 and hot core 3 are not offloaded from RCU callbacks",
+        ]
+    );
+    // An empty rcu_nocbs is set and offloads no core of its own.
+    for rcu_nocbs in ["rcu_nocbs: \nisolcpus: 2-3", "isolcpus: 2-3\nrcu_nocbs:"] {
+        assert_eq!(
+            list_warnings(&format!("nohz_full: 2\n{rcu_nocbs}"), Some(2), Some(3)),
+            [
+                "hot core 3 is not in nohz_full (2)",
+                "hot core 3 is not in rcu_nocbs ()",
+            ],
+            "{rcu_nocbs:?}"
+        );
+    }
+    // No core of an empty nohz_full is the boot CPU.
+    assert_eq!(
+        list_warnings("isolcpus: 0-7\nnohz_full: \nrcu_nocbs: all", Some(0), None),
+        ["feeder core 0 is not in nohz_full ()"]
+    );
+    // A longer key is another key.
+    let f = file_with_cores(&format!("isolcpus_x: 2\n{QUIET}"), "active: 0");
+    assert_eq!(f.isolated_cpus(), None);
+}
+
+#[test]
+fn isolcpus_flags_are_read_only_where_the_kernel_reads_them() {
+    // Linux v6.8 kernel/sched/isolation.c, housekeeping_isolcpus_setup: the
+    // flags are taken while the value starts with a letter, each with its
+    // comma; whatever follows goes to cpulist_parse whole. So an empty part
+    // ends the flags, and a flag after it or after a CPU is a letter in the
+    // list, which bitmap_parse_region refuses (-EINVAL).
+    let f = file_with_cores(&format!("isolcpus: domain,,2,\n{QUIET}"), "active: 0");
+    assert_eq!(f.isolated_cpus(), Some(vec![2]));
+    let f = file_with_cores(&format!("isolcpus: domain,\n{QUIET}"), "active: 0");
+    assert_eq!(f.isolated_cpus(), Some(Vec::new()));
+    for raw in [",domain,2", "2,domain", "domain,,managed_irq,2"] {
+        assert_eq!(
+            list_warnings(&format!("isolcpus: {raw}\n{QUIET}"), Some(2), Some(3)),
+            [unread("isolcpus", raw)],
+            "{raw}"
+        );
+        let f = file_with_cores(&format!("isolcpus: {raw}\n{QUIET}"), "active: 0");
+        assert_eq!(f.isolated_cpus(), None, "{raw}");
+    }
+}

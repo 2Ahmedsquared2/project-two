@@ -90,7 +90,12 @@ The report also prints `warning:` lines, which never stop a run:
   more (past the widest CPU mask an x86-64 or arm64 kernel is built with), or
   a stride using more than its group (`0-7:3/2`). A list the kernel accepts
   that selects no CPU (`0-7:0/2`, or `isolcpus=domain` with no list) is read
-  as an empty list, so every pinned core is reported as not in it;
+  as an empty list, so every pinned core is reported as not in it. Empty
+  parts are skipped as the kernel skips them (`2,,3`, `,2,3` and `2,3,` name
+  CPUs 2 and 3), and a key with nothing after it (`nohz_full=`) is set and
+  names no CPU (Linux v6.8 `lib/bitmap-str.c`, `bitmap_parselist`). The
+  `isolcpus` flags are read only before the list, where the kernel takes
+  them: `2,domain` is a list the kernel refuses;
 - with `nohz_full` unreadable, a core outside `rcu_nocbs` (or `rcu_nocbs` not
   set) is reported as "whether it is offloaded from RCU callbacks is
   undetermined", not as not offloaded;
