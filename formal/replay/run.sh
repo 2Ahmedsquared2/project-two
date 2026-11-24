@@ -20,16 +20,16 @@ echo "$TLA_SHA256  $jar" | sha256sum -c --quiet -
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-cp "$here/ReplayDriver.tla" "$work/"
+cp "$here"/*.tla "$work/"
 
 fail=0
-run() { # cfg expect(pass|violated)
-  local cfg="$1" expect="$2" name out
+run() { # cfg expect(pass|violated) module
+  local cfg="$1" expect="$2" module="$3" name out
   name="$(basename "$cfg" .cfg)"
   out="$work/$name.out"
   cp "$here/$cfg" "$work/$name.cfg"
   ( cd "$work" && java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers auto \
-      -metadir "$work/meta-$name" -config "$name.cfg" ReplayDriver.tla ) \
+      -metadir "$work/meta-$name" -config "$name.cfg" "$module.tla" ) \
       >"$out" 2>&1 || true
   local got
   if grep -q "Model checking completed. No error has been found." "$out"; then
@@ -51,8 +51,8 @@ run() { # cfg expect(pass|violated)
   if [ -n "${TLC_LOG_DIR:-}" ]; then mkdir -p "$TLC_LOG_DIR"; cp "$out" "$TLC_LOG_DIR/"; fi
 }
 
-# expected.txt: one "<cfg name> <pass|violated>" per line.
-while read -r name expect; do
-  [ -n "$name" ] && run "cfg/$name.cfg" "$expect"
+# expected.txt: one "<cfg name> <pass|violated> [module]" per line (module defaults to ReplayDriver).
+while read -r name expect module; do
+  [ -n "$name" ] && run "cfg/$name.cfg" "$expect" "${module:-ReplayDriver}"
 done < "$here/expected.txt"
 exit "$fail"

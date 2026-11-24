@@ -865,6 +865,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hl-capture"
+version = "0.1.0"
+dependencies = [
+ "hl-latency",
+ "proptest",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "hl-dataset"
 version = "0.1.0"
 dependencies = [
