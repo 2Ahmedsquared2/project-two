@@ -261,8 +261,11 @@ impl NodeTailer {
     ///
     /// The directory is walked for a newer file only when a rescan is due
     /// (the first poll, and after each [`Self::request_rescan`]) and the
-    /// current file has been read to its end, so the old file is always
-    /// drained before a switch. Every other poll is `read` calls on the open
+    /// current file has been read to its end. When the walk finds a newer
+    /// file, the old one is read to its end once more before the switch, so
+    /// what the node appended to it up to the moment the new file was seen
+    /// is kept. (What it appends to the old file after that is not read:
+    /// the node is taken to finish a file before it starts the next.) Every other poll is `read` calls on the open
     /// file and nothing else: it does not allocate, lines being parsed in
     /// place from the read buffer or the splitter's reserved buffer.
     pub fn poll_into<S: ObservationSink + ?Sized>(
@@ -310,6 +313,20 @@ impl NodeTailer {
                 (_, None) => false,
             };
             if let (true, Some(key)) = (newer, key) {
+                if self.current.is_some() {
+                    // The node may have appended to the old file after the
+                    // drain above and before the look found the new one:
+                    // read it to its end once more, or that tail is lost.
+                    // Cold: once per switch. These are ordinary lines, not
+                    // post-rotation ones.
+                    self.drain(clock, sink, &mut budget)?;
+                    if self.backlogged {
+                        // More than this poll may read: finish the old file
+                        // first and look again.
+                        self.rescan_due = true;
+                        return Ok(());
+                    }
+                }
                 let mut file = File::open(&newest)?;
                 if self.current.is_some() {
                     self.stats.rotations += 1;
