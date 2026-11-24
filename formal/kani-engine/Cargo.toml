@@ -12,6 +12,11 @@ publish = false
 [dependencies]
 hl-exec = { path = "../../crates/hl-exec" }
 
+[features]
+# Compile the descoped Kani harnesses in `src/descoped.rs` (only under
+# `cargo kani`). They hit the 8 GiB cap or a timeout; see README.
+descoped = []
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

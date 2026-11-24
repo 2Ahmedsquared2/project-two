@@ -6,6 +6,10 @@ cd "$(dirname "$0")/.."
 echo "== cargo fmt --all --check";   cargo fmt --all --check
 echo "== cargo clippy -D warnings";  cargo clippy --workspace --all-targets -- -D warnings
 echo "== cargo test";                cargo test --workspace
+# The two exhaustive tests take minutes in debug and seconds in release, so
+# they are ignored in debug (cfg_attr(debug_assertions, ignore)) and run here.
+echo "== kani-engine exhaustive tests (release)"
+cargo test --release -p kani-engine --test exhaustive_resync --test exhaustive_oid_hint
 echo "== cargo doc";                 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 echo "== golden vectors"
 cargo run -q -p book-check -- golden/basic.jsonl

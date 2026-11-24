@@ -8,8 +8,13 @@
 //!
 //! The helpers here are plain Rust so the unit tests can run them on concrete
 //! inputs; the harnesses themselves are in `proofs` (only under `cfg(kani)`).
+//! The descoped harnesses (a Kani memory/time limit, not proofs) are kept in
+//! `descoped`, compiled only with `cfg(kani)` and the `descoped` feature.
 
 pub mod model;
 
 #[cfg(kani)]
 mod proofs;
+
+#[cfg(all(kani, feature = "descoped"))]
+mod descoped;

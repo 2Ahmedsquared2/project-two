@@ -157,12 +157,15 @@ fn reuses_live_cloid(s: &[RestingOrder], a: Act, user: User) -> bool {
 }
 
 /// Run every case of the domain; returns (cases, failures as text, B1 failures).
-fn check(stp: bool, snaps: &[Vec<RestingOrder>], acts: &[Act]) -> (u64, Vec<String>, u64) {
+/// Returns (cases, other failures, up to 5 examples of them, B1-class failures).
+/// The counts are of every failing case; only the examples are capped.
+fn check(stp: bool, snaps: &[Vec<RestingOrder>], acts: &[Act]) -> (u64, u64, Vec<String>, u64) {
     let cfg = EngineConfig {
         stp,
         alo_priority_window_ms: 400,
     };
     let mut n = 0u64;
+    let mut other = 0u64;
     let mut bad = Vec::new();
     let mut b1 = 0u64;
     for s in snaps {
@@ -207,19 +210,26 @@ fn check(stp: bool, snaps: &[Vec<RestingOrder>], acts: &[Act]) -> (u64, Vec<Stri
                 if !idx_ok || r.is_err() || post != pre || !e.check_invariants() {
                     if reuses_live_cloid(s, a, user) {
                         b1 += 1;
-                    } else if bad.len() < 5 {
-                        bad.push(format!(
-                            "stp={stp} snap={s:?} action={ua:?} index_ok={idx_ok} resync={r:?}\n pre={pre:?}\n post={post:?}"
-                        ));
+                    } else {
+                        other += 1;
+                        if bad.len() < 5 {
+                            bad.push(format!(
+                                "stp={stp} snap={s:?} action={ua:?} index_ok={idx_ok} resync={r:?}\n pre={pre:?}\n post={post:?}"
+                            ));
+                        }
                     }
                 }
             }
         }
     }
-    (n, bad, b1)
+    (n, other, bad, b1)
 }
 
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: scripts/check.sh runs it with `cargo test --release`"
+)]
 fn resync_empty_restores_pre_block_exhaustive() {
     let snaps = snapshots();
     let acts = actions();
@@ -227,7 +237,7 @@ fn resync_empty_restores_pre_block_exhaustive() {
         .map_or(2, usize::from)
         .max(2);
     let chunk = snaps.len().div_ceil(threads);
-    let results: Vec<(u64, Vec<String>, u64)> = std::thread::scope(|sc| {
+    let results: Vec<(u64, u64, Vec<String>, u64)> = std::thread::scope(|sc| {
         let hs: Vec<_> = snaps
             .chunks(chunk)
             .flat_map(|ch| {
@@ -238,16 +248,16 @@ fn resync_empty_restores_pre_block_exhaustive() {
         hs.into_iter().map(|h| h.join().expect("worker")).collect()
     });
     let cases: u64 = results.iter().map(|r| r.0).sum();
-    let bad: Vec<&String> = results.iter().flat_map(|r| r.1.iter()).collect();
-    let b1: u64 = results.iter().map(|r| r.2).sum();
+    let other: u64 = results.iter().map(|r| r.1).sum();
+    let bad: Vec<&String> = results.iter().flat_map(|r| r.2.iter()).collect();
+    let b1: u64 = results.iter().map(|r| r.3).sum();
     println!(
-        "exhaustive resync(&[]): {} snapshots x {} actions x 2 users x STP on/off = {cases} cases; {b1} failures in class B1 (live cloid reused; fixed in ff7821e); {} other failures",
+        "exhaustive resync(&[]): {} snapshots x {} actions x 2 users x STP on/off = {cases} cases; {b1} failures in class B1 (live cloid reused; fixed in ff7821e); {other} other failures",
         snaps.len(),
-        acts.len(),
-        bad.len()
+        acts.len()
     );
     for b in bad.iter().take(3) {
         println!("{b}");
     }
-    assert!(bad.is_empty() && b1 == 0);
+    assert!(other == 0 && b1 == 0);
 }

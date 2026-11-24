@@ -1,8 +1,8 @@
 //! Kani harnesses for `hl-exec`. Only harnesses that verify within an
 //! 8 GiB cap stay here; the ones descoped as a Kani/CBMC memory or time
 //! limit (no counterexample) are listed in `README.md` with the exhaustive
-//! test that stands in for each. Their minimal-bound source is in commit
-//! `eccdd82` of this branch. Run one: `scripts/run-harness.py <name>`
+//! test that stands in for each. Their minimal-bound source is kept in
+//! `src/descoped.rs` (feature `descoped`, not run by the gate). Run one: `scripts/run-harness.py <name>`
 //! (8 GiB cap, peak memory) or
 //! `cargo kani -p kani-engine --harness proofs::<name> --exact`.
 
@@ -31,7 +31,6 @@ macro_rules! per_sides {
 }
 
 /// Price in 1..=2.
-/// Price in 1..=2.
 fn px() -> Px {
     if kani::any() {
         Px(1)
@@ -57,7 +56,8 @@ fn usr() -> User {
     }
 }
 
-/// Slot 0 or 1 (may name a free or never-used slot).
+/// Slot 0 or 1. `book_with` never removes, so a slot is live or never
+/// used, never free.
 fn slot() -> u32 {
     u32::from(kani::any::<bool>())
 }
@@ -95,7 +95,7 @@ fn book_with(sides: &[Side]) -> Book {
 // ------------------------------------------------------ book-level proofs
 
 /// (1), resize only. Bounds: <= 1 resting order on side `s0`, then ONE
-/// `resize` at slot 0 or 1 (live, free or never used) to size 0..=2;
+/// `resize` at slot 0 or 1 (live or never used) to size 0..=2;
 /// price 1..=2, size 1..=2, 2 users; the side is fixed per instance and the
 /// two instances cover both. The book stays sound (not crossed, no zero
 /// size, each level's total = sum of its orders, every listed level

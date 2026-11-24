@@ -183,6 +183,9 @@ fn strip(o: &BlockOutcome) -> BlockOutcome {
 #[derive(Default)]
 struct Tally {
     cases: u64,
+    /// Every failing case is counted; only the examples are capped.
+    a_count: u64,
+    b_count: u64,
     a_fail: Vec<String>,
     b_fail: Vec<String>,
     no_oid_hint: u64,
@@ -250,6 +253,7 @@ fn run(snaps: &[Vec<RestingOrder>], acts: &[Act]) -> Tally {
                         let a_bad = strip(&out) != strip(&plain_out)
                             || engine_view(&e) != plain_view
                             || (all_agree && out.oid_mismatches != 0);
+                        t.a_count += u64::from(a_bad);
                         if a_bad && t.a_fail.len() < 3 {
                             t.a_fail.push(format!(
                                 "(a) {}\n mismatches={}",
@@ -257,7 +261,9 @@ fn run(snaps: &[Vec<RestingOrder>], acts: &[Act]) -> Tally {
                                 out.oid_mismatches
                             ));
                         }
-                        if out.oid_mismatches != want && t.b_fail.len() < 3 {
+                        let b_bad = out.oid_mismatches != want;
+                        t.b_count += u64::from(b_bad);
+                        if b_bad && t.b_fail.len() < 3 {
                             t.b_fail.push(format!(
                                 "(b) {}\n mismatches={} want={want}",
                                 ctx(),
@@ -281,6 +287,10 @@ fn run(snaps: &[Vec<RestingOrder>], acts: &[Act]) -> Tally {
 }
 
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: scripts/check.sh runs it with `cargo test --release`"
+)]
 fn oid_hint_gate_exhaustive() {
     let snaps = snapshots();
     let acts = actions();
@@ -298,20 +308,20 @@ fn oid_hint_gate_exhaustive() {
     let cases: u64 = ts.iter().map(|t| t.cases).sum();
     let a: Vec<&String> = ts.iter().flat_map(|t| &t.a_fail).collect();
     let b: Vec<&String> = ts.iter().flat_map(|t| &t.b_fail).collect();
+    let na: u64 = ts.iter().map(|t| t.a_count).sum();
+    let nb: u64 = ts.iter().map(|t| t.b_count).sum();
     let noh: u64 = ts.iter().map(|t| t.no_oid_hint).sum();
     let cm: u64 = ts.iter().map(|t| t.covered_mismatch).sum();
     let cok: u64 = ts.iter().map(|t| t.covered_match).sum();
     println!(
-        "F3 oid hints: {} snapshots x {} actions^2 x hints = {cases} cases; (a) failures {}; (b) failures {}; cases with a hint on a leg that takes no oid (counted since 01f058e) {noh}; cover: {cm} cases with a counted mismatch, {cok} with a correct hint on an oid-taking leg",
+        "F3 oid hints: {} snapshots x {} actions^2 x hints = {cases} cases; (a) failures {na}; (b) failures {nb}; cases with a hint on a leg that takes no oid (counted since 01f058e) {noh}; cover: {cm} cases with a counted mismatch, {cok} with a correct hint on an oid-taking leg",
         snaps.len(),
-        acts.len(),
-        a.len(),
-        b.len()
+        acts.len()
     );
     for x in a.iter().chain(b.iter()).take(3) {
         println!("{x}");
     }
     assert!(cm > 0 && cok > 0 && noh > 0, "vacuous");
-    assert!(a.is_empty(), "(a) failed");
-    assert!(b.is_empty(), "(b) failed");
+    assert!(na == 0, "(a) failed");
+    assert!(nb == 0, "(b) failed");
 }
