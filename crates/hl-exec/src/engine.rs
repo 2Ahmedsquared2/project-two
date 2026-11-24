@@ -322,17 +322,16 @@ impl Engine {
         self.out.statuses.push(s);
     }
 
+    /// The engine's own next oid. `hint` (native's oid for this leg, when
+    /// the driver has it) is never used as the oid: a differing hint only
+    /// counts in [`BlockOutcome::oid_mismatches`], so a block that needed
+    /// native's answer cannot count as reproduced.
     fn take_oid(&mut self, hint: Option<Oid>) -> Oid {
-        let oid = match hint {
-            Some(h) => {
-                if h.0 != self.next_oid {
-                    self.out.oid_mismatches = self.out.oid_mismatches.saturating_add(1);
-                }
-                h
-            }
-            None => Oid(self.next_oid),
-        };
-        self.next_oid = oid.0.saturating_add(1);
+        let oid = Oid(self.next_oid);
+        if hint.is_some_and(|h| h != oid) {
+            self.out.oid_mismatches = self.out.oid_mismatches.saturating_add(1);
+        }
+        self.next_oid = self.next_oid.saturating_add(1);
         oid
     }
 
@@ -341,10 +340,8 @@ impl Engine {
             return OrderStatus::Rejected(r);
         }
         if o.reduce_only || o.tif == Tif::Other {
-            // Consumes an oid on native; keep the counter in step when known.
-            if let Some(h) = o.oid_hint {
-                self.next_oid = h.0.saturating_add(1);
-            }
+            // Native may assign an oid here; the block is not reproduced and
+            // the driver adopts native's counter with `resync`/`set_next_oid`.
             return OrderStatus::Unsupported;
         }
         let Some(&b) = self.by_asset.get(&o.asset) else {

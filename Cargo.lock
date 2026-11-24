@@ -555,6 +555,8 @@ dependencies = [
  "hl-alloc-gate",
  "hl-book-ref",
  "proptest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

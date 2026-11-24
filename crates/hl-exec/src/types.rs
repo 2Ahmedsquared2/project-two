@@ -82,13 +82,14 @@ pub struct OrderReq {
     /// Order-priority fee rate of the action (`grouping: {"p": N}`), 0 for
     /// `"na"`. Used only for ALO queue placement (`ACTION_ORDERING` 3.3).
     pub priority: u64,
-    /// A rejection the driver found while converting the leg's strings
-    /// (e.g. `TickSize` for a price that is not on the grid). The leg gets
-    /// this status, consumes no oid and does not touch the book.
+    /// A rejection the driver found from the action and static asset
+    /// metadata only (never from native's response), e.g. `TickSize`. The
+    /// leg gets this status, consumes no oid and does not touch the book.
     pub pre_reject: Option<RejectReason>,
     /// The oid native assigned to this leg, when the driver knows it from
-    /// native's response. Oid assignment is not modelled (`ACTION_ORDERING`
-    /// 5.2 UNVERIFIED); without a hint the engine uses its own counter.
+    /// native's response. Used ONLY for comparison: the engine always uses
+    /// its own counter and counts a differing hint in
+    /// [`BlockOutcome::oid_mismatches`].
     pub oid_hint: Option<Oid>,
 }
 
@@ -159,9 +160,11 @@ pub enum RejectReason {
     ZeroSize,
     /// Zero price.
     ZeroPrice,
-    /// Price not on the tick grid: native's "Price must be divisible by tick size."
+    /// More than 5 significant figures: native's "Price must be divisible by tick size."
     TickSize,
-    /// Size not on the lot grid.
+    /// More decimals than the price grid allows: native's "Order has invalid price."
+    InvalidPrice,
+    /// More decimals than `szDecimals`: native's "Order has invalid size."
     LotSize,
     /// ALO that would cross: native's "Post only order would have
     /// immediately matched, bbo was BID@ASK". The best bid and ask at that moment.

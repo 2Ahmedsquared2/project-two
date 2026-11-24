@@ -15,6 +15,7 @@
 //! No floats, no `unsafe` (the workspace forbids it).
 
 pub mod book;
+pub mod decimal;
 pub mod engine;
 pub mod types;
 

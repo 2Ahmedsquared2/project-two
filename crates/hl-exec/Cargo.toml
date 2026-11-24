@@ -11,6 +11,8 @@ authors.workspace = true
 [dependencies]
 
 [dev-dependencies]
+serde_json = { workspace = true }
+serde = { workspace = true }
 hl-book-ref = { workspace = true }
 hl-alloc-gate = { path = "../hl-alloc-gate" }
 proptest = { workspace = true }

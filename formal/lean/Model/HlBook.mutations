@@ -1,0 +1,55 @@
+# Mutations for mutate.py: each swaps a piece of HlBook.lean for a plausible
+# bug in the Rust book (crates/hl-exec/src/book.rs). Every public theorem must
+# fail on at least one.
+
+mutation new level starts with count 0
+-   | none => some (sz, 1)
++   | none => some (sz, 0)
+
+mutation rest forgets to add the size to the level total
+-   | some (t, c) => some (t + sz, c + 1)
++   | some (t, c) => some (t, c + 1)
+
+mutation remove keeps a level whose last order left
+-   | some (t, c) => if c ≤ 1 then none else some (t - sz, c - 1)
++   | some (t, c) => if c < 1 then none else some (t - sz, c - 1)
+
+mutation remove forgets the order's size
+-   | some (t, c) => if c ≤ 1 then none else some (t - sz, c - 1)
++   | some (t, c) => if c ≤ 1 then none else some (t, c - 1)
+
+mutation resize does not subtract the old size
+-   | some (t, c) => some (t - old + new, c)
++   | some (t, c) => some (t + new, c)
+
+mutation resize updates the view with the wrong size
+-   else (take oid b).map fun (o, _) => (setSz oid sz b, update v o.key (setLevel (v o.key) o.sz sz))
++   else (take oid b).map fun (o, _) => (setSz oid sz b, update v o.key (setLevel (v o.key) sz o.sz))
+
+mutation best ask uses the worst price
+- def better (bid : Bool) (a b : Nat) : Bool := if bid then b < a else a < b
++ def better (bid : Bool) (a b : Nat) : Bool := if bid then a < b else b < a
+
+mutation maker taken from the taker's own side
+-   (best (!tbid) b).bind fun p =>
++   (best tbid b).bind fun p =>
+
+mutation maker is the last order at the best price, not the first
+-     if crossesP tbid tpx p then b.find? (fun o => o.bid = !tbid ∧ o.px = p) else none
++     if crossesP tbid tpx p then b.reverse.find? (fun o => o.bid = !tbid ∧ o.px = p) else none
+
+mutation insert-before view update counts nothing
+-   if o.sz = 0 then none else some (b.insertIdx i o, update v o.key (addLevel (v o.key) o.sz))
++   if o.sz = 0 then none else some (b.insertIdx i o, v)
+
+mutation rest appends without touching the view
+-   if o.sz = 0 then none else some (b ++ [o], update v o.key (addLevel (v o.key) o.sz))
++   if o.sz = 0 then none else some (b ++ [o], v)
+
+mutation cancel removes the order but leaves the view
+-   (take oid b).map fun (o, r) => (r, update v o.key (subLevel (v o.key) o.sz))
++   (take oid b).map fun (o, r) => (r, v)
+
+mutation a partial fill is applied as a full fill
+-   if min tsz m.sz = m.sz then cancel m.oid b v else resize m.oid (m.sz - min tsz m.sz) b v
++   if min tsz m.sz = m.sz then cancel m.oid b v else (cancel m.oid b v).map fun (b', _) => (b', v)
