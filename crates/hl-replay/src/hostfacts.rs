@@ -194,7 +194,7 @@ impl HostFacts {
 
     /// The CPUs the kernel command line isolates (`isolcpus=`), in ascending
     /// order and once each, if it names them one by one and every part of the
-    /// list was read.
+    /// list was read. A list that selects no CPU gives an empty `Vec`.
     #[must_use]
     pub fn isolated_cpus(&self) -> Option<Vec<usize>> {
         match self.cpu_list("isolcpus")? {
@@ -213,6 +213,11 @@ impl HostFacts {
     /// [`MAX_CPUS`], a stride using more than its group) makes the whole list
     /// unreadable: a partly read list would report a core as outside a list
     /// that holds it. Ranges are kept as ranges, never expanded CPU by CPU.
+    ///
+    /// A list that selects no CPU (`0-7:0/2`, or `isolcpus=` flags with no
+    /// list) is read, as an empty list: the kernel accepts it and sets no
+    /// bit (Linux v6.8 `lib/bitmap-str.c`: `bitmap_check_region` refuses only
+    /// `off > group_len`, and `bitmap_set_region` sets `min(.., off)` bits).
     fn cpu_list(&self, key: &str) -> Option<CpuList> {
         let mut ranges = Vec::new();
         let mut all = false;
@@ -232,8 +237,6 @@ impl HostFacts {
         }
         Some(if all {
             CpuList::All
-        } else if ranges.iter().all(|r| r.used == 0) {
-            CpuList::Unreadable
         } else {
             CpuList::Listed(ranges)
         })

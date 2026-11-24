@@ -126,7 +126,14 @@ pub struct Engine {
     books: Vec<Book>,
     by_asset: HashMap<Asset, u32, Fx>,
     oids: HashMap<Oid, (u32, u32), Fx>,
-    cloids: HashMap<(User, Cloid), Oid, Fx>,
+    /// Per book, as native's `books[].cloid_tracker`: (book, user, cloid)
+    /// to the newest live order placed with that cloid. Native accepts a
+    /// new order reusing a live cloid; the older order stays on the book,
+    /// unreachable by cloid.
+    cloids: HashMap<CloidKey, Oid, Fx>,
+    /// Every change to `cloids` this block, with the value it replaced, so
+    /// `resync` restores the index exactly (an overwritten entry included).
+    cloid_journal: Vec<(CloidKey, Option<Oid>)>,
     next_oid: u64,
     block_start_oid: u64,
     config: EngineConfig,
@@ -134,6 +141,8 @@ pub struct Engine {
     touched: Vec<u32>,
     touched_mark: Vec<bool>,
 }
+
+type CloidKey = (u32, User, Cloid);
 
 fn ix(b: u32) -> usize {
     usize::try_from(b).unwrap_or(usize::MAX)
@@ -184,6 +193,7 @@ impl Engine {
             by_asset,
             oids: HashMap::with_capacity_and_hasher(cap.orders, Fx::default()),
             cloids: HashMap::with_capacity_and_hasher(cap.orders, Fx::default()),
+            cloid_journal: Vec::with_capacity(cap.events_per_block),
             next_oid: 0,
             block_start_oid: 0,
             config,
@@ -228,7 +238,10 @@ impl Engine {
                 .map_err(|err| LoadError::Book(o.oid, err))?;
             e.oids.insert(o.oid, (b, slot));
             if let Some(c) = o.cloid {
-                e.cloids.insert((o.user, c), o.oid);
+                // Several live orders may share a cloid; native's index
+                // names the newest.
+                let ent = e.cloids.entry((b, o.user, c)).or_insert(o.oid);
+                *ent = (*ent).max(o.oid);
             }
             max = max.max(o.oid.0);
         }
@@ -362,6 +375,7 @@ impl Engine {
             self.touched_mark[ix(b)] = false;
         }
         self.touched.clear();
+        self.cloid_journal.clear();
         self.block_start_oid = self.next_oid;
         self.out.clear(block_time_ms);
     }
@@ -442,12 +456,17 @@ impl Engine {
         if let Some(r) = o.pre_reject {
             return OrderStatus::Rejected(r);
         }
+        // Native spends an oid on every leg past the static checks, whatever
+        // its outcome (our node's statuses: margin, spot balance, OI cap,
+        // min notional and too-many-orders rejects all carry fresh oids). A
+        // leg we do not model still takes its oid, so later oids in the
+        // block stay aligned; the block cannot count (`has_unsupported`).
         if o.reduce_only || o.tif == Tif::Other {
-            // Native may assign an oid here; the block is not reproduced and
-            // the driver adopts native's counter with `resync`/`set_next_oid`.
+            self.take_oid(o.oid_hint);
             return OrderStatus::Unsupported;
         }
         let Some(&b) = self.by_asset.get(&o.asset) else {
+            self.take_oid(o.oid_hint);
             return OrderStatus::Unsupported;
         };
         if o.sz.0 == 0 {
@@ -580,7 +599,9 @@ impl Engine {
     fn index_rest(&mut self, b: u32, slot: u32, user: User, cloid: Option<Cloid>, oid: Oid) {
         self.oids.insert(oid, (b, slot));
         if let Some(c) = cloid {
-            self.cloids.insert((user, c), oid);
+            let k = (b, user, c);
+            let old = self.cloids.insert(k, oid);
+            self.cloid_journal.push((k, old));
         }
     }
 
@@ -588,17 +609,24 @@ impl Engine {
         if let Some((b, slot)) = self.oids.remove(&oid) {
             let n = self.books[ix(b)].raw_node(slot);
             if let Some(c) = n.cloid {
-                if self.cloids.get(&(user, c)) == Some(&oid) {
-                    self.cloids.remove(&(user, c));
+                let k = (b, user, c);
+                if self.cloids.get(&k) == Some(&oid) {
+                    self.cloids.remove(&k);
+                    self.cloid_journal.push((k, Some(oid)));
                 }
             }
         }
     }
 
+    /// `asset` restricts the target to that asset's book; a cloid is
+    /// looked up in that book's index (no asset: no cloid lookup).
     fn resolve(&self, user: User, asset: Option<Asset>, r: OrderRef) -> Option<(u32, u32)> {
         let oid = match r {
             OrderRef::Oid(o) => o,
-            OrderRef::Cloid(c) => *self.cloids.get(&(user, c))?,
+            OrderRef::Cloid(c) => {
+                let b = *self.by_asset.get(&asset?)?;
+                *self.cloids.get(&(b, user, c))?
+            }
         };
         let (b, slot) = *self.oids.get(&oid)?;
         let book = &self.books[ix(b)];
@@ -635,7 +663,9 @@ impl Engine {
         if !self.by_asset.contains_key(&m.order.asset) {
             return OrderStatus::Unsupported;
         }
-        match self.resolve(user, None, m.target) {
+        // A modify by cloid looks in the replacement's book.
+        let asset = matches!(m.target, OrderRef::Cloid(_)).then_some(m.order.asset);
+        match self.resolve(user, asset, m.target) {
             Some((b, slot)) => {
                 self.remove_resting(b, slot);
                 self.place(user, &m.order, now)
@@ -654,25 +684,26 @@ impl Engine {
             touched,
             oids,
             cloids,
+            cloid_journal,
             ..
         } = self;
         for &b in touched.iter() {
             books[ix(b)].rollback(|r| match r {
                 Restored::Unrested(n) => {
                     oids.remove(&n.oid);
-                    if let Some(c) = n.cloid {
-                        if cloids.get(&(n.user, c)) == Some(&n.oid) {
-                            cloids.remove(&(n.user, c));
-                        }
-                    }
                 }
                 Restored::Back(n, slot) => {
                     oids.insert(n.oid, (b, slot));
-                    if let Some(c) = n.cloid {
-                        cloids.insert((n.user, c), n.oid);
-                    }
                 }
             });
+        }
+        // Undo the block's cloid index changes newest first, so an entry a
+        // new order overwrote comes back too.
+        while let Some((k, old)) = cloid_journal.pop() {
+            match old {
+                Some(o) => cloids.insert(k, o),
+                None => cloids.remove(&k),
+            };
         }
         self.next_oid = self.block_start_oid;
         for (i, d) in native.iter().enumerate() {

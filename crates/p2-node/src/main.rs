@@ -14,7 +14,7 @@ use p2_node::timing::{run_passes, Timed, TimingConfig};
 
 const USAGE: &str = "usage:
   p2-node replay --blocks <replica_cmds file> --diffs <node_raw_book_diffs batch file> --snapshot-height <H>
-                 [--engine null|echo|hlexec --seed resting_<H>.jsonl --asset-meta asset_meta.json]
+                 [--engine null|echo|hlexec --seed resting_<H>.jsonl --asset-meta asset_meta.json [--statuses F]]
                  [--passes N>=5] [--prewarm-passes N] [--window-blocks N]
                  [--core C] [--require-mlock] [--out DIR]
                  [--compare-only]  (stream decode, run, compare, drop per block: the k/N count
@@ -29,7 +29,8 @@ engines: null = executes nothing (driver overhead, honest coverage); echo = retu
 answers (harness oracle). Neither is an execution engine: no speed claim comes from them.
 hlexec = lane 1's hl-exec engine, seeded from lane 1's resting-order seed (perp books only:
 every perp asset in --asset-meta is seeded, empty books included; spot books are not held, so
-actions on them are unsupported and their native diffs are not adopted).
+actions on them are unsupported and their native diffs are not adopted). --statuses F (native's
+order_statuses_by_block file) gives resync native's oid counter, rejected orders' oids included.
 exit: 0 ok, 1 run error, 2 usage";
 
 struct Args(Vec<String>);
@@ -186,7 +187,13 @@ fn replay(a: &Args) -> ExitCode {
     };
     let mut blocks = Vec::with_capacity(lines.len());
     for (i, l) in lines.iter().enumerate() {
-        let h = snapshot + 1 + u64::try_from(i).unwrap_or(u64::MAX);
+        let h = match p2_node::replay::height_at(snapshot, i) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(1);
+            }
+        };
         let b = match hl_block::decode_block(l) {
             Ok(b) => b,
             Err(e) => {
@@ -234,8 +241,11 @@ fn replay(a: &Args) -> ExitCode {
         return ExitCode::from(1);
     }
     let timed: Result<Timed, _> = match (engine, &hl) {
-        ("hlexec", Some((table, seeded))) => run_passes(
-            &mut || p2_node::hlexec::HlExecEngine::new(seeded.clone(), table.clone()),
+        ("hlexec", Some((table, seeded, st))) => run_passes(
+            &mut || {
+                p2_node::hlexec::HlExecEngine::new(seeded.clone(), table.clone())
+                    .with_status_max_oids(st.clone())
+            },
             &lines,
             &blocks,
             snapshot,
@@ -262,7 +272,7 @@ fn replay(a: &Args) -> ExitCode {
     let mut report = String::new();
     let _ = writeln!(report, "engine {engine}  blocks {}  passes {passes}  prewarm {prewarm}  window {window}  core {core:?}", blocks.len());
     report.push_str(&first_pass.to_text());
-    if let Some((table, _)) = &hl {
+    if let Some((table, _, _)) = &hl {
         // Mismatched blocks by class; a block that touches a book the seed
         // does not hold is "unseeded-book" whatever else differs.
         let unseeded: std::collections::HashSet<u64> = blocks
@@ -345,7 +355,7 @@ fn compare_only(
     dpath: &str,
     snapshot: u64,
     engine: &str,
-    hl: Option<&(p2_node::hlexec::AssetTable, hl_exec::Engine)>,
+    hl: Option<&HlSetup>,
 ) -> ExitCode {
     let fail = |e: String| {
         eprintln!("{e}");
@@ -372,7 +382,10 @@ fn compare_only(
             Err(e) => return fail(e),
         };
         count += 1;
-        let height = snapshot + count;
+        let height = match nth_height(snapshot, count) {
+            Ok(h) => h,
+            Err(e) => return fail(e),
+        };
         if !diffs.contains_key(&height) {
             return fail(ReplayError::NoNativeDiffs { height }.to_string());
         }
@@ -396,22 +409,23 @@ fn compare_only(
     let mut line_no = 0u64;
     let stream = lines.map(|l| {
         line_no += 1;
-        let height = snapshot + line_no;
+        let height = nth_height(snapshot, line_no)?;
         let line = l?;
         let block = hl_block::decode_block(&line).map_err(|e| format!("{bpath}:{line_no}: {e}"))?;
         ReplayBlock::new(height, block, diffs.remove(&height)).map_err(|e| e.to_string())
     });
     let mut unseeded = std::collections::HashSet::new();
     let each = |blk: &ReplayBlock, _: bool| {
-        if let Some((table, _)) = hl {
+        if let Some((table, _, _)) = hl {
             if p2_node::hlexec::touches_unseeded(table, blk) {
                 unseeded.insert(blk.height());
             }
         }
     };
     let run = match (engine, hl) {
-        ("hlexec", Some((table, seeded))) => Replay::run_stream(
-            &mut p2_node::hlexec::HlExecEngine::new(seeded.clone(), table.clone()),
+        ("hlexec", Some((table, seeded, st))) => Replay::run_stream(
+            &mut p2_node::hlexec::HlExecEngine::new(seeded.clone(), table.clone())
+                .with_status_max_oids(st.clone()),
             stream,
             snapshot,
             each,
@@ -439,15 +453,32 @@ fn compare_only(
         p2_node::replay::verdict_label(run.reproduced, run.blocks, None)
     );
     print!("{report}");
-    if let Some(out) = args.get("--out").map(PathBuf::from) {
-        let w = std::fs::create_dir_all(&out)
-            .and_then(|()| std::fs::write(out.join("report.txt"), &report))
-            .and_then(|()| std::fs::write(out.join("heights.tsv"), heights_tsv(&run, &unseeded)));
-        if let Err(e) = w {
-            return fail(format!("{}: {e}", out.display()));
-        }
+    if let Err(e) = write_out(args, &report, &heights_tsv(&run, &unseeded)) {
+        return fail(e);
     }
     ExitCode::SUCCESS
+}
+
+/// `snapshot + n` for the n-th (1-based) block line, checked.
+fn nth_height(snapshot: u64, n: u64) -> Result<u64, String> {
+    snapshot.checked_add(n).ok_or_else(|| {
+        ReplayError::HeightOverflow {
+            snapshot,
+            index: usize::try_from(n.saturating_sub(1)).unwrap_or(usize::MAX),
+        }
+        .to_string()
+    })
+}
+
+/// With `--out DIR`: the report and the per-height verdicts.
+fn write_out(args: &Args, report: &str, heights: &str) -> Result<(), String> {
+    let Some(out) = args.get("--out").map(PathBuf::from) else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(&out)
+        .and_then(|()| std::fs::write(out.join("report.txt"), report))
+        .and_then(|()| std::fs::write(out.join("heights.tsv"), heights))
+        .map_err(|e| format!("{}: {e}", out.display()))
 }
 
 /// One line per block: height, verdict (reproduced / mismatch class), and
@@ -508,12 +539,18 @@ fn class_report(run: &Replay, unseeded: &std::collections::HashSet<u64>) -> Stri
     report
 }
 
+/// Asset table, seeded engine and native's highest oid per height (from
+/// `--statuses`, empty without it).
+type HlSetup = (
+    p2_node::hlexec::AssetTable,
+    hl_exec::Engine,
+    std::collections::HashMap<u64, u64>,
+);
+
 /// The asset table (perp assets only: the seed holds perp books) and lane
-/// 1's resting-order seed, checked against `--snapshot-height`.
-fn load_hlexec(
-    a: &Args,
-    snapshot: u64,
-) -> Result<(p2_node::hlexec::AssetTable, hl_exec::Engine), String> {
+/// 1's resting-order seed, checked against `--snapshot-height`; with
+/// `--statuses`, native's order-status file for resync's oid counter.
+fn load_hlexec(a: &Args, snapshot: u64) -> Result<HlSetup, String> {
     let (Some(sp), Some(mp)) = (a.get("--seed"), a.get("--asset-meta")) else {
         return Err("--engine hlexec needs --seed and --asset-meta".into());
     };
@@ -554,7 +591,17 @@ fn load_hlexec(
         hl_exec::EngineConfig::default(),
     )
     .map_err(|e| format!("{sp}: seed does not load into hl-exec: {e:?}"))?;
-    Ok((table, e))
+    let st = match a.get("--statuses") {
+        Some(path) => {
+            let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+            let max = p2_node::hlexec::load_status_max_oids(BufReader::new(file))
+                .map_err(|e| format!("{path}: {e}"))?;
+            eprintln!("hlexec statuses: highest oid for {} heights", max.len());
+            max
+        }
+        None => std::collections::HashMap::new(),
+    };
+    Ok((table, e, st))
 }
 
 fn load_pair(
@@ -706,7 +753,9 @@ fn native_times(a: &Args) -> ExitCode {
             }
         }
     }
-    let contiguous = v.windows(2).all(|w| w[1].height == w[0].height + 1);
+    let contiguous = v
+        .windows(2)
+        .all(|w| w[0].height.checked_add(1) == Some(w[1].height));
     let mut ns: Vec<u64> = v.iter().map(|t| t.apply_ns).collect();
     ns.sort_unstable();
     let p = |m| p2_node::timing::percentile(&ns, m).unwrap_or(0);

@@ -143,3 +143,31 @@ fn failed_undo_keeps_state_and_fails() {
     assert!(f.state().exists(), "state deleted after a failed undo");
     assert_eq!(f.read("proc/sys/vm/nr_hugepages"), "0");
 }
+
+/// CI/CD re-review blocker 1: a tune that stops part-way (here: a tuned path
+/// that cannot be read makes `set -e` exit after two values were already
+/// written) must leave a state file that undoes what it changed.
+#[test]
+fn interrupted_tune_leaves_a_usable_undo() {
+    let f = Fake::new("interrupted");
+    // busy_read comes after nr_hugepages and busy_poll; a directory is
+    // writable but `cat` on it fails, for root too.
+    fs::create_dir_all(f.root().join("proc/sys/net/core/busy_read")).unwrap();
+    let o = f.run(&["--hugepages", "8"]);
+    assert!(!o.status.success(), "{}", text(&o));
+    assert_eq!(f.read("proc/sys/vm/nr_hugepages"), "8");
+    assert_eq!(f.read("proc/sys/net/core/busy_poll"), "50");
+    assert!(
+        f.state().exists(),
+        "no state after a partial tune: {}",
+        text(&o)
+    );
+    let o = f.run(&[]);
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    assert!(text(&o).contains("already tuned"), "{}", text(&o));
+    let o = f.run(&["--undo"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(f.read("proc/sys/vm/nr_hugepages"), "0");
+    assert_eq!(f.read("proc/sys/net/core/busy_poll"), "0");
+    assert!(!f.state().exists());
+}

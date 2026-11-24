@@ -949,12 +949,47 @@ fn from_node_diff(meta: &AssetTable, d: &BookDiff) -> Result<XDiff, String> {
     })
 }
 
+/// Highest oid per height in native's order-status file
+/// (`node_order_statuses_by_block`: one JSON line per block,
+/// `{"block_number", "events": [{"order": {"oid"}, ..}]}`). It records every
+/// order that took an oid, rejects past the static checks included, which
+/// neither the responses (an error string) nor the book diffs show. Resync
+/// only: it sets the counter after a block that did not reproduce.
+pub fn load_status_max_oids(reader: impl std::io::BufRead) -> Result<HashMap<u64, u64>, String> {
+    #[derive(serde::Deserialize)]
+    struct Line {
+        block_number: u64,
+        events: Vec<Event>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Event {
+        order: Option<Order>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Order {
+        oid: Option<u64>,
+    }
+    let mut out = HashMap::new();
+    for (i, line) in reader.lines().enumerate() {
+        let line = line.map_err(|e| format!("line {}: {e}", i + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let l: Line = serde_json::from_str(&line).map_err(|e| format!("line {}: {e}", i + 1))?;
+        if let Some(m) = l.events.iter().filter_map(|e| e.order.as_ref()?.oid).max() {
+            out.insert(l.block_number, m);
+        }
+    }
+    Ok(out)
+}
+
 /// The hl-exec engine behind the replay driver's trait.
 pub struct HlExecEngine {
     eng: hl_exec::Engine,
     meta: AssetTable,
     last_core_ns: Option<u64>,
     unadopted_diffs: u64,
+    status_max_oids: HashMap<u64, u64>,
 }
 
 impl std::fmt::Debug for HlExecEngine {
@@ -975,7 +1010,16 @@ impl HlExecEngine {
             meta,
             last_core_ns: None,
             unadopted_diffs: 0,
+            status_max_oids: HashMap::new(),
         }
+    }
+
+    /// Native's highest oid per height from its order-status file
+    /// ([`load_status_max_oids`]); resync then sets the counter past it.
+    #[must_use]
+    pub fn with_status_max_oids(mut self, m: HashMap<u64, u64>) -> Self {
+        self.status_max_oids = m;
+        self
     }
 
     /// The wrapped engine.
@@ -1045,7 +1089,7 @@ impl Engine for HlExecEngine {
 
     fn resync(
         &mut self,
-        _height: u64,
+        height: u64,
         native_diffs: &[BookDiff],
         native_responses: &[Value],
     ) -> Result<(), String> {
@@ -1088,6 +1132,9 @@ impl Engine for HlExecEngine {
             xs.push(x);
         }
         self.eng.resync(&xs).map_err(|e| format!("{e:?}"))?;
+        if let Some(&m) = self.status_max_oids.get(&height) {
+            max_oid = max_oid.max(m);
+        }
         if max_oid > 0 && self.eng.next_oid().0 <= max_oid {
             self.eng.set_next_oid(Oid(max_oid + 1));
         }

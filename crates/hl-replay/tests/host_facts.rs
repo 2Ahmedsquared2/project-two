@@ -789,3 +789,69 @@ fn a_stride_using_more_than_its_group_is_unreadable() {
         Vec::<String>::new()
     );
 }
+
+#[test]
+fn a_list_that_selects_no_cpu_is_a_readable_empty_list() {
+    // The kernel accepts a stride using 0 of each group and sets no CPU:
+    // `bitmap_check_region` refuses only `r->off > r->group_len`, and
+    // `bitmap_set_region` then sets `min(r->end - start + 1, r->off)` = 0
+    // bits (Linux v6.8 lib/bitmap-str.c). So the list is read, and holds no
+    // pinned core.
+    for raw in ["0-7:0/2", "0-3:0/1,4-7:0/4"] {
+        assert_eq!(
+            list_warnings(
+                &format!("isolcpus: 0-7\nnohz_full: {raw}\nrcu_nocbs: all"),
+                Some(2),
+                Some(3)
+            ),
+            [
+                format!("feeder core 2 is not in nohz_full ({raw})"),
+                format!("hot core 3 is not in nohz_full ({raw})"),
+            ],
+            "{raw}"
+        );
+        let f = file_with_cores(&format!("isolcpus: {raw}"), "active: 0");
+        assert_eq!(f.isolated_cpus(), Some(Vec::new()), "{raw}");
+    }
+    // With nohz_full read as empty, RCU offload is decided by rcu_nocbs
+    // alone, never left "undetermined".
+    assert_eq!(
+        list_warnings(
+            "isolcpus: 0-7\nnohz_full: 0-7:0/2\nrcu_nocbs: 3",
+            Some(2),
+            Some(3)
+        ),
+        [
+            "feeder core 2 is not in nohz_full (0-7:0/2)",
+            "hot core 3 is not in nohz_full (0-7:0/2)",
+            "feeder core 2 is not in rcu_nocbs (3)",
+        ]
+    );
+    // An empty part beside a part that names CPUs changes nothing.
+    assert_eq!(
+        list_warnings(
+            "isolcpus: 0-7\nnohz_full: 0-7:0/2,2-3\nrcu_nocbs: all",
+            Some(2),
+            Some(3)
+        ),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn isolcpus_flags_without_a_list_isolate_no_cpu() {
+    // `isolcpus=domain` hands the kernel an empty list, which
+    // `bitmap_parselist` accepts as an empty mask (it returns 0 when no
+    // region is found, Linux v6.8 lib/bitmap-str.c).
+    assert_eq!(
+        list_warnings(
+            "isolcpus: domain,managed_irq\nnohz_full: 2-3\nrcu_nocbs: all",
+            Some(2),
+            Some(3)
+        ),
+        [
+            "feeder core 2 is not in isolcpus (domain,managed_irq)",
+            "hot core 3 is not in isolcpus (domain,managed_irq)",
+        ]
+    );
+}

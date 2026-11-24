@@ -331,3 +331,35 @@ fn native_f64_noise_in_diff_sizes_reads_as_the_grid_value() {
         e.final_book().unwrap()
     );
 }
+
+/// Rejected orders past the static checks spend an oid that neither native's
+/// responses (an error string) nor its diffs show; native's order-status
+/// file does. Block 1232430073 ended with two IOC no-match rejects that took
+/// ..430 and ..431, so 074 started at ..432 while a counter taken from
+/// responses and diffs started at ..430 (53 blocks lane 1 reproduces).
+#[test]
+fn resync_adopts_the_oid_counter_from_native_order_statuses() {
+    let statuses = concat!(
+        r#"{"block_number":1,"events":[{"status":"open","order":{"oid":500}},"#,
+        r#"{"status":"iocCancelRejected","order":{"oid":502}}]}"#,
+        "\n",
+        r#"{"block_number":2,"events":[]}"#,
+        "\n"
+    );
+    let max = p2_node::hlexec::load_status_max_oids(statuses.as_bytes()).unwrap();
+    assert_eq!(max.get(&1), Some(&502));
+    assert_eq!(max.get(&2), None);
+    let mut e = engine().with_status_max_oids(max);
+    let native_resp = vec![
+        json!({"status":"ok","response":{"type":"order","data":{"statuses":[
+            {"resting":{"oid":500}},
+            {"error":"Order could not immediately match against any resting orders. asset=7"}
+        ]}}}),
+    ];
+    let native_diffs: Vec<hl_node_convert::node::BookDiff> = serde_json::from_value(json!([
+        {"user": BOB, "oid": 500, "coin": "TST", "side": "A", "px": "11.0", "raw_book_diff": {"new": {"sz": "1.0"}}}
+    ]))
+    .unwrap();
+    e.resync(1, &native_diffs, &native_resp).unwrap();
+    assert_eq!(e.engine().next_oid(), Oid(503));
+}

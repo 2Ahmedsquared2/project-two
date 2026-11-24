@@ -88,7 +88,9 @@ The report also prints `warning:` lines, which never stop a run:
   and gets a line saying the pinned cores were not checked against it. So
   does a list the kernel itself refuses: one naming a CPU number of 8192 or
   more (past the widest CPU mask an x86-64 or arm64 kernel is built with), or
-  a stride using more than its group (`0-7:3/2`);
+  a stride using more than its group (`0-7:3/2`). A list the kernel accepts
+  that selects no CPU (`0-7:0/2`, or `isolcpus=domain` with no list) is read
+  as an empty list, so every pinned core is reported as not in it;
 - with `nohz_full` unreadable, a core outside `rcu_nocbs` (or `rcu_nocbs` not
   set) is reported as "whether it is offloaded from RCU callbacks is
   undetermined", not as not offloaded;
@@ -187,7 +189,7 @@ The report prints this table from the stage types themselves:
 | parser | real, mode `header scan` | `hl_latency::scan_node_header` (block time and height from the fixed prefix), falling back to the strict `parse_node_line` for a line it cannot scan |
 | book | stub | fixed 16-level arrays; prices derived from the block number, not from the line |
 | decision | stub | one ALO order per update |
-| signer | real | `HlOrderSigner`: `hl-order`'s `Signer::sign_l1` (msgpack into keccak-256, EIP-712 agent digest, k256 RFC 6979) + the SDK request body, testnet source, throwaway key. Real because `tests/real_signer.rs` signs all 12 `hl-order` golden vectors through it byte for byte. Build with `--features prototype-signer` to run the old `PrototypeSigner` (libsecp256k1, placeholder domain) for comparison; the report then says `signer=prototype` |
+| signer | real | `HlOrderSigner`: `hl-order`'s `Signer::sign_l1` (msgpack into keccak-256, EIP-712 agent digest, libsecp256k1 RFC 6979) + the SDK request body, testnet source, throwaway key. Real because `tests/real_signer.rs` signs all 12 `hl-order` golden vectors through it byte for byte. Build with `--features prototype-signer` to run the old `PrototypeSigner` (libsecp256k1, placeholder domain) for comparison; the report then says `signer=prototype` |
 | send | prototype | plain TCP write to loopback: no TLS, no WebSocket framing, no NIC |
 
 So `t2-t0` today is a header scan plus the real signing cost. It is not
