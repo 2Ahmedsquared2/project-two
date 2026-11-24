@@ -1,5 +1,5 @@
 //! Allocation gate for the node arm's steady-state tick: after warmup, one
-//! tick (read + split + stamp + parse + hand-off) must not touch the heap.
+//! tick (read + split + stamp + parse + ring push) must not touch the heap.
 //! Linking `hl-alloc-gate` swaps this test binary's global allocator for a
 //! counting one (per-thread counts).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -9,8 +9,7 @@ use std::hint::black_box;
 use std::io::Write;
 
 use hl_alloc_gate::assert_no_alloc_after_warmup;
-use hl_capture::{NodeTailer, ObservationSink};
-use hl_latency::Observation;
+use hl_capture::{ring, NodeTailer};
 
 const WARMUP: u64 = 64;
 const TICKS: u64 = 2000;
@@ -37,19 +36,6 @@ fn hourly_file(root: &std::path::Path) -> File {
         .unwrap()
 }
 
-/// A sink that checks each observation and keeps nothing.
-struct Count {
-    seen: u64,
-    last_height: Option<u64>,
-}
-
-impl ObservationSink for Count {
-    fn observe(&mut self, obs: Observation) {
-        self.seen += 1;
-        self.last_height = black_box(obs).block_number;
-    }
-}
-
 fn gate(what: &str, events: usize) {
     let t = tempfile::tempdir().unwrap();
     let mut file = hourly_file(t.path());
@@ -63,18 +49,29 @@ fn gate(what: &str, events: usize) {
         ns += 1;
         ns
     };
-    let mut sink = Count {
-        seen: 0,
-        last_height: None,
-    };
+    // The reader's whole tick: the record goes into the SPSC ring. The
+    // writer's side is drained here (a pop, no serialising) so the ring
+    // never fills.
+    let (mut sink, mut source) = ring(64);
+    let mut seen = 0u64;
     // The first poll finds the file and follows it from its end.
     tail.poll_into(&mut clock, &mut sink).unwrap();
     assert_no_alloc_after_warmup(what, WARMUP, TICKS, |i| {
         file.write_all(&lines[usize::try_from(i).unwrap()]).unwrap();
         tail.poll_into(&mut clock, &mut sink).unwrap();
-        assert_eq!(sink.last_height, Some(1000 + i));
+        let o = black_box(source.pop()).expect("the tick pushed its record");
+        assert_eq!(o.block_number, Some(1000 + i));
+        assert!(source.pop().is_none());
+        seen += 1;
     });
-    assert_eq!(sink.seen, WARMUP + TICKS, "every tick delivered its line");
+    assert_eq!(seen, WARMUP + TICKS, "every tick delivered its line");
+    assert_eq!(sink.dropped(), 0);
+    let s = tail.stats();
+    assert_eq!(
+        (s.rescans, s.scan_fallbacks),
+        (1, 0),
+        "no walk, no strict parse"
+    );
     assert_eq!(tail.stats().rotations, 0, "steady state: no rotation");
 }
 

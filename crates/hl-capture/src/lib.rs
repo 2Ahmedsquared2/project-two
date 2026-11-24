@@ -16,10 +16,12 @@
 //! split across two reads carries the second read's stamp.
 
 mod lines;
+mod ring;
 mod tail;
 mod ws;
 
 pub use lines::{LineSink, LineSplitter, StampedLine, DEFAULT_MAX_LINE};
+pub use ring::{ring, RingSink, RingSource, DEFAULT_RING_RECORDS};
 pub use tail::{
     hourly_key, newest_hourly_file, NodeTailer, ObservationSink, Switch, TailStats,
     MAX_READS_PER_POLL,
