@@ -1,0 +1,19 @@
+$ lscpu --extended
+CPU NODE SOCKET CORE L1d:L1i:L2:L3 ONLINE
+  0    0      0    0 0:0:0:0          yes
+  1    0      0    1 1:1:1:0          yes
+  2    -      -    - -                 no
+  3    -      -    - -                 no
+  4    -      -    - -                 no
+  5    -      -    - -                 no
+  6    -      -    - -                 no
+  7    -      -    - -                 no
+  8    -      -    - -                 no
+  9    -      -    - -                 no
+ 10    -      -    - -                 no
+ 11    -      -    - -                 no
+ 12    -      -    - -                 no
+ 13    -      -    - -                 no
+ 14    -      -    - -                 no
+ 15    -      -    - -                 no
+exit=0

@@ -1,0 +1,8 @@
+== /sys/devices/system/cpu/cpu0/cpuidle/state*/name
+cat: '/sys/devices/system/cpu/cpu0/cpuidle/state*/name': No such file or directory
+== /sys/devices/system/cpu/cpu0/cpuidle/state*/disable
+cat: '/sys/devices/system/cpu/cpu0/cpuidle/state*/disable': No such file or directory
+== /sys/devices/system/cpu/cpu0/cpuidle/state*/latency
+cat: '/sys/devices/system/cpu/cpu0/cpuidle/state*/latency': No such file or directory
+== /sys/module/intel_idle/parameters/max_cstate
+9

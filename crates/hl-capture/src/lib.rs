@@ -15,10 +15,19 @@
 //! newline) returned. A line is not usable before it is complete, so a line
 //! split across two reads carries the second read's stamp.
 
+mod detect;
 mod lines;
+mod ring;
+mod stop;
 mod tail;
 mod ws;
 
-pub use lines::{LineSplitter, StampedLine, DEFAULT_MAX_LINE};
-pub use tail::{hourly_key, newest_hourly_file, NodeTailer, TailStats, MAX_READS_PER_POLL};
+pub use detect::{Detect, Waiter, Wake};
+pub use lines::{LineSink, LineSplitter, StampedLine, DEFAULT_MAX_LINE};
+pub use ring::{ring, RingSink, RingSource, DEFAULT_RING_RECORDS};
+pub use stop::Stop;
+pub use tail::{
+    hourly_key, newest_hourly_file, NodeTailer, ObservationSink, Switch, TailStats,
+    MAX_READS_PER_POLL,
+};
 pub use ws::{WsFilter, WsStats};

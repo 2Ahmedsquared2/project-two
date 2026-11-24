@@ -1,0 +1,2 @@
+$ ethtool -l eth0
+unavailable: ethtool

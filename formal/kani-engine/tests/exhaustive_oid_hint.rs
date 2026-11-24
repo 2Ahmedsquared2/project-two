@@ -6,10 +6,13 @@
 //! (a) the outcome (responses, statuses, diffs, fills, flags) and the
 //!     resulting state (orders + queue order, L2, next oid, indexes) are
 //!     identical apart from `oid_mismatches`, for ANY hints; and when every
-//!     hint is `None` or equal to the counter at its leg, `oid_mismatches == 0`;
-//! (b) `oid_mismatches` equals the number of legs that TAKE an oid and carry
-//!     a hint different from the counter. Legs that take no oid (pre-reject,
-//!     zero size, modify of an unknown order) are counted apart as F3-gap.
+//!     hint is `None`, or equal to the counter on a leg that takes an oid,
+//!     `oid_mismatches == 0`;
+//! (b) `oid_mismatches` equals the number of legs whose hint disagrees with
+//!     the engine: a leg that takes an oid with a hint different from the
+//!     counter, or a leg that takes no oid (pre-reject, zero size, modify of
+//!     an unknown order) with any `Some` hint. This is lane 1's rule from
+//!     `01f058e` (the F3-gap fix); before it such legs were never counted.
 //!
 //! Domain: snapshot 0 or 1 resting order (oid 1; side x px {1,3} x sz {1,2}
 //! x user {u1,u2}), next oid 10, STP on. Block of TWO single-leg actions from
@@ -182,8 +185,7 @@ struct Tally {
     cases: u64,
     a_fail: Vec<String>,
     b_fail: Vec<String>,
-    gap: u64,
-    gap_example: Option<String>,
+    no_oid_hint: u64,
     covered_mismatch: u64,
     covered_match: u64,
 }
@@ -232,10 +234,16 @@ fn run(snaps: &[Vec<RestingOrder>], acts: &[Act]) -> Tally {
                         let mut e = base.clone();
                         e.execute_block(1, &[ua(&k0), ua(&k1)]);
                         let out = e.outcome().clone();
-                        let differs0 = h0.is_some_and(|h| h != c0);
-                        let differs1 = h1.is_some_and(|h| h != c1);
-                        let want = u32::from(takes0 && differs0) + u32::from(takes1 && differs1);
-                        let all_agree = !differs0 && !differs1;
+                        let bad = |takes: bool, h: Option<Oid>, c: Oid| {
+                            if takes {
+                                h.is_some_and(|h| h != c)
+                            } else {
+                                h.is_some()
+                            }
+                        };
+                        let (bad0, bad1) = (bad(takes0, h0, c0), bad(takes1, h1, c1));
+                        let want = u32::from(bad0) + u32::from(bad1);
+                        let all_agree = !bad0 && !bad1;
                         let ctx = || {
                             format!("snap={s:?}\n a0={m0:?} (counter {c0:?}, takes={takes0})\n a1={m1:?} (counter {c1:?}, takes={takes1})")
                         };
@@ -256,11 +264,8 @@ fn run(snaps: &[Vec<RestingOrder>], acts: &[Act]) -> Tally {
                                 out.oid_mismatches
                             ));
                         }
-                        if (!takes0 && differs0) || (!takes1 && differs1) {
-                            t.gap += 1;
-                            if t.gap_example.is_none() && out.oid_mismatches == 0 {
-                                t.gap_example = Some(ctx());
-                            }
+                        if (!takes0 && h0.is_some()) || (!takes1 && h1.is_some()) {
+                            t.no_oid_hint += 1;
                         }
                         if want > 0 {
                             t.covered_mismatch += 1;
@@ -293,11 +298,11 @@ fn oid_hint_gate_exhaustive() {
     let cases: u64 = ts.iter().map(|t| t.cases).sum();
     let a: Vec<&String> = ts.iter().flat_map(|t| &t.a_fail).collect();
     let b: Vec<&String> = ts.iter().flat_map(|t| &t.b_fail).collect();
-    let gap: u64 = ts.iter().map(|t| t.gap).sum();
+    let noh: u64 = ts.iter().map(|t| t.no_oid_hint).sum();
     let cm: u64 = ts.iter().map(|t| t.covered_mismatch).sum();
     let cok: u64 = ts.iter().map(|t| t.covered_match).sum();
     println!(
-        "F3 oid hints: {} snapshots x {} actions^2 x hints = {cases} cases; (a) failures {}; (b) failures {}; F3-gap cases (differing hint on a leg that takes no oid, not counted) {gap}; cover: {cm} cases with a counted mismatch, {cok} with a correct hint on an oid-taking leg",
+        "F3 oid hints: {} snapshots x {} actions^2 x hints = {cases} cases; (a) failures {}; (b) failures {}; cases with a hint on a leg that takes no oid (counted since 01f058e) {noh}; cover: {cm} cases with a counted mismatch, {cok} with a correct hint on an oid-taking leg",
         snaps.len(),
         acts.len(),
         a.len(),
@@ -306,10 +311,7 @@ fn oid_hint_gate_exhaustive() {
     for x in a.iter().chain(b.iter()).take(3) {
         println!("{x}");
     }
-    if let Some(g) = ts.iter().find_map(|t| t.gap_example.clone()) {
-        println!("F3-gap example:\n{g}");
-    }
-    assert!(cm > 0 && cok > 0, "vacuous");
+    assert!(cm > 0 && cok > 0 && noh > 0, "vacuous");
     assert!(a.is_empty(), "(a) failed");
     assert!(b.is_empty(), "(b) failed");
 }

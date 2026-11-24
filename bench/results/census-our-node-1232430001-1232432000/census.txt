@@ -1,0 +1,153 @@
+blocks 2000 (empty 0), bundles 3974, actions 1858991, rounds Some(1538572706)..Some(1538574844), round gaps 139, regressions 0, decode errors 0
+      801540  cancelByCloid
+          736029    ok:cancel:success
+          602774    ok:cancel:error:Order was never placed, already canceled, or filled. asset=<n>
+             257    ok:cancel
+      763870  order
+          965244    ok:order:resting
+          412828    ok:order:error:Post only order would have immediately matched, bbo was <n>@<n>. asset=<n>
+           51519    ok:order:error:Insufficient margin to place order. asset=<n>
+           26066    ok:order:error:Order could not immediately match against any resting orders. asset=<n>
+            4849    ok:order:filled
+            3770    ok:order:error:Insufficient spot balance asset=<n>
+            2982    ok:order:error:Too many open orders asset=<n>
+             607    ok:order:error:Order must have minimum value of $<n>. asset=<n>
+             338    err:Action already expired
+             143    ok:order:error:Reduce only order would increase position. asset=<n>
+             101    ok:order:waitingForTrigger
+              91    ok:order:error:Cannot flip position when open interest is at cap. asset=<n>
+              89    ok:order:error:Cannot increase position when open interest is at cap. asset=<n>
+              51    ok:order:error:Order has invalid price.
+              40    ok:order:error:Order must have minimum value of <n> USDC. asset=<n>
+              34    ok:order:waitingForFill
+              29    ok:order:error:Order price cannot be more than <n>% away from the reference price
+              21    ok:order:error:Post only order would have immediately matched. asset=<n>
+              16    ok:order:error:Order has invalid size.
+               5    ok:order:error:Price must be divisible by tick size. asset=<n>
+               2    ok:order:error:Order has zero size.
+               2    ok:order:error:Trigger order has unexpected type.
+               1    err:Invalid spot
+      187785  cancel
+          224470    ok:cancel:success
+           93582    ok:cancel:error:Order was never placed, already canceled, or filled. asset=<n>
+             194    ok:cancel
+       55867  batchModify
+          116917    ok:order:resting
+            1144    ok:order:error:Cannot modify canceled or filled order
+             156    ok:order:error:Error placing new order during modify: Post only order would have immediately matched, bbo was <n>@<n>.
+              49    ok:order:error:Error placing new order during modify: Insufficient margin to place order.
+              18    ok:order:error:Attempted to modify to invalid new order
+               2    ok:order:error:Error placing new order during modify: Order must have minimum value of $<n>.
+               2    ok:order:filled
+               1    ok:order:error:Error placing new order during modify: Post only order would have immediately matched.
+       19739  modify
+           19554    ok:default
+             123    err:Error placing new order during modify: Post only order would have immediately matched, bbo was <n>@<n>.
+              58    err:Cannot modify canceled or filled order
+               3    err:Order price cannot be more than <n>% away from the reference price
+               1    err:Error placing new order during modify: Insufficient margin to place order.
+       17506  noop
+           17079    ok:default
+             427    err:User or API Wallet <hex> does not exist.
+        6424  scheduleCancel
+            6166    ok:default
+             212    err:Cannot set scheduled cancel time until enough volume traded. Required: $<n>. Traded: $<n>.
+              46    err:Scheduled cancel time too early, must be at least <n> seconds from now.
+        3259  evmRawTx
+            1510    err:L1 eth api error: already known
+            1082    ok:default
+             548    err:L1 eth api error: nonce too low: next nonce <n>, tx nonce <n>
+             119    err:L1 eth api error: replacement transaction underpriced
+         849  UNKNOWN validatorL1UpdateReferenceOracle
+             849    ok:setGlobal
+         741  updateLeverage
+             610    ok:default
+              78    err:Cross margin is not allowed for this asset.
+              42    err:Cannot switch leverage type with open position.
+               8    err:Cross position does not have sufficient margin available to decrease leverage. To decrease leverage, deposit more collateral.
+               2    err:Invalid leverage value
+               1    err:Isolated position does not have sufficient margin available to decrease leverage. To decrease leverage, add margin to the position.
+         296  updateIsolatedMargin
+             266    ok:default
+              20    err:Position does not have sufficient margin for reduction.
+               6    err:Account does not have sufficient margin available for increase.
+               4    err:Cannot update margin for empty position.
+         210  setReferrer
+             201    err:Referrer already set
+               9    ok:default
+         161  UNKNOWN userSetAbstraction
+             161    ok:default
+         116  sendAsset
+              64    ok:default
+              47    err:Insufficient balance for token transfer
+               4    err:Insufficient balance for withdrawal.
+               1    err:Insufficient USDC or HYPE balance for token transfer gas.
+         101  multiSig
+              97    ok:setGlobal
+               4    ok:default
+          73  perpDeploy
+              71    ok:setGlobal
+               2    ok:default
+          61  UNKNOWN voteAbciDigest
+              59    ok:validatorVote
+               2    err:Unknown validator
+          50  UNKNOWN gossipPriorityBid
+              28    err:Gas auction completed. Try again later.
+              20    err:Gas fee is greater than the maximum fee set by user
+               2    ok:default
+          44  SetGlobalAction
+              44    ok:setGlobal
+          44  UNKNOWN l1ValidatorVoteBridgeDeposit
+              44    ok:default
+          41  twapOrder
+              41    ok:twapOrder
+          38  UNKNOWN agentSetAbstraction
+              37    err:Abstraction transition not allowed
+               1    ok:default
+          31  UNKNOWN voteL1Hash
+              30    ok:validatorVote
+               1    err:Unknown validator
+          28  approveAgent
+              27    ok:default
+               1    err:User has pending agent removal
+          23  approveBuilderFee
+              23    ok:default
+          17  UNKNOWN agentSendAsset
+              13    ok:default
+               4    err:Insufficient balance for withdrawal.
+          13  NetChildVaultPositionsAction
+              13    ok:default
+          11  spotSend
+              11    ok:default
+          10  UNKNOWN userOutcome
+              10    ok:default
+           8  VoteEthDepositAction
+               8    ok:default
+           7  usdSend
+               5    ok:default
+               2    err:Action disabled when unified account is active
+           4  VoteEthFinalizedWithdrawalAction
+               3    ok:default
+               1    err:Validator cannot vote on withdrawal that does not exist
+           4  evmUserModify
+               4    ok:default
+           4  UNKNOWN sendToEvmWithData
+               3    err:Insufficient USDC or HYPE balance for token transfer gas.
+               1    ok:default
+           3  claimRewards
+               2    ok:default
+               1    err:Must have at least <n> of a reward token to claim
+           3  UNKNOWN trailingStop
+               3    ok:trailingStop
+           3  twapCancel
+               3    ok:twapCancel
+           2  borrowLend
+               2    ok:default
+           2  vaultTransfer
+               2    err:Insufficient vault equity for withdrawal
+           1  UNKNOWN outcomeDeploy
+               1    ok:default
+           1  subAccountTransfer
+               1    ok:default
+           1  UNKNOWN validatorL1Status
+               1    ok:default

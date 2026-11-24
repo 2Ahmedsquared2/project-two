@@ -1,0 +1,1 @@
+source: AWS upload window/our-node/node_fast_block_times_first2000.jsonl sha256 b3f52eaca35fc3e36d0798c24c45653d9f3044725613148c5e0d0e672f553ea6. Caveat: begin_block_wall_time is ~20 min after block_time for these heights (node catching up after start), so these are catch-up applies, not at-tip.

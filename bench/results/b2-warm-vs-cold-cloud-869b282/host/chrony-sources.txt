@@ -1,0 +1,2 @@
+$ chronyc sources -v
+unavailable: chronyc

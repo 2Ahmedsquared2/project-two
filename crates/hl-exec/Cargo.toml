@@ -12,6 +12,9 @@ authors.workspace = true
 
 [dev-dependencies]
 serde_json = { workspace = true }
+# replay example: L1 signer recovery for the unknown-wallet rule.
+secp256k1 = { version = "0.29", features = ["recovery"] }
+sha3 = "0.10"
 serde = { workspace = true }
 hl-book-ref = { workspace = true }
 hl-alloc-gate = { path = "../hl-alloc-gate" }

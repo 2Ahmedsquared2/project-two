@@ -1,0 +1,4 @@
+== /sys/devices/system/cpu/isolated
+
+== /sys/devices/system/cpu/nohz_full
+cat: /sys/devices/system/cpu/nohz_full: No such file or directory
