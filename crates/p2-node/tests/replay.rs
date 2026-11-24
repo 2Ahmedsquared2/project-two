@@ -98,7 +98,10 @@ fn engine_never_sees_native_responses() {
     let acts = blocks[0].user_actions();
     assert_eq!(acts.len(), 2);
     assert_eq!(acts[0].action_type, "order");
-    assert_eq!(acts[0].user, "0xecececececececececececececececececececec");
+    assert_eq!(
+        acts[0].user,
+        Some("0xecececececececececececececececececececec")
+    );
     assert_eq!(
         acts[1].vault_address,
         Some("0x0101010101010101010101010101010101010101")

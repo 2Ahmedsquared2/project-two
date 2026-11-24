@@ -117,17 +117,7 @@ pub fn hot(
     let Ok(block) = hl_block::decode_block(line) else {
         return (0, 0);
     };
-    let acts: Vec<UserAction<'_>> = block
-        .actions()
-        .map(|a| UserAction {
-            action_type: &a.action_type,
-            action: &a.action,
-            nonce: a.nonce,
-            user: &a.user,
-            vault_address: a.vault_address.as_deref(),
-            expires_after: a.expires_after,
-        })
-        .collect();
+    let acts: Vec<UserAction<'_>> = block.actions().map(UserAction::from_signed).collect();
     let applied = apply_diffs(book, diffs);
     if let Some(a) = arena {
         // Scratch writes into the hot-path arena (what a preallocated engine

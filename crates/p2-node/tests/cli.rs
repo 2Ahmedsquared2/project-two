@@ -135,3 +135,20 @@ fn usage_exit_2() {
         Some(2)
     );
 }
+
+#[test]
+fn native_times_summary() {
+    let o = bin()
+        .args(["native-times", &data("fast_block_times_3.jsonl")])
+        .output()
+        .unwrap();
+    let so = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{so}");
+    assert!(
+        so.contains("blocks 3, heights 1232430001..=1232430003, contiguous yes"),
+        "{so}"
+    );
+    // nearest-rank p50 of [2629160, 12478919, 26845330] = 12478919
+    assert!(so.contains("median 12478919"), "{so}");
+    assert!(so.contains("max 26845330"), "{so}");
+}

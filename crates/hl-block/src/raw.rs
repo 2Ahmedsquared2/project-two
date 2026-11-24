@@ -10,6 +10,8 @@ use crate::{text::parse_time_ns, Block, BlockError, Bundle, Outcome, Signature, 
 pub(crate) struct Line {
     abci_block: AbciBlock,
     resps: Resps,
+    #[serde(default)]
+    height: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -48,6 +50,8 @@ struct RawSigned {
     vault_address: Option<String>,
     #[serde(rename = "expiresAfter", default)]
     expires_after: Option<u64>,
+    #[serde(rename = "isFrontend", default)]
+    is_frontend: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -60,7 +64,7 @@ struct Resps {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawResp {
-    user: String,
+    user: Option<String>,
     res: RawRes,
 }
 
@@ -106,6 +110,7 @@ pub(crate) fn into_block(raw: Line) -> Result<Block, BlockError> {
     let a = raw.abci_block;
     let time_ns = parse_time_ns(&a.time).map_err(|_| BlockError::Time(a.time.clone()))?;
     let resps = raw.resps.full;
+    let height = raw.height;
     if resps.len() != a.signed_action_bundles.len() {
         return Err(BlockError::BundleCount {
             bundles: a.signed_action_bundles.len(),
@@ -144,6 +149,7 @@ pub(crate) fn into_block(raw: Line) -> Result<Block, BlockError> {
                 nonce: s.nonce,
                 vault_address: s.vault_address,
                 expires_after: s.expires_after,
+                is_frontend: s.is_frontend,
                 signature: s.signature,
                 user: r.user,
                 outcome: outcome(r.res, bi, ai)?,
@@ -157,6 +163,7 @@ pub(crate) fn into_block(raw: Line) -> Result<Block, BlockError> {
         });
     }
     Ok(Block {
+        height,
         round: a.round,
         parent_round: a.parent_round,
         time: a.time,

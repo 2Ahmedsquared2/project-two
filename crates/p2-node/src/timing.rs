@@ -181,17 +181,7 @@ fn one_pass<E: Engine>(
                 block_ns: rb.block().time_ns,
             });
         }
-        let acts: Vec<UserAction<'_>> = block
-            .actions()
-            .map(|a| UserAction {
-                action_type: &a.action_type,
-                action: &a.action,
-                nonce: a.nonce,
-                user: &a.user,
-                vault_address: a.vault_address.as_deref(),
-                expires_after: a.expires_after,
-            })
-            .collect();
+        let acts: Vec<UserAction<'_>> = block.actions().map(UserAction::from_signed).collect();
         let t_exec = Instant::now();
         let out = engine.execute_block(block.time_ns, &acts);
         let exec_ns = ns(t_exec);

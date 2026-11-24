@@ -35,8 +35,8 @@ fn pairs_actions_with_responses() {
     assert_eq!(bundle.actions[1].action_type, "cancel");
     assert!(bundle.actions[1].vault_address.is_some());
     assert_eq!(
-        bundle.actions[0].user,
-        "0xecececececececececececececececececececec"
+        bundle.actions[0].user.as_deref(),
+        Some("0xecececececececececececececececececececec")
     );
     assert!(
         matches!(bundle.actions[0].outcome, Outcome::Ok { ref response_type, .. } if response_type == "order")
@@ -161,4 +161,42 @@ fn outcome_round_trips_to_the_native_json() {
             }
         }
     }
+}
+
+// Real capture (our node, block 1232430001 onwards, 2,000 blocks) showed three
+// differences from the Dwellir spec; these tests pin each one.
+
+#[test]
+fn real_schema_top_level_height() {
+    let mut v: serde_json::Value = serde_json::from_str(lines()[0]).unwrap();
+    v["height"] = serde_json::json!(1_232_430_001_u64);
+    let b = decode_block(&v.to_string()).unwrap();
+    assert_eq!(b.height, Some(1_232_430_001));
+    assert_eq!(decode_block(lines()[0]).unwrap().height, None);
+}
+
+#[test]
+fn real_schema_is_frontend_flag() {
+    let mut v: serde_json::Value = serde_json::from_str(lines()[0]).unwrap();
+    v["abci_block"]["signed_action_bundles"][0][1]["signed_actions"][0]["isFrontend"] =
+        serde_json::json!(true);
+    let b = decode_block(&v.to_string()).unwrap();
+    assert_eq!(b.bundles[0].actions[0].is_frontend, Some(true));
+    assert_eq!(b.bundles[0].actions[1].is_frontend, None);
+}
+
+#[test]
+fn real_schema_null_user_on_rejected_action() {
+    let mut v: serde_json::Value = serde_json::from_str(lines()[2]).unwrap();
+    v["resps"]["Full"][0][1][0]["user"] = serde_json::Value::Null;
+    let b = decode_block(&v.to_string()).unwrap();
+    assert_eq!(b.bundles[0].actions[0].user, None);
+}
+
+#[test]
+fn real_schema_still_rejects_unknown_fields() {
+    let mut v: serde_json::Value = serde_json::from_str(lines()[0]).unwrap();
+    v["abci_block"]["signed_action_bundles"][0][1]["signed_actions"][0]["isFrontendX"] =
+        serde_json::json!(true);
+    assert!(decode_block(&v.to_string()).is_err());
 }

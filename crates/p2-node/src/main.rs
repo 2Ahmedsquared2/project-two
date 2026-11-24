@@ -20,6 +20,8 @@ const USAGE: &str = "usage:
   p2-node warm-trial --config cold|warm|warm-no-pin|warm-no-arena|warm-no-prewarm
                  --blocks F --diffs F --prewarm-blocks F --prewarm-diffs F --n N [--prewarm R] [--core C]
                  (one trial per process; prints one CSV line: config,event,ns,...)
+  p2-node native-times <node_fast_block_times file>
+                 (native's own apply_duration per block: median/p90/p99/max/mean, ns)
 engines: null = executes nothing (driver overhead, honest coverage); echo = returns native's
 answers (harness oracle). Neither is an execution engine: no speed claim comes from them.
 exit: 0 ok, 1 run error, 2 usage";
@@ -57,6 +59,7 @@ fn main() -> ExitCode {
         Some("replay") => replay(&a),
         Some("gen") => gen(&a),
         Some("warm-trial") => warm_trial(&a),
+        Some("native-times") => native_times(&a),
         _ => usage("no command"),
     }
 }
@@ -371,5 +374,55 @@ fn warm_trial(a: &Args) -> ExitCode {
         );
     }
     print!("{out}");
+    ExitCode::SUCCESS
+}
+
+/// Native's own per-block `apply_duration` (from `node_fast_block_times`).
+fn native_times(a: &Args) -> ExitCode {
+    let Some(path) = a.0.get(1) else {
+        return usage("native-times needs a file");
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{path}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut v = Vec::new();
+    for (i, l) in text
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+    {
+        match p2_node::native_times::parse_line(l) {
+            Ok(t) => v.push(t),
+            Err(e) => {
+                eprintln!("{path}:{}: {e}", i + 1);
+                return ExitCode::from(1);
+            }
+        }
+    }
+    let contiguous = v.windows(2).all(|w| w[1].height == w[0].height + 1);
+    let mut ns: Vec<u64> = v.iter().map(|t| t.apply_ns).collect();
+    ns.sort_unstable();
+    let p = |m| p2_node::timing::percentile(&ns, m).unwrap_or(0);
+    let n = u128::try_from(ns.len()).unwrap_or(1).max(1);
+    let mean = ns.iter().map(|&x| u128::from(x)).sum::<u128>() / n;
+    println!(
+        "blocks {}, heights {}..={}, contiguous {}",
+        v.len(),
+        v.first().map_or(0, |t| t.height),
+        v.last().map_or(0, |t| t.height),
+        if contiguous { "yes" } else { "NO" }
+    );
+    println!(
+        "apply_duration ns: median {} p90 {} p99 {} max {} mean {}",
+        p(500),
+        p(900),
+        p(990),
+        ns.last().copied().unwrap_or(0),
+        mean
+    );
     ExitCode::SUCCESS
 }

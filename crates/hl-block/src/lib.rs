@@ -4,7 +4,9 @@
 //!
 //! Schema source: the official `hyperliquid-dex/node` README (paths, flag) and
 //! Dwellir's `StreamBlocks` "Full Block Spec", which documents the same
-//! `replica_cmds` `BlockData`. PROVISIONAL until checked against a real capture:
+//! `replica_cmds` `BlockData`, corrected against a real capture of our node
+//! (blocks 1232430001..=1232432000: top-level `height`, `isFrontend`, null
+//! `user`). Everything else is still checked strictly:
 //! that is why every envelope here rejects unknown fields, and an action
 //! without a string `type` is an error. Action payloads and response data are
 //! kept as raw JSON: the engine decodes the ones it executes, the census counts
@@ -31,6 +33,9 @@ pub use text::{normalize_message, parse_time_ns, TimeError};
 /// One decoded block with every action paired to its native response.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Block {
+    /// Block height, when the line carries it (our node's `replica_cmds`
+    /// does: top-level `height`; the Dwellir spec does not show it).
+    pub height: Option<u64>,
     /// `HyperBFT` round of this block. Rounds can skip.
     pub round: u64,
     /// Round of the parent block (not always `round - 1`).
@@ -94,10 +99,14 @@ pub struct SignedAction {
     pub vault_address: Option<String>,
     /// `expiresAfter`, ms.
     pub expires_after: Option<u64>,
+    /// `isFrontend`, when present (seen on real `order` actions).
+    pub is_frontend: Option<bool>,
     /// Signature.
     pub signature: Signature,
-    /// The signer native resolved (from the response).
-    pub user: String,
+    /// The signer native resolved (from the response); `None` when native
+    /// could not resolve one (seen on rejected actions: "User or API Wallet
+    /// ... does not exist.").
+    pub user: Option<String>,
     /// Native's response.
     pub outcome: Outcome,
 }

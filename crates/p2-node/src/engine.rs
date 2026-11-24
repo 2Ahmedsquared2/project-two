@@ -19,12 +19,27 @@ pub struct UserAction<'a> {
     pub action: &'a Value,
     /// Action nonce.
     pub nonce: u64,
-    /// Signer address (lowercase hex).
-    pub user: &'a str,
+    /// Signer address (lowercase hex); `None` when native resolved none.
+    pub user: Option<&'a str>,
     /// `vaultAddress`, when present.
     pub vault_address: Option<&'a str>,
     /// `expiresAfter`, ms, when present.
     pub expires_after: Option<u64>,
+}
+
+impl<'a> UserAction<'a> {
+    /// The engine input for one decoded action.
+    #[must_use]
+    pub fn from_signed(a: &'a hl_block::SignedAction) -> Self {
+        UserAction {
+            action_type: &a.action_type,
+            action: &a.action,
+            nonce: a.nonce,
+            user: a.user.as_deref(),
+            vault_address: a.vault_address.as_deref(),
+            expires_after: a.expires_after,
+        }
+    }
 }
 
 /// What the engine produced for one action.

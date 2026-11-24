@@ -104,17 +104,7 @@ impl ReplayBlock {
     /// The engine's input: what the block carries.
     #[must_use]
     pub fn user_actions(&self) -> Vec<UserAction<'_>> {
-        self.block
-            .actions()
-            .map(|a| UserAction {
-                action_type: &a.action_type,
-                action: &a.action,
-                nonce: a.nonce,
-                user: &a.user,
-                vault_address: a.vault_address.as_deref(),
-                expires_after: a.expires_after,
-            })
-            .collect()
+        self.block.actions().map(UserAction::from_signed).collect()
     }
 }
 

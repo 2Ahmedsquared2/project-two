@@ -9,6 +9,7 @@
 pub mod engine;
 pub mod engines;
 pub mod gen;
+pub mod native_times;
 pub mod replay;
 pub mod timing;
 pub mod warmbench;
