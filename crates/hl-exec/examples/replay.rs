@@ -1,0 +1,1758 @@
+//! Lane 1 diagnostic replay (not the official driver, which is lane 3's):
+//! seed `hl-exec` from an `l4Snapshots` file, decode `replica_cmds`
+//! (actions-and-responses), execute every block, and compare per block with
+//! native's responses and raw book diffs. Prints k/N and the mismatch
+//! classes, and times `execute_block` alone (decode is done before timing).
+//!
+//! ```text
+//! cargo run --release -p hl-exec --example replay -- \
+//!   --meta DIR --seed l4.json --replica replica.jsonl --diffs diffs.jsonl \
+//!   [--statuses statuses.jsonl] [--max N] [--show K] [--heights-out FILE.tsv]
+//! ```
+//!
+//! `--meta DIR` holds `meta.json`, `spotMeta.json`, `perpDexs.json` and
+//! `meta_<dex>.json` from the public info API. Inputs are plain JSONL.
+//!
+//! Honesty rules (lead planner F3): a block counts only if it has no
+//! unsupported action or leg, no oid hint differed from our counter, every
+//! response equals native's and our diff sequence equals native's. Leg
+//! pre-rejects are derived from the action and static metadata only. The
+//! acting user is taken from native's response (`user`): agent-to-master
+//! mapping is not implemented (input, not outcome).
+//!
+//! `--signers FILE` (lane 2's `signers_<height>.txt`, one address per line;
+//! pass a `.gz` through `<(zcat …)`) turns on the unknown-wallet rule: each
+//! L1 action's signer is recovered from its own signature (mainnet phantom
+//! agent) and, when it is not in the set, the action is a noop answered
+//! `User or API Wallet {signer} does not exist.` An `approveAgent` native
+//! accepted adds its agent to the set (acceptance read from native: input).
+//! User-signed actions (`signatureChainId`), `multiSig` and `evmRawTx` (signed
+//! by its own EVM transaction; native answered none of 3,259 in the first
+//! 2,000 blocks with unknown-wallet) are not ruled.
+//! The set is the seed plus in-window accepted `approveAgent`s; users created
+//! in the window (deposits, transfers) are not added. `--wallet-log FILE`
+//! writes every action where the rule and native disagree.
+//!
+//! `--set-global-const` answers every `SetGlobalAction` with native's
+//! constant `{"type":"setGlobal","data":[]}` and no book effect (223 of 223
+//! over 1232430001..1232440000, lane 3's count; lane 3's adapter does the
+//! same). Off by default; a k that uses it is labelled `set-global-const`.
+//!
+//! `--cancel-log FILE` (needs `--statuses`) writes one JSON line per
+//! `cancel`/`cancelByCloid` leg whose response differs from native's, in
+//! every block, past the block's first mismatch too: both responses, the
+//! target's book kind and whether the seed holds it, whether the target oid
+//! rests in the seed, earlier actions in the same block whose native response
+//! names the target, and native's order statuses for the target before, at and
+//! after that block (status and order type). `first` marks the leg of the
+//! action that is the block's first response mismatch. Counting only: it
+//! changes no verdict.
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::too_many_lines,
+    clippy::cast_precision_loss,
+    clippy::float_arithmetic,
+    clippy::as_conversions,
+    clippy::disallowed_types,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names,
+    clippy::similar_names
+)]
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Write as _};
+use std::time::Instant;
+
+use hl_exec::decimal::parse_fixed;
+use hl_exec::{
+    Asset, BookDiff, CancelReq, Capacity, Cloid, DiffKind, Engine, EngineConfig, ModifyReq, Oid,
+    OrderRef, OrderReq, OrderStatus, Px, RejectReason, RestingOrder, Side, Sz, Tif, User,
+    UserAction,
+};
+use serde_json::Value;
+
+#[path = "replay_support/signers.rs"]
+mod signers;
+
+#[derive(Clone, Debug)]
+struct AssetInfo {
+    sz_dec: u32,
+    px_dec: u32,
+}
+
+struct Meta {
+    by_idx: HashMap<Asset, AssetInfo>,
+    by_name: HashMap<String, Asset>,
+}
+
+/// Outcome-market asset id for coin "#E": actions name it 100,000,000 + E
+/// (observed in our node's order actions, e.g. "#414130" is a = 100414130).
+const OUTCOME_ASSET_BASE: Asset = 100_000_000;
+
+impl Meta {
+    /// Register outcome coin "#E" (the seed holds its book). szDecimals 0 and
+    /// 8 price decimals (spot rule 8 - szDecimals) are inferred: every "#E"
+    /// size in the window is a whole number and outcomeMeta has no szDecimals.
+    fn add_outcome(&mut self, coin: &str) -> Option<Asset> {
+        let e: Asset = coin.strip_prefix('#')?.parse().ok()?;
+        let a = OUTCOME_ASSET_BASE.checked_add(e)?;
+        self.by_idx.insert(
+            a,
+            AssetInfo {
+                sz_dec: 0,
+                px_dec: 8,
+            },
+        );
+        self.by_name.insert(coin.to_owned(), a);
+        Some(a)
+    }
+}
+
+fn load_meta(dir: &str) -> Meta {
+    let rd = |f: &str| -> Value {
+        serde_json::from_reader(BufReader::new(File::open(format!("{dir}/{f}")).unwrap())).unwrap()
+    };
+    let mut by_idx = HashMap::new();
+    let mut by_name = HashMap::new();
+    let mut add = |idx: Asset, name: String, sz_dec: u32, spot: bool| {
+        let px_dec = if spot { 8 } else { 6 } - sz_dec;
+        by_idx.insert(idx, AssetInfo { sz_dec, px_dec });
+        by_name.insert(name, idx);
+    };
+    let meta = rd("meta.json");
+    for (i, u) in meta["universe"].as_array().unwrap().iter().enumerate() {
+        add(
+            i as Asset,
+            u["name"].as_str().unwrap().to_owned(),
+            u["szDecimals"].as_u64().unwrap() as u32,
+            false,
+        );
+    }
+    let spot = rd("spotMeta.json");
+    let toks: HashMap<u64, u32> = spot["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            (
+                t["index"].as_u64().unwrap(),
+                t["szDecimals"].as_u64().unwrap() as u32,
+            )
+        })
+        .collect();
+    for u in spot["universe"].as_array().unwrap() {
+        let base = u["tokens"][0].as_u64().unwrap();
+        add(
+            10000 + u["index"].as_u64().unwrap() as Asset,
+            u["name"].as_str().unwrap().to_owned(),
+            toks[&base],
+            true,
+        );
+    }
+    let dexs = rd("perpDexs.json");
+    for (k, d) in dexs.as_array().unwrap().iter().enumerate() {
+        let Some(name) = d["name"].as_str() else {
+            continue;
+        };
+        let m = rd(&format!("meta_{name}.json"));
+        for (i, u) in m["universe"].as_array().unwrap().iter().enumerate() {
+            add(
+                (100_000 + k * 10_000 + i) as Asset,
+                u["name"].as_str().unwrap().to_owned(),
+                u["szDecimals"].as_u64().unwrap() as u32,
+                false,
+            );
+        }
+    }
+    Meta { by_idx, by_name }
+}
+
+fn hexbytes<const N: usize>(s: &str) -> Option<[u8; N]> {
+    let s = s.strip_prefix("0x")?;
+    if s.len() != 2 * N {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+fn user(s: &str) -> User {
+    User(hexbytes::<20>(s).unwrap_or([0; 20]))
+}
+
+fn cloid(v: &Value) -> Option<Cloid> {
+    v.as_str()
+        .and_then(hexbytes::<16>)
+        .map(|b| Cloid(u128::from_be_bytes(b)))
+}
+
+fn fmt_units(v: u128, dec: u32) -> String {
+    let p = 10u128.pow(dec);
+    let (i, f) = (v / p, v % p);
+    if f == 0 {
+        return i.to_string();
+    }
+    let fs = format!("{f:0>w$}", w = dec as usize);
+    format!("{i}.{}", fs.trim_end_matches('0'))
+}
+
+/// Native prints a whole-number `totalSz` / `avgPx` with ".0" ("1710.0").
+fn pad_whole(s: String) -> String {
+    if s.contains('.') {
+        s
+    } else {
+        format!("{s}.0")
+    }
+}
+
+/// Decimal places of the fractional part, trailing zeros ignored.
+fn decs(s: &str) -> usize {
+    s.split_once('.')
+        .map_or(0, |(_, f)| f.trim_end_matches('0').len())
+}
+
+fn sig_figs(s: &str) -> usize {
+    let (i, f) = s.split_once('.').unwrap_or((s, ""));
+    let f = f.trim_end_matches('0');
+    if f.is_empty() {
+        return 0;
+    }
+    let i = i.trim_start_matches('0');
+    if i.is_empty() {
+        f.trim_start_matches('0').len()
+    } else {
+        i.len() + f.len()
+    }
+}
+
+/// One decoded order leg plus whether it is outside the model.
+fn decode_leg(meta: &Meta, o: &Value, priority: u64) -> (OrderReq, bool) {
+    let a = o["a"].as_u64().unwrap_or(u64::MAX) as Asset;
+    let p = o["p"].as_str().unwrap_or("");
+    let s = o["s"].as_str().unwrap_or("");
+    let tif = match o["t"]["limit"]["tif"].as_str() {
+        Some("Gtc") => Tif::Gtc,
+        Some("Alo") => Tif::Alo,
+        Some("Ioc") => Tif::Ioc,
+        _ => Tif::Other,
+    };
+    let mut req = OrderReq {
+        asset: a,
+        side: if o["b"].as_bool().unwrap_or(false) {
+            Side::Bid
+        } else {
+            Side::Ask
+        },
+        px: Px(0),
+        sz: Sz(0),
+        reduce_only: o["r"].as_bool().unwrap_or(false),
+        tif,
+        cloid: cloid(&o["c"]),
+        priority,
+        pre_reject: None,
+        oid_hint: None,
+    };
+    let Some(info) = meta.by_idx.get(&a) else {
+        return (req, true);
+    };
+    req.px = Px(parse_fixed(p.as_bytes(), info.px_dec).unwrap_or(0));
+    req.sz = Sz(parse_fixed(s.as_bytes(), info.sz_dec).unwrap_or(0));
+    // Static checks, in the order the public sample supports (see PR notes).
+    if decs(s) > info.sz_dec as usize {
+        req.pre_reject = Some(RejectReason::LotSize);
+    } else if decs(p) > info.px_dec as usize {
+        req.pre_reject = Some(RejectReason::InvalidPrice);
+    } else if sig_figs(p) > 5 {
+        req.pre_reject = Some(RejectReason::TickSize);
+    } else if req.px.0 == 0 {
+        // Price 0 is "Order has invalid price." ahead of the minimum-value
+        // check: native answers exactly that on all 23 price-0 legs in the
+        // 10,000-block window (lane 3's HYPE Gtc legs).
+        req.pre_reject = Some(RejectReason::InvalidPrice);
+    }
+    // Minimum notional ($10) is not modelled: the sample shows other checks
+    // (margin, reduce-only) win in some cases, so such legs are unsupported.
+    let notional = u128::from(req.px.0) * u128::from(req.sz.0);
+    let ten = 10u128 * 10u128.pow(info.px_dec + info.sz_dec);
+    let unsupported = req.pre_reject.is_none() && notional < ten;
+    if unsupported {
+        // Hand the leg to the engine as unmodelled: it answers `Unsupported`
+        // but still takes the oid native spends on it.
+        req.tif = Tif::Other;
+    }
+    (req, unsupported)
+}
+
+#[derive(Default)]
+struct Block {
+    height: u64,
+    time_ms: u64,
+    users: Vec<User>,
+    orders: Vec<Vec<OrderReq>>,
+    cancels: Vec<Vec<CancelReq>>,
+    modifies: Vec<Vec<ModifyReq>>,
+    /// (kind, index into the vec of that kind)
+    acts: Vec<(u8, usize)>,
+    types: Vec<String>,
+    native: Vec<Value>,
+    expires: Vec<Option<u64>>,
+    /// Every asset a decoded leg names (for the unseeded-book check).
+    assets: Vec<Asset>,
+    /// Actions per signed-action bundle (native's in-block order is per bundle).
+    bundle_lens: Vec<u32>,
+    /// Per action, its range in `assets`.
+    act_assets: Vec<(usize, usize)>,
+    /// Per action, the recovered signer the unknown-wallet rule found absent
+    /// (kind 5; `None` for every other action).
+    unknown_signer: Vec<Option<[u8; 20]>>,
+    /// Per action, the recovered L1 signer when the rule was applied.
+    signer: Vec<Option<[u8; 20]>>,
+}
+
+/// The unknown-wallet rule's state across blocks.
+struct WalletRule {
+    set: signers::Signers,
+    ctx: secp256k1::Secp256k1<secp256k1::VerifyOnly>,
+    not_recovered: usize,
+    agents_added: usize,
+}
+
+impl Block {
+    fn actions(&self) -> Vec<UserAction<'_>> {
+        self.acts
+            .iter()
+            .enumerate()
+            .map(|(i, &(k, j))| match k {
+                0 => UserAction::Order {
+                    user: self.users[i],
+                    orders: &self.orders[j],
+                },
+                1 => UserAction::Cancel {
+                    user: self.users[i],
+                    cancels: &self.cancels[j],
+                },
+                2 => UserAction::Modify {
+                    user: self.users[i],
+                    modifies: &self.modifies[j],
+                },
+                3 | 5 | 6 => UserAction::Noop,
+                _ => UserAction::Unsupported("x"),
+            })
+            .collect()
+    }
+}
+
+fn time_ms(s: &str) -> u64 {
+    // "2026-11-23T23:32:07.188849213" -> ms since epoch (UTC).
+    let (d, t) = s.split_once('T').unwrap();
+    let mut it = d.split('-').map(|x| x.parse::<i64>().unwrap());
+    let (y, m, dd) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+    let (hms, frac) = t.split_once('.').unwrap_or((t, "0"));
+    let mut it = hms.split(':').map(|x| x.parse::<i64>().unwrap());
+    let (h, mi, se) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+    let ms: i64 = format!("{frac:0<3}")[..3].parse().unwrap();
+    // days from civil (Howard Hinnant)
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + dd - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    (((days * 24 + h) * 60 + mi) * 60 + se) as u64 * 1000 + ms as u64
+}
+
+fn decode_block(meta: &Meta, line: &str, mut rule: Option<&mut WalletRule>) -> Block {
+    let v: Value = serde_json::from_str(line).unwrap();
+    let l1 = rule.as_ref().map(|_| signers::signed_actions(line));
+    let set_global = flag("--set-global-const");
+    let mut act_no = 0usize;
+    let ab = &v["abci_block"];
+    let mut b = Block {
+        height: v["height"].as_u64().unwrap(),
+        time_ms: time_ms(ab["time"].as_str().unwrap()),
+        ..Block::default()
+    };
+    let resps = v["resps"]["Full"].as_array().unwrap();
+    for (bundle, resp) in ab["signed_action_bundles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(resps)
+    {
+        let sas = bundle[1]["signed_actions"].as_array().unwrap();
+        let rs = resp[1].as_array().unwrap();
+        assert_eq!(sas.len(), rs.len());
+        b.bundle_lens.push(sas.len() as u32);
+        for (sa, r) in sas.iter().zip(rs) {
+            let a = &sa["action"];
+            let t = a["type"].as_str().unwrap_or("?").to_owned();
+            let u = user(r["user"].as_str().unwrap_or(""));
+            b.users.push(u);
+            b.native.push(r["res"].clone());
+            let expired = sa["expiresAfter"].as_u64().is_some_and(|e| e < b.time_ms);
+            let mut unsupported = expired;
+            let a0 = b.assets.len();
+            let kind = match t.as_str() {
+                "order" => {
+                    let prio = a["grouping"]["p"].as_u64().unwrap_or(0);
+                    if !(a["grouping"] == "na" || a["grouping"]["p"].is_u64()) {
+                        unsupported = true;
+                    }
+                    let mut legs = Vec::new();
+                    for o in a["orders"].as_array().into_iter().flatten() {
+                        // An unmodelled leg goes to the engine, which answers
+                        // it `Unsupported` and takes its oid (native does).
+                        let (leg, _uns) = decode_leg(meta, o, prio);
+                        b.assets.push(leg.asset);
+                        legs.push(leg);
+                    }
+                    b.orders.push(legs);
+                    0
+                }
+                "cancel" | "cancelByCloid" => {
+                    let mut cs = Vec::new();
+                    for c in a["cancels"].as_array().into_iter().flatten() {
+                        let asset = c["a"].as_u64().or(c["asset"].as_u64()).unwrap_or(0) as Asset;
+                        unsupported |= !meta.by_idx.contains_key(&asset);
+                        b.assets.push(asset);
+                        let target = if t == "cancel" {
+                            OrderRef::Oid(Oid(c["o"].as_u64().unwrap_or(0)))
+                        } else {
+                            OrderRef::Cloid(cloid(&c["cloid"]).unwrap_or_default())
+                        };
+                        cs.push(CancelReq { asset, target });
+                    }
+                    b.cancels.push(cs);
+                    1
+                }
+                "modify" | "batchModify" => {
+                    let list: Vec<&Value> = if t == "modify" {
+                        vec![a]
+                    } else {
+                        a["modifies"].as_array().into_iter().flatten().collect()
+                    };
+                    let mut ms = Vec::new();
+                    for m in list {
+                        let target = match &m["oid"] {
+                            Value::String(_) => {
+                                OrderRef::Cloid(cloid(&m["oid"]).unwrap_or_default())
+                            }
+                            x => OrderRef::Oid(Oid(x.as_u64().unwrap_or(0))),
+                        };
+                        let (leg, _uns) = decode_leg(meta, &m["order"], 0);
+                        b.assets.push(leg.asset);
+                        ms.push(ModifyReq { target, order: leg });
+                    }
+                    b.modifies.push(ms);
+                    2
+                }
+                "noop" => 3,
+                "SetGlobalAction" if set_global => 6,
+                _ => 4,
+            };
+            let kind = if unsupported { 4 } else { kind };
+            // Unknown-wallet rule: a signer outside the set makes the whole
+            // action a noop with native's error, whatever its type.
+            let mut unknown = None;
+            let mut ruled = None;
+            if let (Some(r), Some(l1)) = (rule.as_deref_mut(), l1.as_ref()) {
+                let user_signed =
+                    a.get("signatureChainId").is_some() || t == "multiSig" || t == "evmRawTx";
+                if !user_signed && !expired {
+                    match l1[act_no].recover(&r.ctx, signers::MAINNET) {
+                        Some(s) => {
+                            ruled = Some(s);
+                            if !r.set.exists(&s) {
+                                unknown = Some(s);
+                            }
+                        }
+                        None => r.not_recovered += 1,
+                    }
+                }
+                if t == "approveAgent" && b.native.last().is_some_and(|x| x["status"] == "ok") {
+                    if let Some(ag) = a["agentAddress"].as_str() {
+                        r.agents_added += usize::from(r.set.add_hex(ag));
+                    }
+                }
+            }
+            act_no += 1;
+            let kind = if unknown.is_some() {
+                b.assets.truncate(a0);
+                5
+            } else {
+                kind
+            };
+            b.unknown_signer.push(unknown);
+            b.signer.push(ruled);
+            b.act_assets.push((a0, b.assets.len()));
+            b.acts.push((
+                kind,
+                match kind {
+                    0 => b.orders.len() - 1,
+                    1 => b.cancels.len() - 1,
+                    2 => b.modifies.len() - 1,
+                    _ => 0,
+                },
+            ));
+            b.types.push(t);
+        }
+    }
+    b
+}
+
+/// Native-shaped status string for one leg (compared with native's JSON).
+fn leg_json(meta: &Meta, asset: Asset, cl: Option<Cloid>, s: OrderStatus) -> Value {
+    let a = asset;
+    let info = meta.by_idx.get(&a);
+    let fmt_px = |p: Px| fmt_units(u128::from(p.0), info.map_or(0, |i| i.px_dec));
+    let with_cloid = |mut m: serde_json::Map<String, Value>| {
+        if let Some(c) = cl {
+            m.insert("cloid".into(), Value::String(format!("0x{:032x}", c.0)));
+        }
+        Value::Object(m)
+    };
+    match s {
+        OrderStatus::Placed {
+            oid,
+            filled,
+            notional,
+            rested,
+        } => {
+            if rested.0 > 0 {
+                let mut m = serde_json::Map::new();
+                m.insert("oid".into(), oid.0.into());
+                serde_json::json!({ "resting": with_cloid(m) })
+            } else {
+                let i = info.unwrap();
+                let mut m = serde_json::Map::new();
+                let tot = fmt_units(u128::from(filled.0), i.sz_dec);
+                m.insert("totalSz".into(), pad_whole(tot).into());
+                // avgPx: exact notional / filled, FLOORED to the price grid. Native
+                // matches floor on 19,117 of 19,117 legs both we and native filled
+                // over 1232430001..1232440000; 1,085 of them tell floor from
+                // half-up and all say floor (lane 3's R2, adapter 0c97fb2:
+                // r2_filled_legs_0c97fb2.tsv, r2.py / r2b.py). Native-filled legs
+                // we do not fill are not in that count.
+                // A whole number prints with ".0" (R2: 991 whole-number avgPx).
+                let f = u128::from(filled.0);
+                let q = notional / f;
+                m.insert("avgPx".into(), pad_whole(fmt_units(q, i.px_dec)).into());
+                m.insert("oid".into(), oid.0.into());
+                serde_json::json!({ "filled": with_cloid(m) })
+            }
+        }
+        OrderStatus::Cancelled => Value::String("success".into()),
+        OrderStatus::Rejected(r) => {
+            let e = match r {
+                RejectReason::AloWouldCross { bid, ask } => format!(
+                    "Post only order would have immediately matched, bbo was {}@{}. asset={a}",
+                    bid.map_or_else(|| "None".into(), fmt_px),
+                    ask.map_or_else(|| "None".into(), fmt_px)
+                ),
+                RejectReason::IocNoMatch => {
+                    format!(
+                        "Order could not immediately match against any resting orders. asset={a}"
+                    )
+                }
+                RejectReason::UnknownOrder => {
+                    format!("Order was never placed, already canceled, or filled. asset={a}")
+                }
+                RejectReason::ModifyUnknownOrder => "Cannot modify canceled or filled order".into(),
+                RejectReason::TickSize => {
+                    format!("Price must be divisible by tick size. asset={a}")
+                }
+                RejectReason::InvalidPrice => "Order has invalid price.".into(),
+                RejectReason::LotSize => "Order has invalid size.".into(),
+                other => format!("{other:?}"),
+            };
+            serde_json::json!({ "error": e })
+        }
+        OrderStatus::Unsupported => Value::String("UNSUPPORTED".into()),
+    }
+}
+
+/// Our response for action `i` in native's shape.
+fn response_json(meta: &Meta, b: &Block, i: usize, st: &[OrderStatus], expired: bool) -> Value {
+    if expired {
+        return serde_json::json!({"status":"err","response":"Action already expired"});
+    }
+    let (k, j) = b.acts[i];
+    match k {
+        0 => {
+            let legs = &b.orders[j];
+            let s: Vec<Value> = legs
+                .iter()
+                .zip(st)
+                .map(|(l, &s)| leg_json(meta, l.asset, l.cloid, s))
+                .collect();
+            serde_json::json!({"status":"ok","response":{"type":"order","data":{"statuses":s}}})
+        }
+        1 => {
+            let s: Vec<Value> = b.cancels[j]
+                .iter()
+                .zip(st)
+                .map(|(c, &s)| leg_json(meta, c.asset, None, s))
+                .collect();
+            serde_json::json!({"status":"ok","response":{"type":"cancel","data":{"statuses":s}}})
+        }
+        2 => {
+            let ms = &b.modifies[j];
+            if b.types[i] == "modify" {
+                match st[0] {
+                    OrderStatus::Placed { rested, .. } if rested.0 > 0 => {
+                        serde_json::json!({"status":"ok","response":{"type":"default"}})
+                    }
+                    OrderStatus::Rejected(RejectReason::ModifyUnknownOrder) => {
+                        serde_json::json!({"status":"err","response":"Cannot modify canceled or filled order"})
+                    }
+                    s => {
+                        let l = leg_json(meta, ms[0].order.asset, None, s);
+                        match l.get("error") {
+                            Some(e) => {
+                                serde_json::json!({"status":"err","response":format!("Error placing new order during modify: {}", e.as_str().unwrap_or(""))})
+                            }
+                            None => {
+                                serde_json::json!({"status":"ok","response":{"type":"default"}})
+                            }
+                        }
+                    }
+                }
+            } else {
+                let s: Vec<Value> = ms
+                    .iter()
+                    .zip(st)
+                    .map(|(m, &s)| {
+                        let l = leg_json(meta, m.order.asset, m.order.cloid, s);
+                        match (&s, l.get("error")) {
+                            (OrderStatus::Rejected(RejectReason::ModifyUnknownOrder), _) | (_, None) => l,
+                            (_, Some(e)) => serde_json::json!({"error": format!("Error placing new order during modify: {}", e.as_str().unwrap_or(""))}),
+                        }
+                    })
+                    .collect();
+                serde_json::json!({"status":"ok","response":{"type":"order","data":{"statuses":s}}})
+            }
+        }
+        3 => serde_json::json!({"status":"ok","response":{"type":"default"}}),
+        6 => serde_json::json!({"status":"ok","response":{"type":"setGlobal","data":[]}}),
+        5 => serde_json::json!({"status":"err","response":format!(
+            "User or API Wallet {} does not exist.",
+            signers::addr_hex(&b.unknown_signer[i].unwrap())
+        )}),
+        _ => Value::Null,
+    }
+}
+
+/// Parse a decimal from native's OUTPUT (diffs), which may print trailing
+/// zeros past the asset's decimals ("2923.0" for a 0-decimal coin). Inputs
+/// (order legs) stay on the strict `parse_fixed` path.
+fn parse_out(s: &str, dec: u32) -> u64 {
+    let t = if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        s
+    };
+    if let Some(v) = parse_fixed(t.as_bytes(), dec) {
+        return v;
+    }
+    // Native prints some sizes via f64 ("3748301.7000000002"): round to the
+    // asset's units and require the residual to be float noise only.
+    let f: f64 = s
+        .parse()
+        .unwrap_or_else(|_| panic!("bad native decimal {s}"));
+    let scaled = f * 10f64.powi(dec.cast_signed());
+    let r = scaled.round();
+    assert!(
+        (scaled - r).abs() < 1e-3 && r >= 0.0,
+        "native decimal {s} is not on a {dec}-decimal grid"
+    );
+    r as u64
+}
+
+fn parse_diffs(meta: &Meta, line: &str) -> (u64, Vec<BookDiff>, usize) {
+    let v: Value = serde_json::from_str(line).unwrap();
+    let h = v["block_number"].as_u64().unwrap();
+    let mut out = Vec::new();
+    let mut unknown = 0;
+    for e in v["events"].as_array().unwrap() {
+        let Some(&asset) = meta.by_name.get(e["coin"].as_str().unwrap_or("")) else {
+            unknown += 1;
+            continue;
+        };
+        let info = &meta.by_idx[&asset];
+        let side = match e["side"].as_str() {
+            Some("B" | "Bid") => Side::Bid,
+            _ => Side::Ask,
+        };
+        let px = Px(parse_out(e["px"].as_str().unwrap(), info.px_dec));
+        let sz = |s: &Value| Sz(parse_out(s.as_str().unwrap(), info.sz_dec));
+        let d = &e["raw_book_diff"];
+        let kind = if d == "remove" {
+            DiffKind::Remove
+        } else if let Some(n) = d.get("new") {
+            DiffKind::New {
+                sz: sz(&n["sz"]),
+                insert_before: n["insertBefore"].as_u64().map(Oid),
+            }
+        } else {
+            let u = &d["update"];
+            DiffKind::Update {
+                orig: sz(&u["origSz"]),
+                new: sz(&u["newSz"]),
+            }
+        };
+        out.push(BookDiff {
+            asset,
+            user: user(e["user"].as_str().unwrap_or("")),
+            oid: Oid(e["oid"].as_u64().unwrap()),
+            side,
+            px,
+            kind,
+            cloid: None,
+        });
+    }
+    (h, out, unknown)
+}
+
+/// Native raw book diffs carry no cloid; give each `New` the cloid native's
+/// order statuses report for that oid, so an order adopted by `resync` can
+/// still be cancelled or modified by cloid.
+fn attach_cloids(nd: &[BookDiff], by_oid: &HashMap<u64, Cloid>) -> Vec<BookDiff> {
+    nd.iter()
+        .map(|d| match d.kind {
+            DiffKind::New { .. } => BookDiff {
+                cloid: by_oid.get(&d.oid.0).copied(),
+                ..*d
+            },
+            _ => *d,
+        })
+        .collect()
+}
+
+struct Seed {
+    height: u64,
+    orders: Vec<RestingOrder>,
+    skipped: usize,
+    /// Native's next oid at the seed height, when the seed carries it.
+    next_oid: Option<u64>,
+    /// Assets whose book the seed holds (empty books included).
+    seeded: std::collections::HashSet<Asset>,
+}
+
+fn load_seed(meta: &mut Meta, path: &str) -> Seed {
+    let v: Value = serde_json::from_reader(BufReader::new(File::open(path).unwrap())).unwrap();
+    let h = v[0].as_u64().unwrap();
+    let mut out = Vec::new();
+    let mut skipped = 0;
+    let mut seeded = std::collections::HashSet::new();
+    for cb in v[1].as_array().unwrap() {
+        let coin = cb[0].as_str().unwrap();
+        let Some(asset) = meta
+            .by_name
+            .get(coin)
+            .copied()
+            .or_else(|| meta.add_outcome(coin))
+        else {
+            skipped += 1;
+            continue;
+        };
+        seeded.insert(asset);
+        let info = &meta.by_idx[&asset];
+        for (si, side) in [(0, Side::Bid), (1, Side::Ask)] {
+            for uo in cb[1][si].as_array().unwrap() {
+                let (u, o) = (&uo[0], &uo[1]);
+                if o["isTrigger"].as_bool().unwrap_or(false) {
+                    continue;
+                }
+                out.push(RestingOrder {
+                    asset,
+                    user: user(u.as_str().unwrap()),
+                    oid: Oid(o["oid"].as_u64().unwrap()),
+                    side,
+                    px: Px(
+                        parse_fixed(o["limitPx"].as_str().unwrap().as_bytes(), info.px_dec)
+                            .unwrap(),
+                    ),
+                    sz: Sz(parse_fixed(o["sz"].as_str().unwrap().as_bytes(), info.sz_dec).unwrap()),
+                    cloid: cloid(&o["cloid"]),
+                    t_ms: o["timestamp"].as_u64().unwrap_or(0),
+                });
+            }
+        }
+    }
+    Seed {
+        height: h,
+        orders: out,
+        skipped,
+        next_oid: v[2]["next_oid"].as_u64(),
+        seeded,
+    }
+}
+
+/// Book kind of an internal asset id, as `load_meta` and `add_outcome` assign
+/// them: perp 0..10000 and 100000.., spot 10000..100000, outcome 1e8 + E.
+fn kind(a: Asset) -> &'static str {
+    if a >= OUTCOME_ASSET_BASE {
+        "outcome"
+    } else if (10_000..100_000).contains(&a) {
+        "spot"
+    } else {
+        "perp"
+    }
+}
+
+/// One resting order as compared at the end: (px, oid, user, sz).
+type Leg = (Px, Oid, User, Sz);
+
+/// Compare the engine's books after the last replayed block with an l4so
+/// reference taken at that height. Covers only books both sides hold (the
+/// seed's set); `next_oid` in a reference built from a books cut is max
+/// resting oid + 1, a lower bound, so only `>=` is reported. Per side, legs
+/// are compared in queue order (levels best first, the reference's file
+/// order within a level) and, separately, as a set.
+fn end_state_check(e: &Engine, meta_dir: &str, path: &str, last_seen: u64) {
+    let mut meta = load_meta(meta_dir);
+    let r = load_seed(&mut meta, path);
+    if r.height != last_seen {
+        println!(
+            "end-state check NOT RUN: replay ended at height {last_seen}, reference {path} is at {}",
+            r.height
+        );
+        return;
+    }
+    let mut want: BTreeMap<Asset, [Vec<Leg>; 2]> = BTreeMap::new();
+    for a in &r.seeded {
+        want.entry(*a).or_default();
+    }
+    for o in &r.orders {
+        let si = usize::from(o.side == Side::Ask);
+        want.entry(o.asset).or_default()[si].push((o.px, o.oid, o.user, o.sz));
+    }
+    for v in want.values_mut() {
+        // Best first; a stable sort keeps the file's order within a level.
+        v[0].sort_by_key(|l| std::cmp::Reverse(l.0));
+        v[1].sort_by_key(|l| l.0);
+    }
+    // Coins whose book mapping is carried over, not confirmed by a surviving
+    // oid (`--unconfirmed "#E,#E,.."`): tallied apart, since a difference
+    // there may be the map, not the engine.
+    let unconfirmed: std::collections::HashSet<Asset> = arg("--unconfirmed")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|c| meta.by_name.get(c.trim()).copied())
+        .collect();
+    // Outcome coins whose outcome settled or was created inside the window
+    // (`--window-changed "#E,#E,.."`): the engine does not model the outcome
+    // lifecycle, so they are tallied apart and are never engine findings.
+    let changed: std::collections::HashSet<Asset> = arg("--window-changed")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|c| {
+            let c = c.trim();
+            meta.by_name.get(c).copied().or_else(|| meta.add_outcome(c))
+        })
+        .collect();
+    let label = |a: Asset| {
+        if changed.contains(&a) {
+            "outcome (settled or created in window)"
+        } else if unconfirmed.contains(&a) {
+            "outcome (map unconfirmed)"
+        } else {
+            kind(a)
+        }
+    };
+    println!("end-state check at height {last_seen} against {path} (books both sides hold only):");
+    let mut tally: BTreeMap<&str, [usize; 4]> = BTreeMap::new();
+    let mut shown = 0usize;
+    for (a, w) in &want {
+        let t = tally.entry(label(*a)).or_default();
+        let Some(b) = e.book(*a) else {
+            t[3] += 1;
+            continue;
+        };
+        let mut equal = true;
+        let mut same_set = true;
+        for (si, side) in [(0usize, Side::Bid), (1, Side::Ask)] {
+            let got: Vec<Leg> = b
+                .levels(side)
+                .flat_map(|px| b.queue(side, px).map(|n| (n.px, n.oid, n.user, n.sz)))
+                .collect();
+            if got == w[si] {
+                continue;
+            }
+            equal = false;
+            let key = |l: &Leg| (l.1, l.0, l.3);
+            let mut g: Vec<_> = got.iter().map(key).collect();
+            let mut x: Vec<_> = w[si].iter().map(key).collect();
+            g.sort_unstable();
+            x.sort_unstable();
+            same_set &= g == x;
+            if shown < 20 {
+                shown += 1;
+                let i = got
+                    .iter()
+                    .zip(&w[si])
+                    .position(|(p, q)| p != q)
+                    .unwrap_or(got.len().min(w[si].len()));
+                println!(
+                    "  differs {} asset {a} {side:?}: ours {} legs, reference {}; first differing #{i}: ours {:?} reference {:?}",
+                    label(*a),
+                    got.len(),
+                    w[si].len(),
+                    got.get(i),
+                    w[si].get(i)
+                );
+            }
+        }
+        if equal {
+            t[0] += 1;
+        } else if same_set {
+            t[1] += 1;
+        } else {
+            t[2] += 1;
+        }
+    }
+    // Books the engine holds that the reference lacks: listed as "not in
+    // reference", never as differences.
+    let mut absent: BTreeMap<&str, [usize; 2]> = BTreeMap::new();
+    for b in e.books() {
+        let a = b.asset();
+        if want.contains_key(&a) {
+            continue;
+        }
+        let n = [Side::Bid, Side::Ask]
+            .into_iter()
+            .map(|s| b.levels(s).map(|px| b.queue(s, px).count()).sum::<usize>())
+            .sum::<usize>();
+        let t = absent.entry(label(a)).or_default();
+        t[0] += 1;
+        t[1] += n;
+    }
+    for (k, t) in &tally {
+        println!(
+            "  {k}: {} equal, {} same orders in another queue order, {} differing, {} missing from the engine",
+            t[0], t[1], t[2], t[3]
+        );
+    }
+    for (k, t) in &absent {
+        println!(
+            "  {k}: {} engine books not in reference ({} resting orders), not compared",
+            t[0], t[1]
+        );
+    }
+    let ours = e.next_oid().0;
+    // A counter read from the state at the reference height (`--ref-next-oid`)
+    // is exact, unlike the books cut's max resting oid + 1.
+    if let Some(n) = arg("--ref-next-oid").and_then(|s| s.parse::<u64>().ok()) {
+        println!(
+            "  next_oid (read): ours {ours}, reference {n}: {}",
+            if ours == n {
+                "equal".to_owned()
+            } else {
+                format!("ours - reference = {}", i128::from(ours) - i128::from(n))
+            }
+        );
+    }
+    match r.next_oid {
+        Some(n) => println!(
+            "  next_oid: ours {ours}, reference {n} (lower bound when inferred): ours {} it",
+            if ours >= n { ">=" } else { "<" }
+        ),
+        None => println!("  next_oid: ours {ours}, reference has none"),
+    }
+}
+
+/// Native order-status events by oid (`--cancel-log` only): (height, status,
+/// order type), with the strings interned; and oids per (user, cloid).
+#[derive(Default)]
+struct StatusIdx {
+    by_oid: HashMap<u64, Vec<(u64, u16, u16)>>,
+    by_cloid: HashMap<([u8; 20], u128), Vec<u64>>,
+    names: Vec<String>,
+    ids: HashMap<String, u16>,
+}
+
+impl StatusIdx {
+    fn intern(&mut self, s: String) -> u16 {
+        if let Some(&i) = self.ids.get(&s) {
+            return i;
+        }
+        let i = u16::try_from(self.names.len()).expect("< 65536 distinct names");
+        self.names.push(s.clone());
+        self.ids.insert(s, i);
+        i
+    }
+
+    fn add(&mut self, h: u64, s: &Value) {
+        let o = &s["order"];
+        let Some(oid) = o["oid"].as_u64() else {
+            return;
+        };
+        let f = |v: &Value| match v {
+            Value::Null => "?".to_string(),
+            Value::String(x) => x.clone(),
+            other => other.to_string(),
+        };
+        let typ = format!(
+            "{} tif={} trigger={} reduceOnly={} positionTpsl={} children={}",
+            f(&o["orderType"]),
+            f(&o["tif"]),
+            f(&o["isTrigger"]),
+            f(&o["reduceOnly"]),
+            f(&o["isPositionTpsl"]),
+            o["children"].as_array().map_or(0, Vec::len)
+        );
+        let st = self.intern(f(&s["status"]));
+        let ty = self.intern(typ);
+        let hist = self.by_oid.entry(oid).or_default();
+        let first_seen = hist.is_empty();
+        hist.push((h, st, ty));
+        if first_seen {
+            if let (Some(u), Some(c)) = (s["user"].as_str(), cloid(&o["cloid"])) {
+                self.by_cloid.entry((user(u).0, c.0)).or_default().push(oid);
+            }
+        }
+    }
+
+    fn event(&self, e: &(u64, u16, u16)) -> Value {
+        serde_json::json!({
+            "h": e.0,
+            "status": self.names[usize::from(e.1)],
+            "type": self.names[usize::from(e.2)],
+        })
+    }
+}
+
+/// Whether a native response names `oid` or `cloid` anywhere.
+fn names_target(v: &Value, oid: Option<u64>, cl: Option<&str>) -> bool {
+    match v {
+        Value::Object(m) => {
+            if oid.is_some() && m.get("oid").and_then(Value::as_u64) == oid {
+                return true;
+            }
+            if let (Some(c), Some(x)) = (cl, m.get("cloid").and_then(Value::as_str)) {
+                if x.eq_ignore_ascii_case(c) {
+                    return true;
+                }
+            }
+            m.values().any(|x| names_target(x, oid, cl))
+        }
+        Value::Array(a) => a.iter().any(|x| names_target(x, oid, cl)),
+        _ => false,
+    }
+}
+
+/// `--cancel-log`: one JSON line per cancel leg whose response differs from
+/// native's. Returns (legs written, legs of the block's first mismatch).
+#[allow(clippy::too_many_arguments)]
+fn log_cancels(
+    w: &mut impl std::io::Write,
+    meta: &Meta,
+    b: &Block,
+    out: &hl_exec::BlockOutcome,
+    seeded: &HashSet<Asset>,
+    seed_oids: &HashSet<u64>,
+    sidx: &StatusIdx,
+    first_bad_act: Option<usize>,
+) -> (usize, usize) {
+    let (mut legs, mut firsts) = (0usize, 0usize);
+    for i in 0..b.acts.len() {
+        let (kd, j) = b.acts[i];
+        let expired = out.responses[i].expired;
+        if kd != 1 || expired {
+            continue;
+        }
+        let st = out.statuses_of(i);
+        let ours = response_json(meta, b, i, st, expired);
+        let nat = &b.native[i];
+        let nat_legs = nat["response"]["data"]["statuses"].as_array();
+        for (l, c) in b.cancels[j].iter().enumerate() {
+            let o_leg = &ours["response"]["data"]["statuses"][l];
+            let n_leg = nat_legs.and_then(|v| v.get(l)).unwrap_or(nat);
+            if o_leg == n_leg {
+                continue;
+            }
+            let (target, oids, cl_hex) = match c.target {
+                OrderRef::Oid(o) => (format!("oid:{}", o.0), vec![o.0], None),
+                OrderRef::Cloid(cl) => {
+                    let hx = format!("0x{:032x}", cl.0);
+                    let v = sidx
+                        .by_cloid
+                        .get(&(b.users[i].0, cl.0))
+                        .cloned()
+                        .unwrap_or_default();
+                    (format!("cloid:{hx}"), v, Some(hx))
+                }
+            };
+            let first_oid = match c.target {
+                OrderRef::Oid(o) => Some(o.0),
+                OrderRef::Cloid(_) => None,
+            };
+            let earlier: Vec<Value> = (0..i)
+                .filter(|&p| b.users[p] == b.users[i])
+                .filter(|&p| {
+                    names_target(&b.native[p], first_oid, cl_hex.as_deref())
+                        || oids
+                            .iter()
+                            .any(|&o| names_target(&b.native[p], Some(o), None))
+                })
+                .map(|p| {
+                    serde_json::json!({
+                        "act": p,
+                        "type": b.types[p],
+                        "ours_unsupported": b.acts[p].0 == 4
+                            || out.statuses_of(p).contains(&OrderStatus::Unsupported),
+                    })
+                })
+                .collect();
+            let status: Vec<Value> = oids
+                .iter()
+                .map(|o| {
+                    let hist = sidx.by_oid.get(o).map_or(&[][..], Vec::as_slice);
+                    let prior = hist.iter().rev().find(|e| e.0 < b.height);
+                    let at: Vec<Value> = hist
+                        .iter()
+                        .filter(|e| e.0 == b.height)
+                        .map(|e| sidx.event(e))
+                        .collect();
+                    let after = hist.iter().find(|e| e.0 > b.height);
+                    serde_json::json!({
+                        "oid": o,
+                        "in_seed": seed_oids.contains(o),
+                        "prior": prior.map(|e| sidx.event(e)),
+                        "at": at,
+                        "after": after.map(|e| sidx.event(e)),
+                    })
+                })
+                .collect();
+            let first = first_bad_act == Some(i);
+            legs += 1;
+            firsts += usize::from(first);
+            let rec = serde_json::json!({
+                "h": b.height,
+                "act": i,
+                "leg": l,
+                "type": b.types[i],
+                "user": signers::addr_hex(&b.users[i].0),
+                "asset": c.asset,
+                "book": kind(c.asset),
+                "seeded": seeded.contains(&c.asset),
+                "target": target,
+                "ours": o_leg,
+                "native": n_leg,
+                "first": first,
+                "earlier_in_block": earlier,
+                "targets": status,
+            });
+            writeln!(w, "{rec}").unwrap();
+        }
+    }
+    (legs, firsts)
+}
+
+fn arg(name: &str) -> Option<String> {
+    let a: Vec<String> = std::env::args().collect();
+    a.iter()
+        .position(|x| x == name)
+        .and_then(|i| a.get(i + 1).cloned())
+}
+
+fn flag(name: &str) -> bool {
+    std::env::args().any(|x| x == name)
+}
+
+fn main() {
+    let mut meta = load_meta(&arg("--meta").expect("--meta"));
+    let max: usize = arg("--max").map_or(usize::MAX, |s| s.parse().unwrap());
+    let show: usize = arg("--show").map_or(5, |s| s.parse().unwrap());
+    let Seed {
+        height: seed_h,
+        orders: seed,
+        skipped,
+        next_oid: seed_next,
+        seeded,
+    } = load_seed(&mut meta, &arg("--seed").expect("--seed"));
+    let meta = meta;
+    eprintln!(
+        "seed height {seed_h}: {} resting orders in {} books, {skipped} coins not in meta, next_oid {seed_next:?}",
+        seed.len(),
+        seeded.len()
+    );
+    let assets: Vec<Asset> = meta.by_idx.keys().copied().collect();
+    let max_oid = seed.iter().map(|o| o.oid.0).max().unwrap_or(0);
+    let cancel_log_path = arg("--cancel-log");
+    let seed_oids: HashSet<u64> = if cancel_log_path.is_some() {
+        seed.iter().map(|o| o.oid.0).collect()
+    } else {
+        HashSet::new()
+    };
+    let mut e = Engine::from_l4_snapshot(
+        &assets,
+        seed,
+        Some(Oid(seed_next.unwrap_or(max_oid + 1))),
+        Capacity::default(),
+        EngineConfig::default(),
+    )
+    .expect("seed loads");
+    assert!(e.check_invariants());
+    // Blocks are decoded one at a time inside the loop (2,000 decoded blocks
+    // hold ~8 GB of native responses); only execute_block is timed.
+    let rep = BufReader::new(File::open(arg("--replica").expect("--replica")).unwrap());
+    let first = seed_h + 1;
+    let last = if max == usize::MAX {
+        u64::MAX
+    } else {
+        seed_h + max as u64
+    };
+    let mut native_diffs: BTreeMap<u64, (Vec<BookDiff>, usize)> = BTreeMap::new();
+    let mut unseeded_diffs: HashMap<u64, usize> = HashMap::new();
+    for line in BufReader::new(File::open(arg("--diffs").expect("--diffs")).unwrap()).lines() {
+        let line = line.unwrap();
+        let (h, d, unk) = parse_diffs(&meta, &line);
+        if h < first || h > last {
+            continue;
+        }
+        // Diffs on books the seed does not hold are not compared or adopted;
+        // the block is flagged unseeded-book instead.
+        let (keep, drop): (Vec<BookDiff>, Vec<BookDiff>) =
+            d.into_iter().partition(|x| seeded.contains(&x.asset));
+        if !drop.is_empty() {
+            *unseeded_diffs.entry(h).or_default() += drop.len();
+        }
+        let ent = native_diffs.entry(h).or_default();
+        ent.0.extend(keep);
+        ent.1 += unk;
+    }
+    // Native next-oid per block from statuses (resync path only).
+    let mut status_max: HashMap<u64, u64> = HashMap::new();
+    // Native cloid per oid from statuses (raw book diffs carry none).
+    let mut status_cloids: HashMap<u64, Cloid> = HashMap::new();
+    // `--cancel-log` only: every status event per oid, and oids per (user, cloid).
+    let mut sidx = StatusIdx::default();
+    if cancel_log_path.is_some() {
+        assert!(arg("--statuses").is_some(), "--cancel-log needs --statuses");
+    }
+    if let Some(p) = arg("--statuses") {
+        for line in BufReader::new(File::open(p).unwrap()).lines() {
+            let v: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            let h = v["block_number"].as_u64().unwrap();
+            if h < first || h > last {
+                continue;
+            }
+            let evs = v["events"].as_array().unwrap();
+            if cancel_log_path.is_some() {
+                for s in evs {
+                    sidx.add(h, s);
+                }
+            }
+            for s in evs {
+                if let (Some(o), Some(c)) =
+                    (s["order"]["oid"].as_u64(), cloid(&s["order"]["cloid"]))
+                {
+                    status_cloids.insert(o, c);
+                }
+            }
+            let m = evs
+                .iter()
+                .filter_map(|s| s["order"]["oid"].as_u64())
+                .max()
+                .unwrap_or(0);
+            let ent = status_max.entry(h).or_default();
+            *ent = (*ent).max(m);
+        }
+    }
+    let mut wallet_rule = arg("--signers").map(|p| {
+        let set = signers::Signers::from_reader(BufReader::new(File::open(&p).unwrap()));
+        eprintln!("signers: {} addresses from {p}", set.len());
+        WalletRule {
+            set,
+            ctx: secp256k1::Secp256k1::verification_only(),
+            not_recovered: 0,
+            agents_added: 0,
+        }
+    });
+    // Unknown-wallet rule tallies over counted blocks: (native says absent,
+    // we said absent), native absent only, we absent only.
+    let (mut uw_both, mut uw_missed, mut uw_false) = (0usize, 0usize, 0usize);
+    // `--wallet-log FILE`: every action where the rule and native disagree
+    // (height, action index, type, recovered signer or -, our verdict, native).
+    let mut wallet_log = arg("--wallet-log").map(|p| {
+        let mut w = std::io::BufWriter::new(File::create(p).unwrap());
+        writeln!(w, "height\tact\ttype\tsigner\tours\tnative").unwrap();
+        w
+    });
+    let mut cancel_log = cancel_log_path
+        .as_ref()
+        .map(|p| std::io::BufWriter::new(File::create(p).unwrap()));
+    let (mut cl_legs, mut cl_first) = (0usize, 0usize);
+    let mut k = 0usize;
+    // (height, verdict): "reproduced" or the block's mismatch classes.
+    let mut verdicts: Vec<(u64, String)> = Vec::new();
+    let mut classes: BTreeMap<String, usize> = BTreeMap::new();
+    let mut examples: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut times_ns: Vec<u64> = Vec::new();
+    let mut counted_ns: Vec<u64> = Vec::new();
+    let mut global_max_oid = max_oid;
+    let empty = (Vec::new(), 0usize);
+    let (mut n, mut first_seen, mut last_seen) = (0usize, 0u64, 0u64);
+    for line in rep.lines() {
+        if n >= max {
+            break;
+        }
+        let b = &decode_block(&meta, &line.unwrap(), wallet_rule.as_mut());
+        if b.height <= seed_h {
+            continue;
+        }
+        if n == 0 {
+            first_seen = b.height;
+        }
+        last_seen = b.height;
+        n += 1;
+        let acts = b.actions();
+        let t0 = Instant::now();
+        let out = e.execute_block_bundled(b.time_ms, &acts, &b.expires, &b.bundle_lens);
+        let ns = t0.elapsed().as_nanos() as u64;
+        times_ns.push(ns);
+        let mut why: Vec<String> = Vec::new();
+        // A block touching a book the seed does not hold cannot count.
+        if b.assets.iter().any(|a| !seeded.contains(a)) || unseeded_diffs.contains_key(&b.height) {
+            why.push("unseeded-book".into());
+        }
+        if out.has_unsupported {
+            let mut kinds: Vec<&str> = b
+                .acts
+                .iter()
+                .zip(&b.types)
+                .filter(|(a, _)| a.0 == 4)
+                .map(|(_, t)| t.as_str())
+                .collect();
+            kinds.sort_unstable();
+            kinds.dedup();
+            why.push(format!(
+                "unsupported:{}",
+                kinds.first().copied().unwrap_or("leg")
+            ));
+        }
+        if out.oid_mismatches > 0 {
+            why.push("oid-hint".into());
+        }
+        let mut resp_bad = None;
+        let mut first_bad_act: Option<usize> = None;
+        let mut unknown_wallet = false;
+        let mut uw_class: Option<&str> = None;
+        for i in 0..b.acts.len() {
+            let expired = out.responses[i].expired;
+            if b.acts[i].0 == 4 && !expired {
+                continue;
+            }
+            // A leg the engine answered `Unsupported` already keeps the block
+            // out of k; compare the next action instead.
+            if out.statuses_of(i).contains(&OrderStatus::Unsupported) {
+                continue;
+            }
+            // An action on a book the seed lacks cannot match (the block is
+            // already unseeded-book); classify the next one instead.
+            let (a0, a1) = b.act_assets[i];
+            if b.assets[a0..a1].iter().any(|a| !seeded.contains(a)) {
+                continue;
+            }
+            let ours = response_json(&meta, b, i, out.statuses_of(i), expired);
+            let native_unknown = b.native[i]["status"] == "err"
+                && b.native[i]["response"].as_str().is_some_and(|r| {
+                    r.starts_with("User or API Wallet ") && r.ends_with(" does not exist.")
+                });
+            if wallet_rule.is_some() {
+                let ours_unknown = b.acts[i].0 == 5;
+                match (native_unknown, ours_unknown) {
+                    (true, true) => uw_both += 1,
+                    (true, false) => uw_missed += 1,
+                    (false, true) => uw_false += 1,
+                    (false, false) => {}
+                }
+                if ours != b.native[i] && (native_unknown || ours_unknown) {
+                    if let Some(w) = wallet_log.as_mut() {
+                        writeln!(
+                            w,
+                            "{}\t{i}\t{}\t{}\t{}\t{}",
+                            b.height,
+                            b.types[i],
+                            b.signer[i].map_or_else(|| "-".into(), |a| signers::addr_hex(&a)),
+                            if ours_unknown { "absent" } else { "present" },
+                            b.native[i]
+                        )
+                        .unwrap();
+                    }
+                    // A rule miss gets its own class; keep comparing.
+                    uw_class.get_or_insert(if !ours_unknown {
+                        if b.signer[i].is_some() {
+                            "resp:unknown-wallet-missed"
+                        } else {
+                            "resp:unknown-wallet-unruled"
+                        }
+                    } else if native_unknown {
+                        "resp:unknown-wallet-text"
+                    } else {
+                        "resp:unknown-wallet-false"
+                    });
+                    continue;
+                }
+            }
+            // Native rejects an action whose signer is not a known user or
+            // agent (an account-side check the engine does not model). It
+            // keeps the block out of k under its own class; keep comparing.
+            if ours != b.native[i]
+                && b.native[i]["status"] == "err"
+                && b.native[i]["response"].as_str().is_some_and(|r| {
+                    r.starts_with("User or API Wallet ") && r.ends_with(" does not exist.")
+                })
+            {
+                unknown_wallet = true;
+                continue;
+            }
+            if ours != b.native[i] {
+                first_bad_act = Some(i);
+                resp_bad = Some(format!(
+                    "h{} act{i} {}: ours {} native {}",
+                    b.height, b.types[i], ours, b.native[i]
+                ));
+                break;
+            }
+        }
+        if unknown_wallet {
+            why.push("resp:unknown-wallet".into());
+        }
+        if let Some(w) = cancel_log.as_mut() {
+            let (l, f) = log_cancels(w, &meta, b, out, &seeded, &seed_oids, &sidx, first_bad_act);
+            cl_legs += l;
+            cl_first += f;
+        }
+        if let Some(c) = uw_class {
+            why.push(c.into());
+        }
+        if let Some(ex) = resp_bad {
+            let cls = if ex.contains("Post only") {
+                "resp:alo"
+            } else if ex.contains("never placed") {
+                "resp:cancel-unknown"
+            } else if ex.contains("\"filled\"") {
+                "resp:filled"
+            } else if ex.contains("\"resting\"") {
+                "resp:resting"
+            } else if ex.contains("modify") {
+                "resp:modify"
+            } else {
+                "resp:other"
+            };
+            why.push(cls.into());
+            let v = examples.entry(cls.into()).or_default();
+            if v.len() < show {
+                v.push(ex);
+            }
+        }
+        let (nd, unk) = native_diffs.get(&b.height).unwrap_or(&empty);
+        if *unk > 0 {
+            why.push("diffs:unmodelled-coin".into());
+        }
+        let ours_d: Vec<BookDiff> = out
+            .diffs
+            .iter()
+            .filter(|d| seeded.contains(&d.asset))
+            .map(|d| BookDiff { cloid: None, ..*d })
+            .collect();
+        if &ours_d != nd {
+            let mut a = ours_d.clone();
+            let mut c = nd.clone();
+            let key = |d: &BookDiff| {
+                (
+                    d.asset,
+                    d.oid.0,
+                    d.side == Side::Bid,
+                    d.px.0,
+                    format!("{:?}", d.kind),
+                )
+            };
+            a.sort_by_key(key);
+            c.sort_by_key(key);
+            let cls = if a == c {
+                "diffs:order"
+            } else {
+                "diffs:content"
+            };
+            why.push(cls.into());
+            let v = examples.entry(cls.into()).or_default();
+            if v.len() < show {
+                let first_bad = ours_d
+                    .iter()
+                    .zip(nd.iter())
+                    .position(|(x, y)| x != y)
+                    .unwrap_or(ours_d.len().min(nd.len()));
+                v.push(format!(
+                    "h{} n_ours={} n_native={} first differing #{first_bad}: ours {:?} native {:?}",
+                    b.height,
+                    ours_d.len(),
+                    nd.len(),
+                    ours_d.get(first_bad),
+                    nd.get(first_bad)
+                ));
+            }
+        }
+        for d in nd {
+            if matches!(d.kind, DiffKind::New { .. }) {
+                global_max_oid = global_max_oid.max(d.oid.0);
+            }
+        }
+        if let Some(&m) = status_max.get(&b.height) {
+            global_max_oid = global_max_oid.max(m);
+        }
+        if why.is_empty() {
+            k += 1;
+            verdicts.push((b.height, "reproduced".into()));
+            counted_ns.push(ns);
+        } else {
+            for w in &why {
+                *classes.entry(w.clone()).or_default() += 1;
+            }
+            verdicts.push((b.height, why.join(",")));
+            // Adopt native's book and counter (non-reproduced block only).
+            if let Err(err) = e.resync(&attach_cloids(nd, &status_cloids)) {
+                eprintln!("h{}: resync failed: {err:?}; stopping", b.height);
+                break;
+            }
+            e.set_next_oid(Oid(global_max_oid + 1));
+        }
+    }
+    println!("blocks N={n} heights {first_seen}..={last_seen}  reproduced k={k}");
+    if flag("--set-global-const") {
+        println!("label: set-global-const (SetGlobalAction answered with native's constant)");
+    }
+    if let Some(mut w) = cancel_log {
+        w.flush().unwrap();
+        println!(
+            "cancel log: {cl_legs} mismatching cancel legs, {cl_first} of them in the block's first mismatching action"
+        );
+    }
+    if let Some(r) = &wallet_rule {
+        println!(
+            "unknown-wallet rule (actions the comparison reached): both absent {uw_both}, native absent only {uw_missed}, ours absent only {uw_false}; L1 signatures not recovered {}; agents added {}; set now {}",
+            r.not_recovered,
+            r.agents_added,
+            r.set.len()
+        );
+    }
+    // The engine's own score: blocks whose every action and native diff is on
+    // a book the seed holds (and, second, with no action the engine skips).
+    let held = |v: &str| !v.contains("unseeded-book") && !v.contains("diffs:unmodelled-coin");
+    let n_held = verdicts.iter().filter(|(_, v)| held(v)).count();
+    let n_held_modelled = verdicts
+        .iter()
+        .filter(|(_, v)| held(v) && !v.contains("unsupported:"))
+        .count();
+    println!(
+        "held books only: k={k} of N={n_held}; and no unsupported action: k={k} of N={n_held_modelled}"
+    );
+    if let Some(p) = arg("--end-state") {
+        end_state_check(&e, &arg("--meta").expect("--meta"), &p, last_seen);
+    }
+    if let Some(p) = arg("--heights-out") {
+        let body = verdicts
+            .iter()
+            .map(|(h, v)| format!("{h}\t{v}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&p, body).unwrap();
+        println!("per-block verdicts (height TAB reproduced|classes) written to {p}");
+    }
+    println!("non-reproduced blocks by class (a block can be in several):");
+    let mut cl: Vec<_> = classes.into_iter().collect();
+    cl.sort_by_key(|c| std::cmp::Reverse(c.1));
+    for (c, v) in &cl {
+        println!("  {v:6}  {c}");
+    }
+    for (c, ex) in &examples {
+        println!("examples {c}:");
+        for x in ex {
+            println!("    {}", &x[..x.len().min(700)]);
+        }
+    }
+    let stat = |v: &mut Vec<u64>, label: &str| {
+        if v.is_empty() {
+            return;
+        }
+        v.sort_unstable();
+        let q = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize];
+        let mean = v.iter().sum::<u64>() / v.len() as u64;
+        println!(
+            "execute_block ns ({label}, n={}): median {} p90 {} p99 {} max {} mean {}",
+            v.len(),
+            q(0.5),
+            q(0.9),
+            q(0.99),
+            v[v.len() - 1],
+            mean
+        );
+    };
+    stat(&mut times_ns, "all blocks");
+    stat(&mut counted_ns, "reproduced blocks");
+    assert!(e.check_invariants(), "engine invariants after replay");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn diff(oid: u64, kind: DiffKind) -> BookDiff {
+        BookDiff {
+            asset: 0,
+            user: User([7; 20]),
+            oid: Oid(oid),
+            side: Side::Bid,
+            px: Px(100),
+            kind,
+            cloid: None,
+        }
+    }
+
+    /// Native raw book diffs carry no cloid. An order adopted by resync must
+    /// get its cloid from native's order statuses, or a later cancelByCloid
+    /// of it is answered "never placed" (1,507 of 2,000 blocks before).
+    fn meta_one(a: Asset, sz_dec: u32, px_dec: u32) -> Meta {
+        Meta {
+            by_idx: HashMap::from([(a, AssetInfo { sz_dec, px_dec })]),
+            by_name: HashMap::new(),
+        }
+    }
+
+    fn leg(a: Asset, p: &str, s: &str) -> Value {
+        serde_json::json!({"a": a, "b": true, "p": p, "s": s, "r": false,
+            "t": {"limit": {"tif": "Gtc"}}})
+    }
+
+    /// Price "0" is native's "Order has invalid price.", ahead of the
+    /// minimum-value check; a non-zero price under $10 notional stays
+    /// unsupported (min notional is not modelled).
+    #[test]
+    fn price_zero_is_invalid_price_before_min_value() {
+        let meta = meta_one(159, 2, 4); // HYPE: szDecimals 2, 6 - 2 price decimals
+        for p in ["0", "0.0"] {
+            let (r, unsupported) = decode_leg(&meta, &leg(159, p, "1.5"), 0);
+            assert_eq!(r.pre_reject, Some(RejectReason::InvalidPrice), "price {p}");
+            assert!(!unsupported, "price {p} is answered, not unsupported");
+            assert_eq!(
+                leg_json(
+                    &meta,
+                    159,
+                    None,
+                    OrderStatus::Rejected(RejectReason::InvalidPrice)
+                ),
+                serde_json::json!({"error": "Order has invalid price."})
+            );
+        }
+        let (r, unsupported) = decode_leg(&meta, &leg(159, "1.5", "1"), 0);
+        assert_eq!(r.pre_reject, None);
+        assert!(unsupported, "$1.50 notional: min value not modelled");
+        let (r, unsupported) = decode_leg(&meta, &leg(159, "30", "1"), 0);
+        assert_eq!(r.pre_reject, None);
+        assert!(!unsupported, "$30 notional is modelled");
+    }
+
+    fn filled(meta: &Meta, a: Asset, filled: u64, notional: u128) -> Value {
+        let st = OrderStatus::Placed {
+            oid: Oid(9),
+            filled: Sz(filled),
+            notional,
+            rested: Sz(0),
+        };
+        leg_json(meta, a, None, st)["filled"].clone()
+    }
+
+    /// avgPx is floored to the price grid, not rounded half-up (lane 3's R2:
+    /// 1232430012 ENA, VWAP 0.1015239763, native "0.101523").
+    #[test]
+    fn avg_px_floors_to_the_price_grid() {
+        let meta = meta_one(7, 0, 6); // ENA: szDecimals 0, grid 6 decimals
+        let f = filled(&meta, 7, 10_000, 1_015_239_763);
+        assert_eq!(f["avgPx"], "0.101523", "floor, not half-up 0.101524");
+        // Exactly on the grid: unchanged.
+        let f = filled(&meta, 7, 4, 4 * 101_523);
+        assert_eq!(f["avgPx"], "0.101523");
+    }
+
+    /// A whole-number avgPx prints with ".0" (native: 991 whole-number avgPx
+    /// in lane 3's R2, all with ".0"); a non-whole one and totalSz are
+    /// unchanged.
+    #[test]
+    fn avg_px_whole_number_prints_point_zero() {
+        let meta = meta_one(7, 2, 4); // szDecimals 2, price grid 4 decimals
+                                      // 3 lots of 0.01 at px 1710.0000: avgPx 1710 -> "1710.0".
+        let f = filled(&meta, 7, 3, 3 * 1710_0000);
+        assert_eq!(f["avgPx"], "1710.0");
+        assert_eq!(f["totalSz"], "0.03");
+        // Non-whole avgPx: unchanged, trailing zeros trimmed as before.
+        let f = filled(&meta, 7, 100, 100 * 1710_5000);
+        assert_eq!(f["avgPx"], "1710.5");
+        assert_eq!(f["totalSz"], "1.0", "whole totalSz keeps its \".0\"");
+        let f = filled(&meta, 7, 250, 250 * 1234);
+        assert_eq!(f["avgPx"], "0.1234");
+        assert_eq!(f["totalSz"], "2.5");
+    }
+
+    #[test]
+    fn resync_diffs_get_cloids_from_native_statuses() {
+        let new = DiffKind::New {
+            sz: Sz(5),
+            insert_before: None,
+        };
+        let nd = [diff(5, new), diff(6, new), diff(5, DiffKind::Remove)];
+        let by_oid = HashMap::from([(5u64, Cloid(42))]);
+        let out = attach_cloids(&nd, &by_oid);
+        assert_eq!(out[0].cloid, Some(Cloid(42)));
+        assert_eq!(out[1].cloid, None, "no status cloid: stays None");
+        assert_eq!(out[2].cloid, None, "only New diffs rest an order");
+        assert_eq!(
+            out.iter().map(|d| (d.oid, d.kind)).collect::<Vec<_>>(),
+            nd.iter().map(|d| (d.oid, d.kind)).collect::<Vec<_>>()
+        );
+    }
+
+    /// `--cancel-log` lookups: a target named by oid or cloid anywhere in a
+    /// native response, and a status index keyed by oid and (user, cloid).
+    #[test]
+    fn cancel_log_lookups() {
+        let r: Value = serde_json::from_str(
+            r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"x"},{"resting":{"oid":42,"cloid":"0x000000000000000000000000000000AB"}}]}}}"#,
+        )
+        .unwrap();
+        assert!(names_target(&r, Some(42), None));
+        assert!(!names_target(&r, Some(43), None));
+        assert!(names_target(
+            &r,
+            None,
+            Some("0x000000000000000000000000000000ab")
+        ));
+        let mut ix = StatusIdx::default();
+        let ev = |st: &str| {
+            serde_json::json!({"status": st, "user": "0x0707070707070707070707070707070707070707",
+                "order": {"oid": 42, "cloid": "0x000000000000000000000000000000ab",
+                    "orderType": "Stop Market", "isTrigger": true, "reduceOnly": true,
+                    "isPositionTpsl": false, "tif": null, "children": []}})
+        };
+        ix.add(10, &ev("open"));
+        ix.add(12, &ev("canceled"));
+        let h = &ix.by_oid[&42];
+        assert_eq!(h.len(), 2);
+        assert_eq!(ix.event(&h[0])["status"], "open");
+        assert_eq!(
+            ix.event(&h[1])["type"],
+            "Stop Market tif=? trigger=true reduceOnly=true positionTpsl=false children=0"
+        );
+        assert_eq!(ix.by_cloid[&([7; 20], 0xab)], vec![42]);
+    }
+}

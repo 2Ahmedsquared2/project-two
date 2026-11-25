@@ -1,0 +1,819 @@
+{
+  "format": 1,
+  "toolchain": "leanprover/lean4:v4.35.0",
+  "module": "Model.HlBook",
+  "declarations": [
+    {
+      "name": "HlBook.At",
+      "kind": "definition",
+      "type": "List HlBook.Order → Option (Nat × Nat) → HlBook.Key → Prop",
+      "typeHash": "0b893709377c3ace613c06f4b570154e8c43710b0c689953597f3b8ac5048b54",
+      "valueHash": "8e24a380e82951fc30b5f8d9e04909fa6f1a208c42c7eeb973a36824608484d1"
+    },
+    {
+      "name": "HlBook.Inv",
+      "kind": "definition",
+      "type": "List HlBook.Order → HlBook.View → Prop",
+      "typeHash": "fe3387e8370a97615051722a3b7d9a80e9a7d7f43d647848222c5d8bca6c2275",
+      "valueHash": "cb3608edbc02ccc4a9ea75771fb552bf9c14dba94f175506c5dc51f62db3722c"
+    },
+    {
+      "name": "HlBook.Key",
+      "kind": "definition",
+      "type": "Type",
+      "typeHash": "7051ab654d793c216d744f7920d98d672357a0efa67248ee75d146d668f60997",
+      "valueHash": "2e6d8480d5b2343900573d5f17d6eb8de5f60e769018c059b6dc7e88f09ceca0"
+    },
+    {
+      "name": "HlBook.Op",
+      "kind": "inductive",
+      "type": "Type",
+      "typeHash": "7051ab654d793c216d744f7920d98d672357a0efa67248ee75d146d668f60997",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.cancel",
+      "kind": "constructor",
+      "type": "Nat → HlBook.Op",
+      "typeHash": "4fd7ba6a97052c1e655c0d44494486dad0f29f0a4387fd47080bc06e00b02135",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.cancel.elim",
+      "kind": "definition",
+      "type": "{motive : HlBook.Op → Sort u} → (t : HlBook.Op) → t.ctorIdx = 2 → ((oid : Nat) → motive (HlBook.Op.cancel oid)) → motive t",
+      "typeHash": "17ea91062f6b82e20066fe0a75d396a52c055f99bfc025703f079a7491e22be5",
+      "valueHash": "ef1b66be381c1932ed3875168be4eec07b644d065ae9c55f09810297de9672cb"
+    },
+    {
+      "name": "HlBook.Op.cancel.inj",
+      "kind": "theorem",
+      "type": "∀ {oid oid_1 : Nat}, HlBook.Op.cancel oid = HlBook.Op.cancel oid_1 → oid = oid_1",
+      "typeHash": "7e1d69f138288f973c17cf6df406f7e78b934acb9bb9ab6ee069db988d111de1",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.cancel.injEq",
+      "kind": "theorem",
+      "type": "∀ (oid oid_1 : Nat), (HlBook.Op.cancel oid = HlBook.Op.cancel oid_1) = (oid = oid_1)",
+      "typeHash": "0ed2031d902e208656bbc7a61760782f979a5218f15e655380dbca9ebcfadf50",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.cancel.noConfusion",
+      "kind": "definition",
+      "type": "{P : Sort u} → {oid oid' : Nat} → HlBook.Op.cancel oid = HlBook.Op.cancel oid' → (oid = oid' → P) → P",
+      "typeHash": "4057913079fa9b2a7515f432690523c0bb311a4b6f3023233f800aaef2b22baa",
+      "valueHash": "623b011d6c0e9ae0bd749b33d779fb208af738e1351436d92b30a2cdfa660070"
+    },
+    {
+      "name": "HlBook.Op.cancel.sizeOf_spec",
+      "kind": "theorem",
+      "type": "∀ (oid : Nat), sizeOf (HlBook.Op.cancel oid) = 1 + sizeOf oid",
+      "typeHash": "6cb4af30920f01906ddf002057d80fba0bf89789e2c7de6f2fa0d76a26c4e70a",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.casesOn",
+      "kind": "definition",
+      "type": "{motive : HlBook.Op → Sort u} → (t : HlBook.Op) → ((o : HlBook.Order) → motive (HlBook.Op.rest o)) → ((i : Nat) → (o : HlBook.Order) → motive (HlBook.Op.restAt i o)) → ((oid : Nat) → motive (HlBook.Op.cancel oid)) → ((oid sz : Nat) → motive (HlBook.Op.resize oid sz)) → ((bid : Bool) → (px sz : Nat) → motive (HlBook.Op.take1 bid px sz)) → motive t",
+      "typeHash": "db0a3bdfbb763800e0115c6f7130fbe2891fb66121566ce93e224a96f0eb31f4",
+      "valueHash": "80796e6978265745cb1a3367c8d2eba2295ad18bd157a2500809547d550f7b68"
+    },
+    {
+      "name": "HlBook.Op.ctorElim",
+      "kind": "definition",
+      "type": "{motive : HlBook.Op → Sort u} → (ctorIdx : Nat) → (t : HlBook.Op) → ctorIdx = t.ctorIdx → HlBook.Op.ctorElimType ctorIdx → motive t",
+      "typeHash": "b54459058663ec89426dfffabcce3c92e52a5ee7cfd08204f79b60d09530b1c5",
+      "valueHash": "b63173b3572a97af65633755f77ace6d72570008237106fe4fdeacae5151a284"
+    },
+    {
+      "name": "HlBook.Op.ctorElimType",
+      "kind": "definition",
+      "type": "{motive : HlBook.Op → Sort u} → Nat → Sort (max 1 u)",
+      "typeHash": "9ba48c1ead42f235221b190f415540035801b0e598679759289a3d715f30b95d",
+      "valueHash": "bafb10d1a99f1fa4d1d3a0c356b82f93238ab2f41251e4b44c684e10c0e9b30b"
+    },
+    {
+      "name": "HlBook.Op.ctorIdx",
+      "kind": "definition",
+      "type": "HlBook.Op → Nat",
+      "typeHash": "819216f39fc85caf5210236349be7137b1be707b6e69567c7635bf9ea0997785",
+      "valueHash": "710818d896a9de2370c56b10fd4d7502472b15062b3e8e2704eb425b0be3540d"
+    },
+    {
+      "name": "HlBook.Op.noConfusion",
+      "kind": "definition",
+      "type": "{P : Sort u} → {t t' : HlBook.Op} → t = t' → HlBook.Op.noConfusionType P t t'",
+      "typeHash": "e476193be2a37e93119892581c39431d18eb8d16df094f6cf7e28930e9b985ca",
+      "valueHash": "7c8bedf7ea29341428735362229149bd79f80da662be1150301ffa74b7c151d0"
+    },
+    {
+      "name": "HlBook.Op.noConfusionType",
+      "kind": "definition",
+      "type": "Sort u → HlBook.Op → HlBook.Op → Sort u",
+      "typeHash": "a30bf8e5152da24df36c0b7c1d51935aa5b5645f6bb869b22009334c8c59c4e6",
+      "valueHash": "fec68af8f4d109d6fa5a62136a73c129975a874fece0700a3e2c372a0d161e1b"
+    },
+    {
+      "name": "HlBook.Op.rec",
+      "kind": "recursor",
+      "type": "{motive : HlBook.Op → Sort u} → ((o : HlBook.Order) → motive (HlBook.Op.rest o)) → ((i : Nat) → (o : HlBook.Order) → motive (HlBook.Op.restAt i o)) → ((oid : Nat) → motive (HlBook.Op.cancel oid)) → ((oid sz : Nat) → motive (HlBook.Op.resize oid sz)) → ((bid : Bool) → (px sz : Nat) → motive (HlBook.Op.take1 bid px sz)) → (t : HlBook.Op) → motive t",
+      "typeHash": "c17328af0b7d8f4cd67c10307762c253d3de558347e971c432f35d28fa82e86f",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.recOn",
+      "kind": "definition",
+      "type": "{motive : HlBook.Op → Sort u} → (t : HlBook.Op) → ((o : HlBook.Order) → motive (HlBook.Op.rest o)) → ((i : Nat) → (o : HlBook.Order) → motive (HlBook.Op.restAt i o)) → ((oid : Nat) → motive (HlBook.Op.cancel oid)) → ((oid sz : Nat) → motive (HlBook.Op.resize oid sz)) → ((bid : Bool) → (px sz : Nat) → motive (HlBook.Op.take1 bid px sz)) → motive t",
+      "typeHash": "db0a3bdfbb763800e0115c6f7130fbe2891fb66121566ce93e224a96f0eb31f4",
+      "valueHash": "318b77c8df324bdbf390bb0e9544940f2e7972eb5c7769a59191495285100ed5"
+    },
+    {
+      "name": "HlBook.Op.resize",
+      "kind": "constructor",
+      "type": "Nat → Nat → HlBook.Op",
+      "typeHash": "e1108798c178079dde9db012de9b03ac91a1a6cf80f3082337e5ca6ce394aa5b",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.resize.elim",
+      "kind": "definition",
+      "type": "{motive : HlBook.Op → Sort u} → (t : HlBook.Op) → t.ctorIdx = 3 → ((oid sz : Nat) → motive (HlBook.Op.resize oid sz)) → motive t",
+      "typeHash": "903845853e017b955ec8b31ff8fe1647f758606754758f7ae6c635762261e966",
+      "valueHash": "7a978e6615e6076346170bfed41803c2b770fe4164278dd0b1e0b3d0672bdf6c"
+    },
+    {
+      "name": "HlBook.Op.resize.inj",
+      "kind": "theorem",
+      "type": "∀ {oid sz oid_1 sz_1 : Nat}, HlBook.Op.resize oid sz = HlBook.Op.resize oid_1 sz_1 → oid = oid_1 ∧ sz = sz_1",
+      "typeHash": "0ed7d4bc61da25121f493e6bbfaeaef544c17f4508386d36200e262e6ed6b491",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.resize.injEq",
+      "kind": "theorem",
+      "type": "∀ (oid sz oid_1 sz_1 : Nat), (HlBook.Op.resize oid sz = HlBook.Op.resize oid_1 sz_1) = (oid = oid_1 ∧ sz = sz_1)",
+      "typeHash": "6fa03b39167b8c4c0c6b174215b008de6b3c3e16a63cc7d378e1ead22b8cccfc",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.resize.noConfusion",
+      "kind": "definition",
+      "type": "{P : Sort u} → {oid sz oid' sz' : Nat} → HlBook.Op.resize oid sz = HlBook.Op.resize oid' sz' → (oid = oid' → sz = sz' → P) → P",
+      "typeHash": "f6b5cd90494bb3b40f328a09d29bfd5ba984629c88834d602282432ba70edde2",
+      "valueHash": "e8af662db1906b5a93ae11fc0a2ef68f140b633101a9af0165d95ee3d27a695c"
+    },
+    {
+      "name": "HlBook.Op.resize.sizeOf_spec",
+      "kind": "theorem",
+      "type": "∀ (oid sz : Nat), sizeOf (HlBook.Op.resize oid sz) = 1 + sizeOf oid + sizeOf sz",
+      "typeHash": "ce6f55ae02c4332fa3a4b454fe4c403f403e7be1d73dfdb24057e18b24a5bfda",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.rest",
+      "kind": "constructor",
+      "type": "HlBook.Order → HlBook.Op",
+      "typeHash": "f1df18e0609b92c6ab4101557a9aaf8b00e01c3fba381cb886dc8bfed3bef2cc",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.rest.elim",
+      "kind": "definition",
+      "type": "{motive : HlBook.Op → Sort u} → (t : HlBook.Op) → t.ctorIdx = 0 → ((o : HlBook.Order) → motive (HlBook.Op.rest o)) → motive t",
+      "typeHash": "fb5fac882011cbeac0306a558c845a680e67de877385a5712f161b8616a55862",
+      "valueHash": "2321c3247f3c279f489ae965b73583b65c347baa9fcde9f4e8cad5c8396c019e"
+    },
+    {
+      "name": "HlBook.Op.rest.inj",
+      "kind": "theorem",
+      "type": "∀ {o o_1 : HlBook.Order}, HlBook.Op.rest o = HlBook.Op.rest o_1 → o = o_1",
+      "typeHash": "81faf67f5eca20c3070bd56b3dad1ea31b94d8285ae338ab85c0f961ed90a67b",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.rest.injEq",
+      "kind": "theorem",
+      "type": "∀ (o o_1 : HlBook.Order), (HlBook.Op.rest o = HlBook.Op.rest o_1) = (o = o_1)",
+      "typeHash": "fa0ee26c1cb70037d9e9649b6322859b01f4039b50ed6f57cb268a5ec3f92f76",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.rest.noConfusion",
+      "kind": "definition",
+      "type": "{P : Sort u} → {o o' : HlBook.Order} → HlBook.Op.rest o = HlBook.Op.rest o' → (o = o' → P) → P",
+      "typeHash": "256333f1fffd9f6c41788c3f45ab56cda8af3ef80211bacc040eaf40188c4610",
+      "valueHash": "4d344bac0e0b8c72399d9b04ae91a7a9ef1b9b7b6a94c9b90e6d959a19a8beed"
+    },
+    {
+      "name": "HlBook.Op.rest.sizeOf_spec",
+      "kind": "theorem",
+      "type": "∀ (o : HlBook.Order), sizeOf (HlBook.Op.rest o) = 1 + sizeOf o",
+      "typeHash": "9f1c30d792b8da6bbb20234e7c6c731b9022bdd483649d62a754414e70d4e602",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.restAt",
+      "kind": "constructor",
+      "type": "Nat → HlBook.Order → HlBook.Op",
+      "typeHash": "bdf8a98655de68cdb1e81fdc930ecc8fef4b1d523ab613e0b1a44055a7fe52e1",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.restAt.elim",
+      "kind": "definition",
+      "type": "{motive : HlBook.Op → Sort u} → (t : HlBook.Op) → t.ctorIdx = 1 → ((i : Nat) → (o : HlBook.Order) → motive (HlBook.Op.restAt i o)) → motive t",
+      "typeHash": "7986d5cdff252ff71cc8c978d3d27c20821c610c8730a7c3c1102b5344ea8d75",
+      "valueHash": "8fbef4c6afe7a10fcf08e8b491e7d430cbab1842537673f8f34bd0f4f2c62b50"
+    },
+    {
+      "name": "HlBook.Op.restAt.inj",
+      "kind": "theorem",
+      "type": "∀ {i : Nat} {o : HlBook.Order} {i_1 : Nat} {o_1 : HlBook.Order}, HlBook.Op.restAt i o = HlBook.Op.restAt i_1 o_1 → i = i_1 ∧ o = o_1",
+      "typeHash": "3048d7202ec3b373ff68e42e42712460a772b87a56f74111c8bb60e979a79294",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.restAt.injEq",
+      "kind": "theorem",
+      "type": "∀ (i : Nat) (o : HlBook.Order) (i_1 : Nat) (o_1 : HlBook.Order), (HlBook.Op.restAt i o = HlBook.Op.restAt i_1 o_1) = (i = i_1 ∧ o = o_1)",
+      "typeHash": "2153a7cba778043dadb21a319aa9367bd0e0c128284b9b798f37979fd5dcf108",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.restAt.noConfusion",
+      "kind": "definition",
+      "type": "{P : Sort u} → {i : Nat} → {o : HlBook.Order} → {i' : Nat} → {o' : HlBook.Order} → HlBook.Op.restAt i o = HlBook.Op.restAt i' o' → (i = i' → o = o' → P) → P",
+      "typeHash": "6ffddd37feec0fb3866bf02fdabe15908b71fa3fcd337aa6af024399d095da76",
+      "valueHash": "7c8c71bb61fb8d8e791860c270357c802cd725696fc816ee31015a5ad3e28044"
+    },
+    {
+      "name": "HlBook.Op.restAt.sizeOf_spec",
+      "kind": "theorem",
+      "type": "∀ (i : Nat) (o : HlBook.Order), sizeOf (HlBook.Op.restAt i o) = 1 + sizeOf i + sizeOf o",
+      "typeHash": "387085064b2c146cc4de6723248dad4f1401201c48620cb57ef422596d2b8659",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.take1",
+      "kind": "constructor",
+      "type": "Bool → Nat → Nat → HlBook.Op",
+      "typeHash": "c9022d4b9afc6b8150d95c4c80eca4638d20b4bf6def45a9b6d0e599e19084e5",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.take1.elim",
+      "kind": "definition",
+      "type": "{motive : HlBook.Op → Sort u} → (t : HlBook.Op) → t.ctorIdx = 4 → ((bid : Bool) → (px sz : Nat) → motive (HlBook.Op.take1 bid px sz)) → motive t",
+      "typeHash": "709064aeb812f0b8c439493680f931bd1a00fe29663104ea7d413db1cc5726de",
+      "valueHash": "56e743accbb2486e4728ef1aaf62f130316b6633b9c5d165802abcce1fb03d37"
+    },
+    {
+      "name": "HlBook.Op.take1.inj",
+      "kind": "theorem",
+      "type": "∀ {bid : Bool} {px sz : Nat} {bid_1 : Bool} {px_1 sz_1 : Nat}, HlBook.Op.take1 bid px sz = HlBook.Op.take1 bid_1 px_1 sz_1 → bid = bid_1 ∧ px = px_1 ∧ sz = sz_1",
+      "typeHash": "b07fefa4e9290d4c0c73cd8d18874333714c8f91fe29dd95d0a3d98445ef80bf",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.take1.injEq",
+      "kind": "theorem",
+      "type": "∀ (bid : Bool) (px sz : Nat) (bid_1 : Bool) (px_1 sz_1 : Nat), (HlBook.Op.take1 bid px sz = HlBook.Op.take1 bid_1 px_1 sz_1) = (bid = bid_1 ∧ px = px_1 ∧ sz = sz_1)",
+      "typeHash": "8b8f12efabc073a7b6fa21e40b2991974b193db8dbb7a7d12070988c9899845a",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Op.take1.noConfusion",
+      "kind": "definition",
+      "type": "{P : Sort u} → {bid : Bool} → {px sz : Nat} → {bid' : Bool} → {px' sz' : Nat} → HlBook.Op.take1 bid px sz = HlBook.Op.take1 bid' px' sz' → (bid = bid' → px = px' → sz = sz' → P) → P",
+      "typeHash": "908f0038ccfebf7d489097316247d9ffa9cdbc9016d647e54ed9d60d7c36e2ae",
+      "valueHash": "380124a4fc4a95a5b961729fd301e04db34273e064173b84a2ddea287c062d46"
+    },
+    {
+      "name": "HlBook.Op.take1.sizeOf_spec",
+      "kind": "theorem",
+      "type": "∀ (bid : Bool) (px sz : Nat), sizeOf (HlBook.Op.take1 bid px sz) = 1 + sizeOf bid + sizeOf px + sizeOf sz",
+      "typeHash": "7dec347bb84beef80a8bdfd477f3c8f7ca9600f63392278920c12c03afb8e4ee",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Order",
+      "kind": "inductive",
+      "type": "Type",
+      "typeHash": "7051ab654d793c216d744f7920d98d672357a0efa67248ee75d146d668f60997",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Order.bid",
+      "kind": "definition",
+      "type": "HlBook.Order → Bool",
+      "typeHash": "3146833c47ce2162d37ff5fed24aad02740c16f7c6880cefe8e49922683a85ae",
+      "valueHash": "23adbc430085e1fe67f56d942268e391dc91e4073e785c2a3dc9c8c9717d8ee6"
+    },
+    {
+      "name": "HlBook.Order.casesOn",
+      "kind": "definition",
+      "type": "{motive : HlBook.Order → Sort u} → (t : HlBook.Order) → ((oid : Nat) → (bid : Bool) → (px sz : Nat) → motive { oid := oid, bid := bid, px := px, sz := sz }) → motive t",
+      "typeHash": "8250b792ed72fbbf5f1423265a858b4e2da6f24380bb24d418d2d1129523133e",
+      "valueHash": "3085f2838577e62aebf1e514f7e09bf1c19d0c932bec3ed8aaccb599c4f88dc8"
+    },
+    {
+      "name": "HlBook.Order.ctorIdx",
+      "kind": "definition",
+      "type": "HlBook.Order → Nat",
+      "typeHash": "c6525c6d07d2743ed5144849eec30aa6bf6eedfb511e4a57aed670a7e9d55f74",
+      "valueHash": "e070a2ecf11ebd9975144d82c8c7a40fd2ec5e92d8afa457dfe14e3ac9df567e"
+    },
+    {
+      "name": "HlBook.Order.key",
+      "kind": "definition",
+      "type": "HlBook.Order → HlBook.Key",
+      "typeHash": "c5bd0d906aa002b3407302737b33363e23bcd12d116872108f7991afc3ae6b32",
+      "valueHash": "45b9ec2cc55a583d135ef9a508a019a557f1f0fa4ee4c3a948c4e7556346b304"
+    },
+    {
+      "name": "HlBook.Order.mk",
+      "kind": "constructor",
+      "type": "Nat → Bool → Nat → Nat → HlBook.Order",
+      "typeHash": "6dca539cf53620517bcf83859cbc3853ac703e198eb1a123fe053bfbc002d822",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Order.mk.inj",
+      "kind": "theorem",
+      "type": "∀ {oid : Nat} {bid : Bool} {px sz oid_1 : Nat} {bid_1 : Bool} {px_1 sz_1 : Nat}, { oid := oid, bid := bid, px := px, sz := sz } = { oid := oid_1, bid := bid_1, px := px_1, sz := sz_1 } → oid = oid_1 ∧ bid = bid_1 ∧ px = px_1 ∧ sz = sz_1",
+      "typeHash": "7ade492f638e27e9b3e792b78cd31c513001e5c1a9720b0252b0f5f23e9e1fa3",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Order.mk.injEq",
+      "kind": "theorem",
+      "type": "∀ (oid : Nat) (bid : Bool) (px sz oid_1 : Nat) (bid_1 : Bool) (px_1 sz_1 : Nat), ({ oid := oid, bid := bid, px := px, sz := sz } = { oid := oid_1, bid := bid_1, px := px_1, sz := sz_1 }) = (oid = oid_1 ∧ bid = bid_1 ∧ px = px_1 ∧ sz = sz_1)",
+      "typeHash": "62b00d2eb9028524eb0a0beb292aae1cb144a414969a9ad57b8c392b7f53c8f7",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Order.mk.noConfusion",
+      "kind": "definition",
+      "type": "{P : Sort u} → {oid : Nat} → {bid : Bool} → {px sz oid' : Nat} → {bid' : Bool} → {px' sz' : Nat} → { oid := oid, bid := bid, px := px, sz := sz } = { oid := oid', bid := bid', px := px', sz := sz' } → (oid = oid' → bid = bid' → px = px' → sz = sz' → P) → P",
+      "typeHash": "ffe158ae466705938e8908ae74a78f85fc5dab3aa1b84b99c25e46f57b5ef6b0",
+      "valueHash": "f840ac5b1bc18c82d99b367929c7292324c659ea568a8cff5b9005d13908396f"
+    },
+    {
+      "name": "HlBook.Order.mk.sizeOf_spec",
+      "kind": "theorem",
+      "type": "∀ (oid : Nat) (bid : Bool) (px sz : Nat), sizeOf { oid := oid, bid := bid, px := px, sz := sz } = 1 + sizeOf oid + sizeOf bid + sizeOf px + sizeOf sz",
+      "typeHash": "b8c94aaa1528853db043c7a9c842a5ca1dc8442f8e577fe870eac45886a72db4",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Order.noConfusion",
+      "kind": "definition",
+      "type": "{P : Sort u} → {t t' : HlBook.Order} → t = t' → HlBook.Order.noConfusionType P t t'",
+      "typeHash": "87bce989ef618e92274c5ebe78d505dc0a4f550a396a04729e4d024dacee20ad",
+      "valueHash": "14480998580b7776a92ad9eeaf02a9954283bff21119f0557b6ade0978edff5b"
+    },
+    {
+      "name": "HlBook.Order.noConfusionType",
+      "kind": "definition",
+      "type": "Sort u → HlBook.Order → HlBook.Order → Sort u",
+      "typeHash": "9f60cf8964461857697cf4a4519a76eb3b75dacf378be6b83dea082a22e7c41c",
+      "valueHash": "6a187609e83d9adf003fcdfd2fbaa1cbfd57fef83f1dd8e68ff98f4d4339818f"
+    },
+    {
+      "name": "HlBook.Order.oid",
+      "kind": "definition",
+      "type": "HlBook.Order → Nat",
+      "typeHash": "e98e1b5700a6792270f78100bb29edbe5c1235213234e8ecf8b2cb712fff9c73",
+      "valueHash": "0078af1122cbf32699ed97a89deec70c87ba9f1c41651422dbaf83b9dd7db47a"
+    },
+    {
+      "name": "HlBook.Order.px",
+      "kind": "definition",
+      "type": "HlBook.Order → Nat",
+      "typeHash": "e98e1b5700a6792270f78100bb29edbe5c1235213234e8ecf8b2cb712fff9c73",
+      "valueHash": "1ad28a9f84fa9b284972b10189f2b7c052da74d5950b2ccaa82a46724560ded2"
+    },
+    {
+      "name": "HlBook.Order.rec",
+      "kind": "recursor",
+      "type": "{motive : HlBook.Order → Sort u} → ((oid : Nat) → (bid : Bool) → (px sz : Nat) → motive { oid := oid, bid := bid, px := px, sz := sz }) → (t : HlBook.Order) → motive t",
+      "typeHash": "a66459a23124bf08e5373bae9d10d0267008a439a43bb19ebd68ffdc37462d5c",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.Order.recOn",
+      "kind": "definition",
+      "type": "{motive : HlBook.Order → Sort u} → (t : HlBook.Order) → ((oid : Nat) → (bid : Bool) → (px sz : Nat) → motive { oid := oid, bid := bid, px := px, sz := sz }) → motive t",
+      "typeHash": "8250b792ed72fbbf5f1423265a858b4e2da6f24380bb24d418d2d1129523133e",
+      "valueHash": "5821a17ae34b833ddaaa19179fcb5fd8e6ad333b81b8ce053eda01f351acdf77"
+    },
+    {
+      "name": "HlBook.Order.sz",
+      "kind": "definition",
+      "type": "HlBook.Order → Nat",
+      "typeHash": "e98e1b5700a6792270f78100bb29edbe5c1235213234e8ecf8b2cb712fff9c73",
+      "valueHash": "c33f75dde8a719950dae2e0baff09bdc0f00d2407b2ea6eb8af5dbd4b7f25f64"
+    },
+    {
+      "name": "HlBook.View",
+      "kind": "definition",
+      "type": "Type",
+      "typeHash": "7051ab654d793c216d744f7920d98d672357a0efa67248ee75d146d668f60997",
+      "valueHash": "2da3b908ab94c1b713ff5688dab8e292d54a92850defe2acece12180a20cc96a"
+    },
+    {
+      "name": "HlBook.addLevel",
+      "kind": "definition",
+      "type": "Option (Nat × Nat) → Nat → Option (Nat × Nat)",
+      "typeHash": "07176ed1ce42d0f6a9c3514260e4df4735d74a720bba4dc7f677e88465e1fbf4",
+      "valueHash": "f6875275c3e0c4b1da8d340330ef0683f90d24df47060ad3c9dd3ead6ab219bc"
+    },
+    {
+      "name": "HlBook.addLevel_at",
+      "kind": "theorem",
+      "type": "∀ (b b' : List HlBook.Order) (k : HlBook.Key) (sz : Nat) (x : Option (Nat × Nat)), HlBook.At b x k → HlBook.tot k b' = HlBook.tot k b + sz → HlBook.cnt k b' = HlBook.cnt k b + 1 → HlBook.At b' (HlBook.addLevel x sz) k",
+      "typeHash": "8a7f04159de11cecb88f6bf0ee8a93daa15ed3b82338081e7218669f9f01927a",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.badRuns",
+      "kind": "definition",
+      "type": "Nat → List (List HlBook.Order × HlBook.View) → List (List HlBook.Order × HlBook.View)",
+      "typeHash": "a72028a91242bd73704debf4aa4eb30a53dff351b144d5f04bce7c7322765355",
+      "valueHash": "d0a5d353e100c74c7a6a6003836a2c034582e02c1bbaf7055f56cf8578ec82f9"
+    },
+    {
+      "name": "HlBook.best",
+      "kind": "definition",
+      "type": "Bool → List HlBook.Order → Option Nat",
+      "typeHash": "776f5cbc09ff360d5e84a730cd93f4317055d21b6a2cf6f442e43d57fb6e1d42",
+      "valueHash": "10bdca4d59c23b3eb83744b59db598805e1c04a983f42b687395c321fbe5c3c7"
+    },
+    {
+      "name": "HlBook.best_le",
+      "kind": "theorem",
+      "type": "∀ (bid : Bool) (b : List HlBook.Order) (p : Nat), HlBook.best bid b = some p → ∀ (o : HlBook.Order), o ∈ b → o.bid = bid → HlBook.better bid o.px p = false",
+      "typeHash": "babd43bf720e441f4319eb3638170ad035f1d234744c0ceddac21871700e4f18",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.best_none",
+      "kind": "theorem",
+      "type": "∀ (bid : Bool) (b : List HlBook.Order), HlBook.best bid b = none → ∀ (o : HlBook.Order), o ∈ b → o.bid ≠ bid",
+      "typeHash": "d5714638d544373e5a0a51087760aff2375c970d42b1311e047fd246a1b9f19e",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.better",
+      "kind": "definition",
+      "type": "Bool → Nat → Nat → Bool",
+      "typeHash": "25ce88171ef52b18f51f50955466da091f365ff57a0075b0df7d91eed600a1db",
+      "valueHash": "b5183be8d289df1e96e3d3a13ecf00cf1fed7f2265ae6c4edbdd30aac53c74b8"
+    },
+    {
+      "name": "HlBook.cancel",
+      "kind": "definition",
+      "type": "Nat → List HlBook.Order → HlBook.View → Option (List HlBook.Order × HlBook.View)",
+      "typeHash": "9821d1f175b81b3940692a80cc2a4119f56c7b2c5f7fa372b9247cac43094cd7",
+      "valueHash": "4c841dfd84ee7dc726ff78fec1c7d3511b19e15a2d67858e39f90ede30924b34"
+    },
+    {
+      "name": "HlBook.cancel_inv",
+      "kind": "theorem",
+      "type": "∀ (oid : Nat) (b b' : List HlBook.Order) (v v' : HlBook.View), HlBook.Inv b v → HlBook.cancel oid b v = some (b', v') → HlBook.Inv b' v'",
+      "typeHash": "1b5bcd26b68d9694eff2cc8b5dbb70499bd941f15a257dead96400d49cd66a08",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.cancel_inv.witness",
+      "kind": "theorem",
+      "type": "∃ oid b b' v v', HlBook.Inv b v ∧ HlBook.cancel oid b v = some (b', v')",
+      "typeHash": "c87913cb322ce7f86c0c7db90ce7411417fd36a87620f42fa8c3cc6977fb8a78",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.cnt",
+      "kind": "definition",
+      "type": "HlBook.Key → List HlBook.Order → Nat",
+      "typeHash": "c6b850889fa6dfce8e5601ec811e1066055809b623886b9925274a7159e449c4",
+      "valueHash": "737ad58d2ea0f224df648b83af7f6df9975a3b13f465656e3c1a507e739532d9"
+    },
+    {
+      "name": "HlBook.cnt_append",
+      "kind": "theorem",
+      "type": "∀ (k : HlBook.Key) (a c : List HlBook.Order), HlBook.cnt k (a ++ c) = HlBook.cnt k a + HlBook.cnt k c",
+      "typeHash": "62c6e5287cd61dd188a4fa58e898a4e767e15e8270920c3820177032e8c3fe78",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.cnt_insertIdx",
+      "kind": "theorem",
+      "type": "∀ (k : HlBook.Key) (i : Nat) (o : HlBook.Order) (b : List HlBook.Order), i ≤ b.length → HlBook.cnt k (b.insertIdx i o) = HlBook.cnt k b + if o.key = k then 1 else 0",
+      "typeHash": "5c5a47f2d782b404a69b1723829c5f76f0a68d9633f8a613327722b7d713ca49",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.cnt_zero_tot",
+      "kind": "theorem",
+      "type": "∀ (k : HlBook.Key) (b : List HlBook.Order), HlBook.cnt k b = 0 → HlBook.tot k b = 0",
+      "typeHash": "cd0792ce2120b359d67ca80ba9e5deaa5850f2c5bc38d23afe6cd8f0b1f15c99",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.crossesP",
+      "kind": "definition",
+      "type": "Bool → Nat → Nat → Bool",
+      "typeHash": "43e80b67d252b5cff9690f815596ab6c1e8a8aa0d7fbece0ae6d25164988a45f",
+      "valueHash": "f123dce8fb1ccdf9eea368ec9dc4096429037be938a8a9e5bb5fb1c29e97879f"
+    },
+    {
+      "name": "HlBook.fill",
+      "kind": "definition",
+      "type": "HlBook.Order → Nat → List HlBook.Order → HlBook.View → Option (List HlBook.Order × HlBook.View)",
+      "typeHash": "1301a50df56926118051a5f846e1b969757ebd7f776c9ec85d8d920f0085e24c",
+      "valueHash": "f8bad1b8087d753db8bcba81c799caa152df1b40169a86ca610be25ce1e44cc3"
+    },
+    {
+      "name": "HlBook.find_prefix",
+      "kind": "theorem",
+      "type": "∀ (pr : HlBook.Order → Bool) (b : List HlBook.Order) (m : HlBook.Order), List.find? pr b = some m → ∃ pre post, b = pre ++ m :: post ∧ ∀ (o : HlBook.Order), o ∈ pre → pr o = false",
+      "typeHash": "f3e82620aa14c83d6c2badd5b0043486951f29e830e03313b61d3d35ec68697e",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.init",
+      "kind": "definition",
+      "type": "List HlBook.Order × HlBook.View",
+      "typeHash": "f5c9cb803125955366c3a30bb782274d27021f6dde921d95c2b900c91ae26c6c",
+      "valueHash": "9eff7c6701266e6f58f2af6895cffed74694aca512a65209034f8f4d04033a35"
+    },
+    {
+      "name": "HlBook.instDecidableEqOrder",
+      "kind": "definition",
+      "type": "DecidableEq HlBook.Order",
+      "typeHash": "816724cfece180d4b3ea9ab297084312e28f856f78678a2303c7c54c2a079a46",
+      "valueHash": "5fff4e33a7602a9e67cd206935d38d890d3b85fa0e389aa95e4c49417d91c779"
+    },
+    {
+      "name": "HlBook.instDecidableEqOrder.decEq",
+      "kind": "definition",
+      "type": "(x x_1 : HlBook.Order) → Decidable (x = x_1)",
+      "typeHash": "3bdcc7642d06c2018e4986f35036f7b48cf0222e869c68be6d3364bfaf326e32",
+      "valueHash": "835fb0fa5daaab64fbff542bb4c7ddb1bd0b4618ddcbe0354d1d7c1786999abb"
+    },
+    {
+      "name": "HlBook.instReprOp",
+      "kind": "definition",
+      "type": "Repr HlBook.Op",
+      "typeHash": "74325d86b733085f6caca39361a3b08c9273b8cd5bd44495e50b3e330331955e",
+      "valueHash": "0ab8a4180c85a0c03894e0a2a5b86624fef1b5615ed2ed80bf3bfbb23905ca5a"
+    },
+    {
+      "name": "HlBook.instReprOp.repr",
+      "kind": "definition",
+      "type": "HlBook.Op → Nat → Format",
+      "typeHash": "e57740e044dfffecbd2ed5d2167b12c4530a431b86914ee45d582fac6b3e1259",
+      "valueHash": "6c9b849e5acfa764ebe51fa48e7501b315c689b530f4d1b94fa74392795c3b68"
+    },
+    {
+      "name": "HlBook.instReprOrder",
+      "kind": "definition",
+      "type": "Repr HlBook.Order",
+      "typeHash": "3a3c110205b329cd669599ee3dd2e02c76752643a7d602383ce81e91f9f165ee",
+      "valueHash": "62432a58df85f9c9503bf33ae17f25693e012b2a99e802d91ea40ca73696b550"
+    },
+    {
+      "name": "HlBook.instReprOrder.repr",
+      "kind": "definition",
+      "type": "HlBook.Order → Nat → Format",
+      "typeHash": "2f1fc2feaddc57da2b30a1c23abd576e89218b7d228526f9346387eaf700e50a",
+      "valueHash": "46109b1b7491c18f041d712504ca46abe32aab01e9a55b3f81300fa413a5db7f"
+    },
+    {
+      "name": "HlBook.invB",
+      "kind": "definition",
+      "type": "List HlBook.Order → HlBook.View → Bool",
+      "typeHash": "227cf5f055e4b92107643ab6d928d37fc96b1cc4701815f3a702f6a6d6bb5c0e",
+      "valueHash": "594064696ce66bd8724f4a22a4e50141ce12f38a3ab6d607ef1b9dc0b7455d9f"
+    },
+    {
+      "name": "HlBook.inv_update",
+      "kind": "theorem",
+      "type": "∀ (b b' : List HlBook.Order) (v : HlBook.View) (k0 : HlBook.Key) (x : Option (Nat × Nat)), HlBook.Inv b v → HlBook.At b' x k0 → (∀ (k : HlBook.Key), k ≠ k0 → HlBook.tot k b' = HlBook.tot k b ∧ HlBook.cnt k b' = HlBook.cnt k b) → HlBook.Inv b' (HlBook.update v k0 x)",
+      "typeHash": "a4d473f23501d19395344b05d11512bfe359c4d15bcb9687ce230175015d3fdb",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.keys",
+      "kind": "definition",
+      "type": "List HlBook.Key",
+      "typeHash": "75e4a2e1e5f9c8832710e06e0c45d1983c811837df8ed4439539252f413e09e4",
+      "valueHash": "4ab969a76877fb7b01a99e6dacf4ff268dd4cc350e4ed6541227b3fc7d452fda"
+    },
+    {
+      "name": "HlBook.match1",
+      "kind": "definition",
+      "type": "Bool → Nat → Nat → List HlBook.Order → HlBook.View → Option (HlBook.Order × List HlBook.Order × HlBook.View)",
+      "typeHash": "2c823faa8cbe426fa239718cdf08ed7059cecba8f47865b299df911670db4cff",
+      "valueHash": "e06d7546ad635a2f1c9b5a1cc8363fdbf0a246584d5ada35b2f008cb2764a4e4"
+    },
+    {
+      "name": "HlBook.match1_inv",
+      "kind": "theorem",
+      "type": "∀ (tbid : Bool) (tpx tsz : Nat) (b : List HlBook.Order) (v : HlBook.View) (m : HlBook.Order) (b' : List HlBook.Order) (v' : HlBook.View), HlBook.Inv b v → HlBook.match1 tbid tpx tsz b v = some (m, b', v') → HlBook.Inv b' v'",
+      "typeHash": "36f2dfda330727ee9c25720bd3ee154058e1f80bdef742c6903e383b5809949b",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.match1_inv.witness",
+      "kind": "theorem",
+      "type": "∃ tbid tpx tsz b v m b' v', HlBook.Inv b v ∧ HlBook.match1 tbid tpx tsz b v = some (m, b', v')",
+      "typeHash": "360076673f2e5b67a299fd99e8947ff84d5ba0e24e76d7932128ee6ae9e7ca4d",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.match1_priority",
+      "kind": "theorem",
+      "type": "∀ (tbid : Bool) (tpx tsz : Nat) (b : List HlBook.Order) (v : HlBook.View) (m : HlBook.Order) (b' : List HlBook.Order) (v' : HlBook.View), HlBook.match1 tbid tpx tsz b v = some (m, b', v') → m ∈ b ∧ m.bid = !tbid ∧ (∀ (o : HlBook.Order), o ∈ b → o.bid = !tbid → if tbid = true then m.px ≤ o.px else o.px ≤ m.px) ∧ ∃ pre post, b = pre ++ m :: post ∧ ∀ (o : HlBook.Order), o ∈ pre → ¬(o.bid = m.bid ∧ o.px = m.px)",
+      "typeHash": "9232c3478ef9609365d51f9c877179972f52dd01ab3dae98646acfb6f05d10fb",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.match1_priority.witness",
+      "kind": "theorem",
+      "type": "∃ tbid tpx tsz b v m b' v', HlBook.match1 tbid tpx tsz b v = some (m, b', v')",
+      "typeHash": "bc757d4263ad0e21c26fcc2b8d845d67617dc1d57c5587a1fd06fbfc25e2f76c",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.ops",
+      "kind": "definition",
+      "type": "List HlBook.Op",
+      "typeHash": "16c6863ace443c93380da596a835dee365aa71abf5363fb6f57793bdb0bf0f6c",
+      "valueHash": "bc0adf90f108f1b3942afefd3dafc5d9704615fa54c1cbca052aa6c0efd2baf0"
+    },
+    {
+      "name": "HlBook.pick",
+      "kind": "definition",
+      "type": "Bool → Nat → List HlBook.Order → Option HlBook.Order",
+      "typeHash": "bf90b836bcaec70bfa2d00a25716272a68fc9643578452a8ebdd21619e2e559f",
+      "valueHash": "98e0e823b36e33d93dbc656203610bd1395d31159e27dc666a6bffb7c054ecce"
+    },
+    {
+      "name": "HlBook.resize",
+      "kind": "definition",
+      "type": "Nat → Nat → List HlBook.Order → HlBook.View → Option (List HlBook.Order × HlBook.View)",
+      "typeHash": "0e36c90be5427b66e5458cd4d413f165f19ccd27c4a70a7c5ae416aeb83b1eae",
+      "valueHash": "10feeb555c1528c0f9805d8e0651996b70e46c4d9df627d28afacf1a2bb3dc89"
+    },
+    {
+      "name": "HlBook.resize_inv",
+      "kind": "theorem",
+      "type": "∀ (oid sz : Nat) (b b' : List HlBook.Order) (v v' : HlBook.View), HlBook.Inv b v → HlBook.resize oid sz b v = some (b', v') → HlBook.Inv b' v'",
+      "typeHash": "fa02e35708f8e20e8fcb10f209050043f7565cfa914d69991ce0710e0ad7efd9",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.resize_inv.witness",
+      "kind": "theorem",
+      "type": "∃ oid sz b b' v v', HlBook.Inv b v ∧ HlBook.resize oid sz b v = some (b', v')",
+      "typeHash": "22e0ae6f9fd7b0accb54dda305036d017a0bc5e56971423d4e5ec7aecc9b3fde",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.rest",
+      "kind": "definition",
+      "type": "HlBook.Order → List HlBook.Order → HlBook.View → Option (List HlBook.Order × HlBook.View)",
+      "typeHash": "aacf8c780ea5c950ee6df25d3a21425cb1dc40dc156fe984dee78e4e1a373448",
+      "valueHash": "6b2d6e7cfb988de6acc7c530ae1ae2fcb87cc6359b60c078335438db3fe73706"
+    },
+    {
+      "name": "HlBook.restAt",
+      "kind": "definition",
+      "type": "Nat → HlBook.Order → List HlBook.Order → HlBook.View → Option (List HlBook.Order × HlBook.View)",
+      "typeHash": "6b4fb1c0a89640a5d42c0bbb7f2080151e3fe57e2a15c5498a123f7b72abcfdf",
+      "valueHash": "4497575a81ffe9831ebef5662fdf39323ae98a55a16efb0df87f56386045b791"
+    },
+    {
+      "name": "HlBook.restAt_inv",
+      "kind": "theorem",
+      "type": "∀ (i : Nat) (o : HlBook.Order) (b b' : List HlBook.Order) (v v' : HlBook.View), i ≤ b.length → HlBook.Inv b v → HlBook.restAt i o b v = some (b', v') → HlBook.Inv b' v'",
+      "typeHash": "d475c342794d76cc7e706849befd53abc38de48d8435e10725217f114d2402b8",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.restAt_inv.witness",
+      "kind": "theorem",
+      "type": "∃ i o b b' v v', i ≤ b.length ∧ HlBook.Inv b v ∧ HlBook.restAt i o b v = some (b', v')",
+      "typeHash": "58ab546ef00d25d87562ea1bb565d2d5d04a6403372fcb311c72e1dd12930188",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.rest_inv",
+      "kind": "theorem",
+      "type": "∀ (o : HlBook.Order) (b b' : List HlBook.Order) (v v' : HlBook.View), HlBook.Inv b v → HlBook.rest o b v = some (b', v') → HlBook.Inv b' v'",
+      "typeHash": "7d05b9b90ce4cdb26aecd0f6c98b65a28894572d3fdfa9f6a7524ce8f6842290",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.rest_inv.witness",
+      "kind": "theorem",
+      "type": "∃ o b b' v v', HlBook.Inv b v ∧ HlBook.rest o b v = some (b', v')",
+      "typeHash": "680d46cf7a5483ada0d32754ee164fbf36f73098ac7c514309618e6a31a43bfe",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.setLevel",
+      "kind": "definition",
+      "type": "Option (Nat × Nat) → Nat → Nat → Option (Nat × Nat)",
+      "typeHash": "7d346475679b42104d49b98824630ca7699df2ec0a0c9f76eebfa0541fd49746",
+      "valueHash": "fd6ef27f7c6e5693dec88cbe1ab151e7408a36e06274b154e42971021d4ba947"
+    },
+    {
+      "name": "HlBook.setLevel_at",
+      "kind": "theorem",
+      "type": "∀ (b b' : List HlBook.Order) (k : HlBook.Key) (old new : Nat) (x : Option (Nat × Nat)), HlBook.At b x k → HlBook.cnt k b ≠ 0 → old ≤ HlBook.tot k b → HlBook.tot k b' + old = HlBook.tot k b + new → HlBook.cnt k b' = HlBook.cnt k b → HlBook.At b' (HlBook.setLevel x old new) k",
+      "typeHash": "a8fac09827949920181c7c79074f8b770f8cac08ed6bc188de626383191b0ad6",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.setSz",
+      "kind": "definition",
+      "type": "Nat → Nat → List HlBook.Order → List HlBook.Order",
+      "typeHash": "27611da78da0f03bb05e65fbfffc2bf7e9c9f1a67d2c0e53419fb7ab3242fd0d",
+      "valueHash": "4ba509328cf61669a05bc5eceac396ea1cccfbb77e9e9e42ab6d4bdfd8833d7f"
+    },
+    {
+      "name": "HlBook.step",
+      "kind": "definition",
+      "type": "List HlBook.Order × HlBook.View → HlBook.Op → List HlBook.Order × HlBook.View",
+      "typeHash": "f0399357602f4274b5b5a04c47348f4d4aff0c07bfe5e8f68c6dc2ce3feccad6",
+      "valueHash": "3242a6f27a338e70f8d814674aff4993bed95baccc70ecc6fece4b8d33301d2c"
+    },
+    {
+      "name": "HlBook.subLevel",
+      "kind": "definition",
+      "type": "Option (Nat × Nat) → Nat → Option (Nat × Nat)",
+      "typeHash": "07176ed1ce42d0f6a9c3514260e4df4735d74a720bba4dc7f677e88465e1fbf4",
+      "valueHash": "0224a185b4b9594acb313ac050ccf167b84829b218133bdade944f8031a0dec1"
+    },
+    {
+      "name": "HlBook.subLevel_at",
+      "kind": "theorem",
+      "type": "∀ (b b' : List HlBook.Order) (k : HlBook.Key) (sz : Nat) (x : Option (Nat × Nat)), HlBook.At b x k → HlBook.tot k b = HlBook.tot k b' + sz → HlBook.cnt k b = HlBook.cnt k b' + 1 → HlBook.At b' (HlBook.subLevel x sz) k",
+      "typeHash": "9b553cbd6cfcd69d19bb52892c9bf2c7654bf66fe8c52d1471d84fc35f48c24d",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.take",
+      "kind": "definition",
+      "type": "Nat → List HlBook.Order → Option (HlBook.Order × List HlBook.Order)",
+      "typeHash": "fc49eb2e14caf8870639db102edc52ba87240af47e61db7cf9f5a41d718bb770",
+      "valueHash": "2cbd4d768c02c8f42f9d51b73961797da9be59060f50a9780f04060cb552d9e9"
+    },
+    {
+      "name": "HlBook.take_spec",
+      "kind": "theorem",
+      "type": "∀ (k : HlBook.Key) (oid : Nat) (b r : List HlBook.Order) (o : HlBook.Order), HlBook.take oid b = some (o, r) → (HlBook.tot k b = HlBook.tot k r + if o.key = k then o.sz else 0) ∧ (HlBook.cnt k b = HlBook.cnt k r + if o.key = k then 1 else 0) ∧ (∀ (sz : Nat), (HlBook.tot k (HlBook.setSz oid sz b) + if o.key = k then o.sz else 0) = HlBook.tot k b + if o.key = k then sz else 0) ∧ ∀ (sz : Nat), HlBook.cnt k (HlBook.setSz oid sz b) = HlBook.cnt k b",
+      "typeHash": "08fef3650b2ac8153c954df7455812791ebedbae58e961f8f3336e2e9adf5c76",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.tot",
+      "kind": "definition",
+      "type": "HlBook.Key → List HlBook.Order → Nat",
+      "typeHash": "c6b850889fa6dfce8e5601ec811e1066055809b623886b9925274a7159e449c4",
+      "valueHash": "73dce16b327950d230d711663a54262b8ceee764e76968a46c7a8b4719ac00d4"
+    },
+    {
+      "name": "HlBook.tot_append",
+      "kind": "theorem",
+      "type": "∀ (k : HlBook.Key) (a c : List HlBook.Order), HlBook.tot k (a ++ c) = HlBook.tot k a + HlBook.tot k c",
+      "typeHash": "f7637c24f7c41fe040499dd9ff0d8d85f57141815e1dc56b15b3eb553bdc97fb",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.tot_insertIdx",
+      "kind": "theorem",
+      "type": "∀ (k : HlBook.Key) (i : Nat) (o : HlBook.Order) (b : List HlBook.Order), i ≤ b.length → HlBook.tot k (b.insertIdx i o) = HlBook.tot k b + if o.key = k then o.sz else 0",
+      "typeHash": "e3b2cacf14ba384b170953a6f6be404a4ad1896f8ba5bc2bd9bdf5db8ee058b2",
+      "valueHash": null
+    },
+    {
+      "name": "HlBook.update",
+      "kind": "definition",
+      "type": "HlBook.View → HlBook.Key → Option (Nat × Nat) → HlBook.View",
+      "typeHash": "4329e6a2137ce3191597398074191845be8d7aa9eedd84539909d5123b10e1b0",
+      "valueHash": "1e467ad321ce83e09075fa8af6c00063dc0a9b17f08468445e231e7b6dc77052"
+    },
+    {
+      "name": "HlBook.vectors",
+      "kind": "definition",
+      "type": "List (List HlBook.Op)",
+      "typeHash": "577f5a910215f8650075d5ebe440fc404602f64c2ebe3498704858880c6a70e6",
+      "valueHash": "d2c0ad3ee3063c0030f7c65f13f355fdf5ff4be4b2198389d31088f611fb8be4"
+    }
+  ]
+}

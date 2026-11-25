@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dcabb51dc49a55b47bad259e3b1ee2cee0c7155549951caa327e7db059b125b0 # shrinks to warm = [], block = [(0, true, 90, 1, 0), (1, true, 98, 8, 0), (0, false, 90, 1, 0), (0, false, 90, 1, 0)], junk = [(0, false, 90, 9, 1)]

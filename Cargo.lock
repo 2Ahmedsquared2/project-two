@@ -903,6 +903,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hl-exec"
+version = "0.1.0"
+dependencies = [
+ "criterion 0.8.2",
+ "hl-alloc-gate",
+ "hl-book-ref",
+ "proptest",
+ "secp256k1",
+ "serde",
+ "serde_json",
+ "sha3",
+]
+
+[[package]]
 name = "hl-latency"
 version = "0.1.0"
 dependencies = [
